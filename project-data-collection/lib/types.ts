@@ -124,3 +124,17 @@ export type LineItem = {
   supportingNotes: string
   createdAt: string
 }
+
+export type ChunkProjectItem = {
+  lineItemId: string
+  quantity: string
+}
+
+export type ChunkProject = {
+  id: string
+  projectId: string
+  chunkNumber: string
+  name: string
+  itemLinks: ChunkProjectItem[]
+  createdAt: string
+}

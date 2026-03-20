@@ -299,9 +299,15 @@ export function createLineItem(
   input: Omit<LineItem, 'id' | 'createdAt' | 'companyName' | 'discipline' | 'itemNumber'>,
   project: Project
 ) {
-  const discipline = input.consultantType
-  const companyName = getCompanyNameForUser(project, input.userEmail, discipline)
-  const itemNumber = getNextItemNumber(discipline)
+  const normalizedDiscipline =
+    input.consultantType === 'Admin' ? 'Architecture' : input.consultantType
+
+  const companyName =
+    input.consultantType === 'Admin'
+      ? 'FAA'
+      : getCompanyNameForUser(project, input.userEmail, normalizedDiscipline)
+
+  const itemNumber = getNextItemNumber(normalizedDiscipline)
 
   const items = getStoredLineItems()
 
@@ -310,7 +316,7 @@ export function createLineItem(
     id: crypto.randomUUID(),
     createdAt: new Date().toISOString(),
     companyName,
-    discipline,
+    discipline: normalizedDiscipline,
     itemNumber,
   }
 
@@ -318,4 +324,139 @@ export function createLineItem(
   saveStoredLineItems(updated)
 
   return newItem
+}
+
+export function getLineItemsForProject(projectId: string) {
+  return getStoredLineItems().filter((item) => item.projectId === projectId)
+}
+
+import { ChunkProject } from './types'
+
+const CHUNK_PROJECTS_KEY = 'pdc_chunk_projects'
+
+export function getStoredChunkProjects(): ChunkProject[] {
+  if (typeof window === 'undefined') return []
+
+  const raw = localStorage.getItem(CHUNK_PROJECTS_KEY)
+  if (!raw) return []
+
+  try {
+    return JSON.parse(raw) as ChunkProject[]
+  } catch {
+    return []
+  }
+}
+
+export function saveStoredChunkProjects(projects: ChunkProject[]) {
+  if (typeof window === 'undefined') return
+  localStorage.setItem(CHUNK_PROJECTS_KEY, JSON.stringify(projects))
+}
+
+export function getChunkProjectsForProject(projectId: string) {
+  return getStoredChunkProjects()
+    .filter((item) => item.projectId === projectId)
+    .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime())
+}
+
+export function getNextChunkNumber(projectId: string) {
+  const existing = getChunkProjectsForProject(projectId)
+
+  const usedNumbers = existing
+    .map((item) => {
+      const match = item.chunkNumber.match(/^PP(\d+)$/)
+      return match ? Number(match[1]) : null
+    })
+    .filter((v): v is number => v !== null)
+
+  const next = usedNumbers.length > 0 ? Math.max(...usedNumbers) + 1 : 10
+  return `PP${next}`
+}
+
+export function createChunkProject(input: { projectId: string; name: string }) {
+  const all = getStoredChunkProjects()
+
+  const newChunk: ChunkProject = {
+    id: crypto.randomUUID(),
+    projectId: input.projectId,
+    chunkNumber: getNextChunkNumber(input.projectId),
+    name: input.name.trim(),
+    itemLinks: [],
+    createdAt: new Date().toISOString(),
+  }
+
+  saveStoredChunkProjects([...all, newChunk])
+  return newChunk
+}
+
+export function updateChunkProject(chunkId: string, updates: Partial<ChunkProject>) {
+  const all = getStoredChunkProjects()
+
+  const updated = all.map((chunk) =>
+    chunk.id === chunkId ? { ...chunk, ...updates } : chunk
+  )
+
+  saveStoredChunkProjects(updated)
+  return updated.find((chunk) => chunk.id === chunkId) || null
+}
+
+export function deleteChunkProject(chunkId: string) {
+  const all = getStoredChunkProjects()
+  saveStoredChunkProjects(all.filter((chunk) => chunk.id !== chunkId))
+}
+
+export function addLineItemToChunkProject(chunkId: string, lineItemId: string) {
+  const all = getStoredChunkProjects()
+
+  const updated = all.map((chunk) => {
+    if (chunk.id !== chunkId) return chunk
+
+    const alreadyExists = chunk.itemLinks.some((link) => link.lineItemId === lineItemId)
+    if (alreadyExists) return chunk
+
+    return {
+      ...chunk,
+      itemLinks: [...chunk.itemLinks, { lineItemId, quantity: '' }],
+    }
+  })
+
+  saveStoredChunkProjects(updated)
+  return updated.find((chunk) => chunk.id === chunkId) || null
+}
+
+export function removeLineItemFromChunkProject(chunkId: string, lineItemId: string) {
+  const all = getStoredChunkProjects()
+
+  const updated = all.map((chunk) => {
+    if (chunk.id !== chunkId) return chunk
+
+    return {
+      ...chunk,
+      itemLinks: chunk.itemLinks.filter((link) => link.lineItemId !== lineItemId),
+    }
+  })
+
+  saveStoredChunkProjects(updated)
+  return updated.find((chunk) => chunk.id === chunkId) || null
+}
+
+export function updateChunkProjectItemQuantity(
+  chunkId: string,
+  lineItemId: string,
+  quantity: string
+) {
+  const all = getStoredChunkProjects()
+
+  const updated = all.map((chunk) => {
+    if (chunk.id !== chunkId) return chunk
+
+    return {
+      ...chunk,
+      itemLinks: chunk.itemLinks.map((link) =>
+        link.lineItemId === lineItemId ? { ...link, quantity } : link
+      ),
+    }
+  })
+
+  saveStoredChunkProjects(updated)
+  return updated.find((chunk) => chunk.id === chunkId) || null
 }

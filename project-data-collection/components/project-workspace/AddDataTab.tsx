@@ -100,7 +100,7 @@ type DraftLineItem = Omit<
 >
 
 function getUserConsultantType(project: Project, user: SafeUser): ConsultantType | 'Admin' {
-  if (user.role === 'admin') return 'Admin'
+  if (user.role === 'admin') return 'Architecture'
 
   const matchedConsultant = project.consultants.find((consultant) =>
     consultant.emails.includes(user.email)

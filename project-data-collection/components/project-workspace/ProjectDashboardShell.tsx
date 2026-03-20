@@ -40,7 +40,7 @@ export default function ProjectDashboardShell({
 
   const tabs: Tab[] = isAdmin
     ? [
-        { key: 'settings', label: 'Settings', icon: '⚙' },
+        { key: 'settings', label: 'Settings', icon: 'S' },
         { key: 'add-data', label: 'Add Data' },
         { key: 'master-view', label: 'Master View' },
         { key: 'chunking', label: 'Chunking' },
@@ -71,7 +71,7 @@ export default function ProjectDashboardShell({
       case 'master-view':
         return <MasterViewTab project={project} />
       case 'chunking':
-        return <ChunkingTab />
+        return <ChunkingTab project={project} />
       case 'visuals':
         return <VisualsTab />
       default:
@@ -80,47 +80,63 @@ export default function ProjectDashboardShell({
   }
 
   const currentTab = tabs.find((tab) => tab.key === activeTab)
+  const isWideTab = activeTab === 'master-view' || activeTab === 'chunking'
 
   return (
-    <div className="min-h-screen bg-gradient-to-b from-zinc-100 via-white to-zinc-100">
-      <div className="mx-auto max-w-6xl px-4 pb-32 pt-6 md:px-6">
-        <div className="mb-6 flex items-start justify-between gap-4">
-          <div>
-            <p className="text-xs font-semibold uppercase tracking-[0.25em] text-gray-400">
-              {isAdmin ? 'Admin Workspace' : 'Consultant Workspace'}
-            </p>
-            <h1 className="mt-2 text-3xl font-semibold text-gray-900">
-              {project.name}
-            </h1>
-            <p className="mt-2 text-sm text-gray-500">
-              {currentTab?.label} · {user.name}
-            </p>
-          </div>
+    <div className="min-h-screen bg-[radial-gradient(circle_at_top_left,_rgba(251,191,36,0.18),_transparent_24%),radial-gradient(circle_at_top_right,_rgba(56,189,248,0.18),_transparent_28%),linear-gradient(180deg,_#fffdf7_0%,_#f7f8fc_50%,_#edf2f7_100%)]">
+      <div
+        className={`mx-auto px-4 pb-32 pt-6 md:px-6 ${
+          isWideTab ? 'max-w-full' : 'max-w-7xl'
+        }`}
+      >
+        <div className="mb-6 overflow-hidden rounded-[2rem] border border-white/70 bg-white/72 px-5 py-5 shadow-[0_30px_100px_rgba(15,23,42,0.12)] backdrop-blur-2xl md:px-7">
+          <div className="flex flex-col gap-5 lg:flex-row lg:items-start lg:justify-between">
+            <div>
+              <p className="text-xs font-semibold uppercase tracking-[0.25em] text-amber-700/70">
+                {isAdmin ? 'Admin Workspace' : 'Consultant Workspace'}
+              </p>
+              <h1 className="mt-2 text-3xl font-semibold tracking-tight text-slate-950 md:text-4xl">
+                {project.name}
+              </h1>
+              <div className="mt-4 flex flex-wrap gap-2">
+                <div className="rounded-full border border-amber-200 bg-amber-50 px-3 py-1.5 text-xs font-medium text-amber-900">
+                  {currentTab?.label}
+                </div>
+                <div className="rounded-full border border-sky-200 bg-sky-50 px-3 py-1.5 text-xs font-medium text-sky-900">
+                  {user.name}
+                </div>
+              </div>
+            </div>
 
-          <div className="flex items-center gap-3">
-            <Link
-              href="/projects"
-              className="rounded-2xl border border-gray-300 bg-white px-4 py-3 text-sm font-medium text-gray-700"
-            >
-              Back
-            </Link>
-            <button
-              onClick={handleLogout}
-              className="rounded-2xl bg-black px-4 py-3 text-sm font-medium text-white"
-            >
-              Logout
-            </button>
+            <div className="flex items-center gap-3">
+              <Link
+                href="/projects"
+                className="rounded-2xl border border-slate-200 bg-white/95 px-4 py-3 text-sm font-medium text-slate-700 shadow-sm transition hover:-translate-y-[1px] hover:border-slate-300"
+              >
+                Back
+              </Link>
+              <button
+                onClick={handleLogout}
+                className="rounded-2xl bg-slate-950 px-4 py-3 text-sm font-medium text-white shadow-lg transition hover:-translate-y-[1px]"
+              >
+                Logout
+              </button>
+            </div>
           </div>
         </div>
 
-        <div className="rounded-[2rem] border border-white/60 bg-white/85 p-6 shadow-2xl backdrop-blur-xl">
+        <div
+          className={`rounded-[2rem] border border-white/70 bg-white/78 shadow-[0_30px_100px_rgba(15,23,42,0.12)] backdrop-blur-2xl ${
+            isWideTab ? 'p-4 md:p-5' : 'p-6'
+          }`}
+        >
           <AnimatePresence mode="wait">
             <motion.div
               key={activeTab}
-              initial={{ opacity: 0, y: 14, scale: 0.985 }}
+              initial={{ opacity: 0, y: 18, scale: 0.985 }}
               animate={{ opacity: 1, y: 0, scale: 1 }}
-              exit={{ opacity: 0, y: -8, scale: 0.99 }}
-              transition={{ duration: 0.24, ease: 'easeOut' }}
+              exit={{ opacity: 0, y: -10, scale: 0.992 }}
+              transition={{ duration: 0.28, ease: 'easeOut' }}
             >
               {renderTabContent()}
             </motion.div>
@@ -128,11 +144,10 @@ export default function ProjectDashboardShell({
         </div>
       </div>
 
-      <div className="fixed bottom-6 left-1/2 z-50 w-[94%] max-w-2xl -translate-x-1/2">
-        <div className="flex items-center justify-between rounded-[2rem] border border-white/60 bg-white/80 p-2 shadow-2xl backdrop-blur-2xl">
+      <div className="fixed bottom-6 left-1/2 z-50 w-[94%] max-w-3xl -translate-x-1/2">
+        <div className="flex items-center justify-between rounded-[2rem] border border-white/70 bg-white/74 p-2 shadow-[0_24px_70px_rgba(15,23,42,0.16)] backdrop-blur-2xl">
           {tabs.map((tab) => {
             const isActive = activeTab === tab.key
-            const isSettings = tab.key === 'settings'
 
             return (
               <button
@@ -145,7 +160,7 @@ export default function ProjectDashboardShell({
                 {isActive ? (
                   <motion.div
                     layoutId="active-tab-pill"
-                    className="absolute inset-0 rounded-[1.4rem] bg-black"
+                    className="absolute inset-0 rounded-[1.4rem] bg-[linear-gradient(135deg,#0f172a_0%,#1e293b_45%,#0f766e_100%)]"
                     transition={{ type: 'spring', stiffness: 380, damping: 30 }}
                   />
                 ) : null}
@@ -153,18 +168,14 @@ export default function ProjectDashboardShell({
                 <motion.span
                   animate={{
                     scale: isActive ? 1.03 : 1,
-                    opacity: isActive ? 1 : 0.68,
+                    opacity: isActive ? 1 : 0.74,
                   }}
                   transition={{ duration: 0.18 }}
                   className={`relative z-10 flex items-center justify-center text-xs font-medium md:text-sm ${
-                    isActive ? 'text-white' : 'text-gray-700'
+                    isActive ? 'text-white' : 'text-slate-700'
                   }`}
                 >
-                  {isSettings ? (
-                    <span className="text-base md:text-lg">{tab.icon}</span>
-                  ) : (
-                    tab.label
-                  )}
+                  {tab.icon || tab.label}
                 </motion.span>
               </button>
             )
