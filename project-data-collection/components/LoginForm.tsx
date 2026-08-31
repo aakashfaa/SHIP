@@ -47,7 +47,7 @@ export default function LoginForm() {
     <div className="w-full max-w-md rounded-[2rem] border border-white/70 bg-white/76 p-8 shadow-[0_30px_100px_rgba(15,23,42,0.16)] backdrop-blur-2xl">
       <div className="mb-8">
         <p className="mb-2 text-xs font-semibold uppercase tracking-[0.25em] text-amber-700/70">
-          Project Data Collection
+          Master Plan Dashboard
         </p>
         <h1 className="text-4xl font-semibold tracking-tight text-slate-950">
           Welcome back

@@ -1,12 +1,14 @@
 'use client'
 
-import { useMemo, useRef } from 'react'
+import { useDeferredValue, useMemo, useRef, useState } from 'react'
 import { getLineItemsForProject } from '@/lib/store'
-import { ConsultantType, LineItem, Project } from '@/lib/types'
+import { LineItem, Project } from '@/lib/types'
 
 type Props = {
   project: Project
 }
+
+type SortKey = 'itemNumber' | 'name' | 'discipline' | 'companyName' | 'relativeFirstCost'
 
 const DISCIPLINE_COLORS: Record<string, string> = {
   MECHANICAL: '#F4B400',
@@ -26,20 +28,22 @@ const DISCIPLINE_COLORS: Record<string, string> = {
   TELECOM: '#A9D18E',
   TELECOMM: '#A9D18E',
   HAZARDOUS_MATERIALS: '#9C6B3A',
-  'HAZARDOUS MATERIALS': '#9C6B3A',
 }
 
 function getDisciplineKey(value: string) {
   return value.trim().toUpperCase().replace(/\s+/g, '_')
 }
 
-function normalizeDiscipline(value: LineItem['discipline']): ConsultantType {
+function normalizeDiscipline(value: LineItem['discipline']) {
   return value === 'Admin' ? 'Architecture' : value
 }
 
 function getDisciplineColor(value: LineItem['discipline']) {
-  const normalized = normalizeDiscipline(value)
-  return DISCIPLINE_COLORS[getDisciplineKey(normalized)] || '#111111'
+  return DISCIPLINE_COLORS[getDisciplineKey(normalizeDiscipline(value))] || '#94A3B8'
+}
+
+function colorTint(hex: string, opacity: string) {
+  return `${hex}${opacity}`
 }
 
 function itemNumberSort(a: string, b: string) {
@@ -55,167 +59,102 @@ function itemNumberSort(a: string, b: string) {
   return Number(aNum) - Number(bNum)
 }
 
+function sortLineItems(items: LineItem[], sortKey: SortKey) {
+  return [...items].sort((a, b) => {
+    if (sortKey === 'itemNumber') return itemNumberSort(a.itemNumber, b.itemNumber)
+    return a[sortKey].localeCompare(b[sortKey])
+  })
+}
+
 function yn(value: string) {
-  return value === 'Yes' ? 'Y' : '—'
+  return value === 'Yes' ? 'Y' : ''
 }
 
 export default function MasterViewTab({ project }: Props) {
   const exportRef = useRef<HTMLDivElement | null>(null)
+  const [query, setQuery] = useState('')
+  const [disciplineFilter, setDisciplineFilter] = useState('all')
+  const [orgFilter, setOrgFilter] = useState('all')
+  const [sortKey, setSortKey] = useState<SortKey>('itemNumber')
+  const deferredQuery = useDeferredValue(query)
 
-  const lineItems = useMemo(() => getLineItemsForProject(project.id), [project.id])
+  const lineItems = useMemo(
+    () =>
+      getLineItemsForProject(project.id).map((item) => ({
+        ...item,
+        discipline: normalizeDiscipline(item.discipline),
+        companyName: item.companyName || 'FAA',
+        estimatedFirstCost: item.estimatedFirstCost || '',
+      })),
+    [project.id]
+  )
 
-  const grouped = useMemo(() => {
-    const byDiscipline = new Map<
-      string,
-      {
-        color: string
-        orgs: Map<string, LineItem[]>
-      }
-    >()
+  const disciplineOptions = useMemo(
+    () => Array.from(new Set(lineItems.map((item) => item.discipline))).sort(),
+    [lineItems]
+  )
 
-    for (const rawItem of lineItems) {
-      const item: LineItem = {
-      ...rawItem,
-      discipline: normalizeDiscipline(rawItem.discipline),
-      companyName: rawItem.companyName || 'FAA',
-    }
+  const orgOptions = useMemo(
+    () => Array.from(new Set(lineItems.map((item) => item.companyName))).sort(),
+    [lineItems]
+  )
 
-      const discipline = item.discipline
-      const org = item.companyName || 'Unknown Organization'
-      const color = getDisciplineColor(discipline)
+  const filteredItems = useMemo(() => {
+    const normalizedQuery = deferredQuery.trim().toLowerCase()
 
-      if (!byDiscipline.has(discipline)) {
-        byDiscipline.set(discipline, {
-          color,
-          orgs: new Map(),
-        })
-      }
+    const filtered = lineItems.filter((item) => {
+      const matchesQuery =
+        !normalizedQuery ||
+        [
+          item.itemNumber,
+          item.name,
+          item.shortDescription,
+          item.discipline,
+          item.companyName,
+          item.category,
+          item.timelinePriority,
+          item.buildingAreaImpacted,
+          item.buildingLevelImpacted,
+          item.supportingNotes,
+          item.relativeFirstCost,
+          item.estimatedFirstCost,
+        ]
+          .join(' ')
+          .toLowerCase()
+          .includes(normalizedQuery)
 
-      const group = byDiscipline.get(discipline)!
-      if (!group.orgs.has(org)) {
-        group.orgs.set(org, [])
-      }
+      const matchesDiscipline =
+        disciplineFilter === 'all' || item.discipline === disciplineFilter
+      const matchesOrg = orgFilter === 'all' || item.companyName === orgFilter
 
-      group.orgs.get(org)!.push(item)
-    }
+      return matchesQuery && matchesDiscipline && matchesOrg
+    })
 
-    return Array.from(byDiscipline.entries())
-      .sort(([a], [b]) => a.localeCompare(b))
-      .map(([discipline, value]) => ({
-        discipline,
-        color: value.color,
-        orgs: Array.from(value.orgs.entries())
-          .sort(([a], [b]) => a.localeCompare(b))
-          .map(([orgName, items]) => ({
-            orgName,
-            items: [...items].sort((a, b) => itemNumberSort(a.itemNumber, b.itemNumber)),
-          })),
-      }))
-  }, [lineItems])
+    return sortLineItems(filtered, sortKey)
+  }, [deferredQuery, disciplineFilter, lineItems, orgFilter, sortKey])
 
   function exportMatrixOnly() {
     const matrixHtml = exportRef.current?.innerHTML
     if (!matrixHtml) return
 
-    const printWindow = window.open('', '_blank', 'width=1400,height=900')
+    const printWindow = window.open('', '_blank', 'width=1500,height=900')
     if (!printWindow) return
 
     printWindow.document.write(`
       <html>
         <head>
-          <title>${project.name} - Master View Matrix</title>
+          <title>${project.name} - Master View</title>
           <style>
             * { box-sizing: border-box; }
-            body {
-              margin: 24px;
-              font-family: Arial, Helvetica, sans-serif;
-              color: #111827;
-              background: white;
-            }
-            .export-title {
-              margin-bottom: 20px;
-            }
-            .export-title h1 {
-              margin: 0;
-              font-size: 24px;
-            }
-            .export-title p {
-              margin: 6px 0 0 0;
-              color: #6b7280;
-              font-size: 12px;
-            }
-            .matrix-section {
-              margin-bottom: 28px;
-              border: 1px solid #e5e7eb;
-              border-radius: 18px;
-              overflow: hidden;
-              page-break-inside: avoid;
-              break-inside: avoid;
-            }
-            .discipline-header {
-              padding: 16px 20px;
-              font-weight: 700;
-              font-size: 20px;
-              color: #111;
-            }
-            .org-row {
-              padding: 10px 16px;
-              border-bottom: 1px solid #e5e7eb;
-              background: #fafafa;
-              font-size: 12px;
-              color: #4b5563;
-              font-weight: 600;
-            }
-            .matrix-wrap {
-              overflow: visible;
-            }
-            table {
-              width: 100%;
-              min-width: 1800px;
-              border-collapse: collapse;
-              font-size: 11px;
-            }
-            th, td {
-              border-right: 1px solid #e5e7eb;
-              border-bottom: 1px solid #e5e7eb;
-              padding: 8px 10px;
-              vertical-align: top;
-              text-align: left;
-            }
-            th {
-              background: #f3f4f6;
-              font-size: 10px;
-              text-transform: uppercase;
-              letter-spacing: .04em;
-            }
-            .item-chip {
-              display: inline-block;
-              padding: 4px 8px;
-              border-radius: 999px;
-              font-size: 10px;
-              font-weight: 700;
-              color: #111;
-            }
-            .notes-cell {
-              min-width: 220px;
-              white-space: pre-wrap;
-            }
-            .name-cell {
-              min-width: 220px;
-            }
-            .muted {
-              color: #6b7280;
-            }
-            @media print {
-              body { margin: 12px; }
-            }
+            body { margin: 24px; font-family: Arial, Helvetica, sans-serif; color: #0f172a; }
+            table { width: 100%; border-collapse: collapse; table-layout: fixed; font-size: 10px; }
+            th, td { border: 1px solid #dbe1ea; padding: 8px 6px; vertical-align: top; word-break: break-word; }
+            th { background: #e2e8f0; text-transform: uppercase; letter-spacing: .04em; font-size: 9px; }
           </style>
         </head>
         <body>
-          <div class="export-title">
-            <h1>${project.name}</h1>
-            <p>Master View Matrix Export</p>
-          </div>
+          <h1>${project.name}</h1>
+          <p>Master View export</p>
           ${matrixHtml}
         </body>
       </html>
@@ -227,17 +166,13 @@ export default function MasterViewTab({ project }: Props) {
   }
 
   return (
-    <div className="space-y-6">
-      <div className="no-print rounded-[2rem] bg-gradient-to-br from-gray-50 to-white p-6 shadow-sm">
-        <div className="flex items-start justify-between gap-4">
+    <div className="space-y-5">
+      <div className="flex flex-col gap-4 rounded-[1.75rem] border border-slate-200 bg-white/86 p-5 shadow-sm">
+        <div className="flex flex-col gap-4 xl:flex-row xl:items-center xl:justify-between">
           <div>
-            <p className="text-sm text-gray-500">Master View</p>
-            <h3 className="mt-1 text-2xl font-semibold text-gray-900">
-              Designer Matrix
-            </h3>
-            <p className="mt-2 max-w-4xl text-sm text-gray-600">
-              All project line items in one dense matrix, grouped by discipline and organization,
-              sorted by item number.
+            <h2 className="text-xl font-semibold tracking-tight text-slate-950">Master View</h2>
+            <p className="mt-1 text-sm text-slate-500">
+              Query, filter, and sort the full line-item matrix without discipline section breaks.
             </p>
           </div>
 
@@ -250,154 +185,157 @@ export default function MasterViewTab({ project }: Props) {
           </button>
         </div>
 
-        <div className="mt-4 flex flex-wrap gap-3 text-sm text-gray-500">
-          <div className="rounded-full bg-white px-3 py-2">
-            {grouped.length} disciplines
-          </div>
-          <div className="rounded-full bg-white px-3 py-2">
-            {lineItems.length} total items
-          </div>
-          <div className="rounded-full bg-white px-3 py-2">{project.name}</div>
+        <div className="grid gap-3 lg:grid-cols-[2fr_1fr_1fr_1fr]">
+          <input
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Search line items, notes, orgs, disciplines"
+            className="w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm outline-none transition focus:border-slate-900"
+          />
+          <select
+            value={disciplineFilter}
+            onChange={(e) => setDisciplineFilter(e.target.value)}
+            className="rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm outline-none transition focus:border-slate-900"
+          >
+            <option value="all">All disciplines</option>
+            {disciplineOptions.map((option) => (
+              <option key={option} value={option}>
+                {option}
+              </option>
+            ))}
+          </select>
+          <select
+            value={orgFilter}
+            onChange={(e) => setOrgFilter(e.target.value)}
+            className="rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm outline-none transition focus:border-slate-900"
+          >
+            <option value="all">All organizations</option>
+            {orgOptions.map((option) => (
+              <option key={option} value={option}>
+                {option}
+              </option>
+            ))}
+          </select>
+          <select
+            value={sortKey}
+            onChange={(e) => setSortKey(e.target.value as SortKey)}
+            className="rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm outline-none transition focus:border-slate-900"
+          >
+            <option value="itemNumber">Sort: Item #</option>
+            <option value="name">Sort: Name</option>
+            <option value="discipline">Sort: Discipline</option>
+            <option value="companyName">Sort: Organization</option>
+            <option value="relativeFirstCost">Sort: First Cost</option>
+          </select>
+        </div>
+
+        <div className="flex flex-wrap gap-2 text-xs text-slate-500">
+          <span className="rounded-full bg-slate-100 px-3 py-1.5">
+            {filteredItems.length} shown
+          </span>
+          <span className="rounded-full bg-slate-100 px-3 py-1.5">
+            {lineItems.length} total
+          </span>
+          <span className="rounded-full bg-slate-100 px-3 py-1.5">{project.name}</span>
         </div>
       </div>
 
-      {lineItems.length === 0 ? (
+      {filteredItems.length === 0 ? (
         <div className="rounded-[2rem] border border-dashed border-gray-300 bg-white p-12 text-center">
-          <h4 className="text-lg font-semibold text-gray-900">No project data yet</h4>
-          <p className="mt-2 text-sm text-gray-500">
-            Once consultants add line items, the matrix will appear here.
-          </p>
+          <h4 className="text-lg font-semibold text-gray-900">No matching line items</h4>
+          <p className="mt-2 text-sm text-gray-500">Adjust the search or filters to widen the view.</p>
         </div>
       ) : (
-        <div ref={exportRef} className="space-y-6">
-          {grouped.map((disciplineGroup) => (
-            <section
-              key={disciplineGroup.discipline}
-              className="matrix-section overflow-hidden rounded-[2rem] border border-gray-200 bg-white shadow-sm"
-            >
-              <div
-                className="discipline-header px-6 py-5"
-                style={{ backgroundColor: disciplineGroup.color }}
-              >
-                <div className="flex flex-wrap items-center justify-between gap-3">
-                  <h4 className="text-2xl font-semibold text-black">
-                    {disciplineGroup.discipline}
-                  </h4>
+        <div
+          ref={exportRef}
+          className="overflow-hidden rounded-[2rem] border border-slate-200 bg-white shadow-sm"
+        >
+          <table className="w-full border-collapse text-[11px] leading-4 text-slate-700">
+            <thead>
+              <tr className="bg-slate-100 text-left">
+                <th className="w-2 border-b border-r border-slate-200 p-0" />
+                <HeaderCell className="w-[72px]">#</HeaderCell>
+                <HeaderCell className="min-w-[128px]">Discipline</HeaderCell>
+                <HeaderCell className="min-w-[144px]">Organization</HeaderCell>
+                <HeaderCell className="min-w-[220px]">Name / Description</HeaderCell>
+                <HeaderCell className="w-[140px]">Strategy</HeaderCell>
+                <HeaderCell className="w-[135px]">Location</HeaderCell>
+                <HeaderCell className="w-[128px]">Impacts</HeaderCell>
+                <HeaderCell className="w-[150px]">Cost / Energy</HeaderCell>
+                <HeaderCell className="min-w-[132px]">Resiliency / Sustainability</HeaderCell>
+                <HeaderCell className="min-w-[132px]">Deferred Maintenance</HeaderCell>
+                <HeaderCell className="min-w-[132px]">Code / Life Safety</HeaderCell>
+                <HeaderCell className="min-w-[132px]">Accessibility Improvement</HeaderCell>
+                <HeaderCell className="min-w-[120px]">Historic Impact</HeaderCell>
+                <HeaderCell className="w-[100px]">Synergies</HeaderCell>
+                <HeaderCell className="w-[150px]">Notes</HeaderCell>
+                <HeaderCell className="w-[120px]">Submitted By</HeaderCell>
+              </tr>
+            </thead>
+            <tbody>
+              {filteredItems.map((item) => {
+                const color = getDisciplineColor(item.discipline)
 
-                  <div className="rounded-full bg-white/80 px-4 py-2 text-sm font-medium text-black">
-                    {disciplineGroup.orgs.reduce((sum, org) => sum + org.items.length, 0)} items
-                  </div>
-                </div>
-              </div>
-
-              <div className="space-y-3 p-4">
-                {disciplineGroup.orgs.map((orgGroup) => (
-                  <div key={`${disciplineGroup.discipline}-${orgGroup.orgName}`}>
-                    <div className="org-row mb-2 flex items-center justify-between rounded-xl bg-gray-50 px-4 py-2">
-                      <span className="truncate font-medium text-gray-700">
-                        {orgGroup.orgName}
+                return (
+                  <tr key={item.id} style={{ backgroundColor: colorTint(color, '10') }}>
+                    <td className="w-2 p-0" style={{ backgroundColor: color }} />
+                    <BodyCell>
+                      <span
+                        className="inline-flex rounded-full px-2 py-1 text-[10px] font-semibold text-slate-950"
+                        style={{ backgroundColor: colorTint(color, '2A') }}
+                      >
+                        {item.itemNumber}
                       </span>
-                      <span className="text-xs text-gray-400">
-                        {orgGroup.items.length} items
-                      </span>
-                    </div>
-
-                    <div className="matrix-wrap overflow-x-auto rounded-[1.25rem] border border-gray-200">
-                      <table className="min-w-[2200px] border-collapse text-sm">
-                        <thead>
-                          <tr className="bg-gray-100 text-left align-top">
-                            <HeaderCell sticky style={{ backgroundColor: disciplineGroup.color }}>
-                              #
-                            </HeaderCell>
-                            <HeaderCell style={{ backgroundColor: disciplineGroup.color }}>
-                              Name / Description
-                            </HeaderCell>
-                            <HeaderCell>Category</HeaderCell>
-                            <HeaderCell>Timeline</HeaderCell>
-                            <HeaderCell>Area</HeaderCell>
-                            <HeaderCell>Level</HeaderCell>
-                            <HeaderCell>Op Impact</HeaderCell>
-                            <HeaderCell>Users</HeaderCell>
-                            <HeaderCell>Public</HeaderCell>
-                            <HeaderCell>1st Cost</HeaderCell>
-                            <HeaderCell>Op Cost</HeaderCell>
-                            <HeaderCell>Energy / Emissions</HeaderCell>
-                            <HeaderCell>EO 594</HeaderCell>
-                            <HeaderCell>Resiliency</HeaderCell>
-                            <HeaderCell>Deferred</HeaderCell>
-                            <HeaderCell>Life Safety</HeaderCell>
-                            <HeaderCell>Access</HeaderCell>
-                            <HeaderCell>Historic</HeaderCell>
-                            <HeaderCell>Synergies</HeaderCell>
-                            <HeaderCell>Notes</HeaderCell>
-                            <HeaderCell>Submitted By</HeaderCell>
-                          </tr>
-                        </thead>
-
-                        <tbody>
-                          {orgGroup.items.map((item, index) => (
-                            <tr
-                              key={item.id}
-                              className={index % 2 === 0 ? 'bg-white' : 'bg-gray-50/60'}
-                            >
-                              <BodyCell
-                                sticky
-                                style={{
-                                  backgroundColor: index % 2 === 0 ? '#ffffff' : '#f9fafb',
-                                }}
-                              >
-                                <span
-                                  className="inline-flex rounded-full px-2.5 py-1 text-xs font-semibold text-black"
-                                  style={{ backgroundColor: disciplineGroup.color }}
-                                >
-                                  {item.itemNumber}
-                                </span>
-                              </BodyCell>
-
-                              <BodyCell className="min-w-[260px]">
-                                <div className="font-semibold text-gray-900">{item.name}</div>
-                                <div className="mt-1 text-xs leading-5 text-gray-500">
-                                  {item.shortDescription || '—'}
-                                </div>
-                              </BodyCell>
-
-                              <BodyCell>{item.category}</BodyCell>
-                              <BodyCell>{item.timelinePriority}</BodyCell>
-                              <BodyCell>{item.buildingAreaImpacted}</BodyCell>
-                              <BodyCell>{item.buildingLevelImpacted}</BodyCell>
-                              <BodyCell>{item.operationalImpact}</BodyCell>
-                              <BodyCell>{item.benefitToUsers}</BodyCell>
-                              <BodyCell>{item.benefitToPublic}</BodyCell>
-                              <BodyCell>{item.relativeFirstCost}</BodyCell>
-                              <BodyCell>{item.relativeOperationCostImpact}</BodyCell>
-                              <BodyCell>{item.relativeOperationalEnergyUsage}</BodyCell>
-                              <BodyCell>{item.electrificationEO594}</BodyCell>
-                              <BodyCell centered>{yn(item.addressingResiliencySustainability)}</BodyCell>
-                              <BodyCell centered>{yn(item.addressingDeferredMaintenance)}</BodyCell>
-                              <BodyCell centered>{yn(item.codeLifeSafetyImprovement)}</BodyCell>
-                              <BodyCell centered>{yn(item.accessibilityImprovement)}</BodyCell>
-                              <BodyCell centered>{yn(item.historicImpact)}</BodyCell>
-                              <BodyCell className="min-w-[170px]">
-                                {item.potentialSynergies.length > 0
-                                  ? item.potentialSynergies.join(', ')
-                                  : '—'}
-                              </BodyCell>
-                              <BodyCell className="min-w-[230px] text-xs leading-5">
-                                {item.supportingNotes || '—'}
-                              </BodyCell>
-                              <BodyCell className="min-w-[170px]">
-                                {item.userEmail}
-                              </BodyCell>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </section>
-          ))}
+                    </BodyCell>
+                    <BodyCell>{item.discipline}</BodyCell>
+                    <BodyCell>{item.companyName}</BodyCell>
+                    <BodyCell>
+                      <div className="font-semibold text-slate-900">{item.name}</div>
+                      <div className="mt-1 text-[10px] text-slate-500">
+                        {item.shortDescription || 'No description'}
+                      </div>
+                    </BodyCell>
+                    <BodyCell>
+                      <div>{item.category}</div>
+                      <div className="mt-1 text-[10px] text-slate-500">{item.timelinePriority}</div>
+                    </BodyCell>
+                    <BodyCell>
+                      <div>{item.buildingAreaImpacted}</div>
+                      <div className="mt-1 text-[10px] text-slate-500">
+                        {item.buildingLevelImpacted}
+                      </div>
+                    </BodyCell>
+                    <BodyCell>
+                      <div>Op: {item.operationalImpact}</div>
+                      <div>User: {item.benefitToUsers}</div>
+                      <div>Public: {item.benefitToPublic}</div>
+                    </BodyCell>
+                    <BodyCell>
+                      <div>{item.relativeFirstCost}</div>
+                      <div className="mt-1 text-[10px] text-slate-500">
+                        {item.estimatedFirstCost || 'No pricing input'}
+                      </div>
+                      <div className="mt-1 text-[10px] text-slate-500">
+                        Op: {item.relativeOperationCostImpact}
+                      </div>
+                      <div className="text-[10px] text-slate-500">
+                        Energy: {item.relativeOperationalEnergyUsage}
+                      </div>
+                      <div className="text-[10px] text-slate-500">EO594: {item.electrificationEO594}</div>
+                    </BodyCell>
+                    <BodyCell centered>{yn(item.addressingResiliencySustainability)}</BodyCell>
+                    <BodyCell centered>{yn(item.addressingDeferredMaintenance)}</BodyCell>
+                    <BodyCell centered>{yn(item.codeLifeSafetyImprovement)}</BodyCell>
+                    <BodyCell centered>{yn(item.accessibilityImprovement)}</BodyCell>
+                    <BodyCell centered>{yn(item.historicImpact)}</BodyCell>
+                    <BodyCell>{item.potentialSynergies.join(', ') || '-'}</BodyCell>
+                    <BodyCell>{item.supportingNotes || '-'}</BodyCell>
+                    <BodyCell>{item.userEmail}</BodyCell>
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
         </div>
       )}
     </div>
@@ -406,20 +344,13 @@ export default function MasterViewTab({ project }: Props) {
 
 function HeaderCell({
   children,
-  sticky = false,
-  style,
+  className = '',
 }: {
   children: React.ReactNode
-  sticky?: boolean
-  style?: React.CSSProperties
+  className?: string
 }) {
   return (
-    <th
-      style={style}
-      className={`border-b border-r border-gray-200 px-4 py-3 text-xs font-semibold uppercase tracking-wide text-gray-700 ${
-        sticky ? 'sticky left-0 z-20 min-w-[110px]' : ''
-      }`}
-    >
+    <th className={`border-b border-r border-slate-200 px-2 py-3 text-[10px] font-semibold uppercase tracking-[0.14em] text-slate-600 ${className}`}>
       {children}
     </th>
   )
@@ -427,23 +358,16 @@ function HeaderCell({
 
 function BodyCell({
   children,
-  className = '',
   centered = false,
-  sticky = false,
-  style,
 }: {
   children: React.ReactNode
-  className?: string
   centered?: boolean
-  sticky?: boolean
-  style?: React.CSSProperties
 }) {
   return (
     <td
-      style={style}
-      className={`border-r border-b border-gray-200 px-4 py-3 align-top text-gray-700 ${
-        centered ? 'text-center' : ''
-      } ${sticky ? 'sticky left-0 z-10 min-w-[110px]' : ''} ${className}`}
+      className={`border-b border-r border-slate-200 px-2 py-3 align-top ${
+        centered ? 'text-center text-sm font-semibold text-slate-800' : ''
+      }`}
     >
       {children}
     </td>

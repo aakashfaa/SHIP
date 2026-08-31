@@ -39,7 +39,7 @@ export default function DashboardShell({ user }: DashboardShellProps) {
       <div className="flex items-center justify-between px-6 pt-6">
         <div>
           <p className="text-xs uppercase tracking-[0.2em] text-gray-400">
-            Project Data Collection
+            Master Plan Dashboard
           </p>
           <h1 className="text-xl font-semibold text-gray-900">
             {activeTab}

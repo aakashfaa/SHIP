@@ -26,4 +26,46 @@ export const SEED_USERS: MockUser[] = [
     role: 'consultant',
     name: 'Consultant Two',
   },
+  {
+    email: 'planning@atlasmech.com',
+    password: 'consultant123',
+    role: 'consultant',
+    name: 'Atlas MEP',
+  },
+  {
+    email: 'structural@coredesign.com',
+    password: 'consultant123',
+    role: 'consultant',
+    name: 'Core Design Structures',
+  },
+  {
+    email: 'electrical@voltworks.com',
+    password: 'consultant123',
+    role: 'consultant',
+    name: 'Volt Works',
+  },
+  {
+    email: 'civil@terrainlab.com',
+    password: 'consultant123',
+    role: 'consultant',
+    name: 'Terrain Lab',
+  },
+  {
+    email: 'historic@heritagestudio.com',
+    password: 'consultant123',
+    role: 'consultant',
+    name: 'Heritage Studio',
+  },
+  {
+    email: 'access@openpath.com',
+    password: 'consultant123',
+    role: 'consultant',
+    name: 'Open Path',
+  },
+  {
+    email: 'landscape@fieldoffice.com',
+    password: 'consultant123',
+    role: 'consultant',
+    name: 'Field Office',
+  },
 ]

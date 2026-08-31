@@ -64,4 +64,58 @@ export const SEED_PROJECTS: Project[] = [
       },
     ],
   },
+  {
+    id: 'federal-campus-master-plan',
+    name: 'Federal Campus Master Plan',
+    createdAt: '2026-04-01',
+    assignedUsers: [
+      'planning@atlasmech.com',
+      'structural@coredesign.com',
+      'electrical@voltworks.com',
+      'civil@terrainlab.com',
+      'historic@heritagestudio.com',
+    ],
+    consultants: [
+      {
+        type: 'Architecture',
+        orgName: 'FAA',
+        emails: ['admin@gmail.com'],
+      },
+      {
+        type: 'Mechanical',
+        orgName: 'Atlas MEP',
+        emails: ['planning@atlasmech.com'],
+      },
+      {
+        type: 'Structural',
+        orgName: 'Core Design Structures',
+        emails: ['structural@coredesign.com'],
+      },
+      {
+        type: 'Electrical',
+        orgName: 'Volt Works',
+        emails: ['electrical@voltworks.com'],
+      },
+      {
+        type: 'Civil',
+        orgName: 'Terrain Lab',
+        emails: ['civil@terrainlab.com'],
+      },
+      {
+        type: 'Historic Preservation',
+        orgName: 'Heritage Studio',
+        emails: ['historic@heritagestudio.com'],
+      },
+      {
+        type: 'Accessibility',
+        orgName: 'Open Path',
+        emails: ['access@openpath.com'],
+      },
+      {
+        type: 'Landscape',
+        orgName: 'Field Office',
+        emails: ['landscape@fieldoffice.com'],
+      },
+    ],
+  },
 ]

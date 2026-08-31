@@ -1,6 +1,15 @@
 import { SEED_PROJECTS } from './mock-projects'
 import { MockUser, SEED_USERS } from './mock-users'
-import { ConsultantType, Project, ProjectConsultant } from './types'
+import { SEED_CHUNK_PROJECTS, SEED_TIMELINE_SETTINGS } from './mock-chunks'
+import { SEED_LINE_ITEMS } from './mock-line-items'
+import {
+  ChunkProject,
+  ConsultantType,
+  LineItem,
+  Project,
+  ProjectConsultant,
+  ProjectTimelineSettings,
+} from './types'
 
 const PROJECTS_KEY = 'pdc_projects'
 const USERS_KEY = 'pdc_users'
@@ -18,6 +27,12 @@ function slugify(value: string) {
 
 function uniqueStrings(values: string[]) {
   return [...new Set(values.map((v) => v.trim().toLowerCase()).filter(Boolean))]
+}
+
+function mergeByKey<T>(seed: T[], custom: T[], getKey: (item: T) => string) {
+  const merged = new Map(seed.map((item) => [getKey(item), item]))
+  custom.forEach((item) => merged.set(getKey(item), item))
+  return Array.from(merged.values())
 }
 
 export function getDefaultConsultantPassword() {
@@ -54,7 +69,7 @@ export function getStoredProjects(): Project[] {
 
   try {
     const parsed = JSON.parse(raw) as Project[]
-    return parsed
+    return mergeByKey(SEED_PROJECTS, parsed, (item) => item.id)
   } catch {
     return SEED_PROJECTS
   }
@@ -205,9 +220,20 @@ export function removeConsultantFromProject(
   })
 }
 
-import { LineItem } from './types'
-
 const LINE_ITEMS_KEY = 'pdc_line_items'
+
+function normalizeLineItem(item: LineItem): LineItem {
+  const consultantType =
+    item.consultantType === 'Admin' ? 'Architecture' : item.consultantType
+  const discipline = item.discipline === 'Admin' ? 'Architecture' : item.discipline
+
+  return {
+    ...item,
+    consultantType,
+    discipline,
+    estimatedFirstCost: item.estimatedFirstCost || '',
+  }
+}
 
 function getDisciplinePrefix(discipline: string) {
   const cleaned = discipline.trim().toUpperCase()
@@ -247,21 +273,28 @@ function getNextItemNumber(discipline: string) {
 }
 
 export function getStoredLineItems(): LineItem[] {
-  if (typeof window === 'undefined') return []
+  if (typeof window === 'undefined') return SEED_LINE_ITEMS
 
   const raw = localStorage.getItem(LINE_ITEMS_KEY)
-  if (!raw) return []
+  if (!raw) return SEED_LINE_ITEMS
 
   try {
-    return JSON.parse(raw) as LineItem[]
+    return mergeByKey(
+      SEED_LINE_ITEMS.map(normalizeLineItem),
+      (JSON.parse(raw) as LineItem[]).map(normalizeLineItem),
+      (item) => item.id
+    )
   } catch {
-    return []
+    return SEED_LINE_ITEMS
   }
 }
 
 export function saveStoredLineItems(items: LineItem[]) {
   if (typeof window === 'undefined') return
-  localStorage.setItem(LINE_ITEMS_KEY, JSON.stringify(items))
+  localStorage.setItem(
+    LINE_ITEMS_KEY,
+    JSON.stringify(items.map(normalizeLineItem))
+  )
 }
 
 export function getLineItemsForProjectUser(projectId: string, userEmail: string) {
@@ -326,30 +359,115 @@ export function createLineItem(
   return newItem
 }
 
+export function updateLineItem(lineItemId: string, updates: Partial<LineItem>) {
+  const items = getStoredLineItems()
+
+  let updatedItem: LineItem | null = null
+
+  const updated = items.map((item) => {
+    if (item.id !== lineItemId) return item
+
+    updatedItem = normalizeLineItem({
+      ...item,
+      ...updates,
+    })
+
+    return updatedItem
+  })
+
+  saveStoredLineItems(updated)
+  return updatedItem
+}
+
 export function getLineItemsForProject(projectId: string) {
   return getStoredLineItems().filter((item) => item.projectId === projectId)
 }
 
-import { ChunkProject } from './types'
-
 const CHUNK_PROJECTS_KEY = 'pdc_chunk_projects'
+const TIMELINE_SETTINGS_KEY = 'pdc_timeline_settings'
+
+function normalizeTimelineSettings(settings: ProjectTimelineSettings): ProjectTimelineSettings {
+  const years =
+    typeof settings.years === 'number' && settings.years >= 0 ? Math.round(settings.years) : 10
+  const zoomLevel =
+    typeof settings.zoomLevel === 'number'
+      ? Math.min(Math.max(Math.round(settings.zoomLevel), 1), 5)
+      : 3
+  const escalationPercent =
+    typeof settings.escalationPercent === 'number' && settings.escalationPercent >= 0
+      ? settings.escalationPercent
+      : 0
+  const escalationEveryYears =
+    typeof settings.escalationEveryYears === 'number' && settings.escalationEveryYears > 0
+      ? Math.round(settings.escalationEveryYears)
+      : 5
+
+  return {
+    ...settings,
+    years,
+    interval: settings.interval || 'yearly',
+    zoomLevel,
+    escalationPercent,
+    escalationEveryYears,
+  }
+}
+
+function normalizeChunkProject(chunk: ChunkProject): ChunkProject {
+  const fallbackStart =
+    typeof chunk.timelineStart === 'number' && chunk.timelineStart >= 0
+      ? chunk.timelineStart
+      : 0
+  const fallbackDuration =
+    typeof chunk.timelineDuration === 'number' && chunk.timelineDuration > 0
+      ? chunk.timelineDuration
+      : 1
+  const timelineSegments =
+    Array.isArray(chunk.timelineSegments) && chunk.timelineSegments.length > 0
+      ? chunk.timelineSegments.map((segment, index) => ({
+          id: segment.id || `${chunk.id}-segment-${index + 1}`,
+          start: typeof segment.start === 'number' && segment.start >= 0 ? segment.start : 0,
+          duration:
+            typeof segment.duration === 'number' && segment.duration > 0 ? segment.duration : 1,
+        }))
+      : [
+          {
+            id: `${chunk.id}-segment-1`,
+            start: fallbackStart,
+            duration: fallbackDuration,
+          },
+        ]
+
+  return {
+    ...chunk,
+    timelineSegments,
+    timelineStart: timelineSegments[0]?.start ?? fallbackStart,
+    timelineDuration: timelineSegments[0]?.duration ?? fallbackDuration,
+  }
+}
 
 export function getStoredChunkProjects(): ChunkProject[] {
-  if (typeof window === 'undefined') return []
+  if (typeof window === 'undefined') return SEED_CHUNK_PROJECTS.map(normalizeChunkProject)
 
   const raw = localStorage.getItem(CHUNK_PROJECTS_KEY)
-  if (!raw) return []
+  if (!raw) return SEED_CHUNK_PROJECTS.map(normalizeChunkProject)
 
   try {
-    return JSON.parse(raw) as ChunkProject[]
+    return mergeByKey(
+      SEED_CHUNK_PROJECTS.map(normalizeChunkProject),
+      (JSON.parse(raw) as ChunkProject[]).map(normalizeChunkProject),
+      (item) => item.id
+    )
   } catch {
-    return []
+    return SEED_CHUNK_PROJECTS.map(normalizeChunkProject)
   }
 }
 
 export function saveStoredChunkProjects(projects: ChunkProject[]) {
   if (typeof window === 'undefined') return
-  localStorage.setItem(CHUNK_PROJECTS_KEY, JSON.stringify(projects))
+  localStorage.setItem(
+    CHUNK_PROJECTS_KEY,
+    JSON.stringify(projects.map(normalizeChunkProject))
+  )
 }
 
 export function getChunkProjectsForProject(projectId: string) {
@@ -381,6 +499,9 @@ export function createChunkProject(input: { projectId: string; name: string }) {
     chunkNumber: getNextChunkNumber(input.projectId),
     name: input.name.trim(),
     itemLinks: [],
+    timelineSegments: [],
+    timelineStart: 0,
+    timelineDuration: 1,
     createdAt: new Date().toISOString(),
   }
 
@@ -392,11 +513,69 @@ export function updateChunkProject(chunkId: string, updates: Partial<ChunkProjec
   const all = getStoredChunkProjects()
 
   const updated = all.map((chunk) =>
-    chunk.id === chunkId ? { ...chunk, ...updates } : chunk
+    chunk.id === chunkId ? normalizeChunkProject({ ...chunk, ...updates }) : chunk
   )
 
   saveStoredChunkProjects(updated)
   return updated.find((chunk) => chunk.id === chunkId) || null
+}
+
+export function getStoredTimelineSettings(): ProjectTimelineSettings[] {
+  if (typeof window === 'undefined') return SEED_TIMELINE_SETTINGS.map(normalizeTimelineSettings)
+
+  const raw = localStorage.getItem(TIMELINE_SETTINGS_KEY)
+  if (!raw) return SEED_TIMELINE_SETTINGS.map(normalizeTimelineSettings)
+
+  try {
+    return mergeByKey(
+      SEED_TIMELINE_SETTINGS.map(normalizeTimelineSettings),
+      (JSON.parse(raw) as ProjectTimelineSettings[]).map(normalizeTimelineSettings),
+      (item) => item.projectId
+    )
+  } catch {
+    return SEED_TIMELINE_SETTINGS.map(normalizeTimelineSettings)
+  }
+}
+
+export function getTimelineSettingsForProject(projectId: string): ProjectTimelineSettings {
+  return (
+    getStoredTimelineSettings().find((item) => item.projectId === projectId) || {
+      projectId,
+      years: 10,
+      interval: 'yearly',
+      zoomLevel: 3,
+      escalationPercent: 0,
+      escalationEveryYears: 5,
+    }
+  )
+}
+
+export function updateTimelineSettingsForProject(
+  projectId: string,
+  updates: Partial<ProjectTimelineSettings>
+) {
+  if (typeof window === 'undefined') {
+    return {
+      projectId,
+      years: updates.years ?? 10,
+      interval: updates.interval ?? 'yearly',
+      zoomLevel: updates.zoomLevel ?? 3,
+      escalationPercent: updates.escalationPercent ?? 0,
+      escalationEveryYears: updates.escalationEveryYears ?? 5,
+    }
+  }
+
+  const all = getStoredTimelineSettings()
+  const existing = getTimelineSettingsForProject(projectId)
+  const next = normalizeTimelineSettings({
+    ...existing,
+    ...updates,
+    projectId,
+  })
+
+  const remaining = all.filter((item) => item.projectId !== projectId)
+  localStorage.setItem(TIMELINE_SETTINGS_KEY, JSON.stringify([...remaining, next]))
+  return next
 }
 
 export function deleteChunkProject(chunkId: string) {

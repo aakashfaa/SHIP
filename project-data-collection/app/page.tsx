@@ -36,28 +36,24 @@ export default function HomePage() {
         >
           <div className="max-w-2xl">
             <p className="text-xs font-semibold uppercase tracking-[0.3em] text-amber-300/80">
-              Project Data Collection
+              Finegold Alexander Architects
             </p>
             <h1 className="mt-5 text-5xl font-semibold tracking-tight md:text-6xl">
-              Turn line-item chaos into structured project packages.
+              Master Plan Dashboard
             </h1>
-            <p className="mt-6 max-w-xl text-base leading-7 text-slate-200">
-              A focused workspace for building projects, collecting consultant input,
-              reviewing matrices, and chunking line items into decision-ready packages.
-            </p>
 
             <div className="mt-10 grid gap-4 sm:grid-cols-3">
               <div className="rounded-[1.5rem] border border-white/10 bg-white/8 p-4 backdrop-blur-xl">
                 <div className="text-2xl font-semibold">01</div>
-                <div className="mt-2 text-sm text-slate-200">Collect consultant line items</div>
+                <div className="mt-2 text-sm text-slate-200">Collect consultant data</div>
               </div>
               <div className="rounded-[1.5rem] border border-white/10 bg-white/8 p-4 backdrop-blur-xl">
                 <div className="text-2xl font-semibold">02</div>
-                <div className="mt-2 text-sm text-slate-200">Build project package matrices</div>
+                <div className="mt-2 text-sm text-slate-200">Build project packages</div>
               </div>
               <div className="rounded-[1.5rem] border border-white/10 bg-white/8 p-4 backdrop-blur-xl">
                 <div className="text-2xl font-semibold">03</div>
-                <div className="mt-2 text-sm text-slate-200">Manage review-ready workspaces</div>
+                <div className="mt-2 text-sm text-slate-200">Create Visuals</div>
               </div>
             </div>
           </div>

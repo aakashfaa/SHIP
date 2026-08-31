@@ -1,0 +1,17 @@
+# dependencies
+node_modules/
+
+# env — never commit secrets
+.env
+.env.*
+!.env.example
+
+# Office lock files
+~$*
+
+# local tool state
+.claude/settings.local.json
+
+# OS
+.DS_Store
+Thumbs.db

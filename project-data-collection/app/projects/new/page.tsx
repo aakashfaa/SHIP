@@ -28,6 +28,120 @@ const createConsultantDraft = (
   emailInput: '',
 })
 
+const CONSULTANT_THEME: Record<
+  ConsultantType,
+  {
+    selectedChip: string
+    card: string
+    badge: string
+    button: string
+    chip: string
+  }
+> = {
+  Architecture: {
+    selectedChip: 'bg-amber-500 text-white',
+    card: 'border-amber-200 bg-amber-50/70',
+    badge: 'text-amber-950',
+    button: 'bg-amber-500 text-white',
+    chip: 'bg-amber-100 text-amber-900',
+  },
+  Accessibility: {
+    selectedChip: 'bg-emerald-700 text-white',
+    card: 'border-emerald-200 bg-emerald-50/70',
+    badge: 'text-emerald-950',
+    button: 'bg-emerald-700 text-white',
+    chip: 'bg-emerald-100 text-emerald-900',
+  },
+  Civil: {
+    selectedChip: 'bg-rose-500 text-white',
+    card: 'border-rose-200 bg-rose-50/70',
+    badge: 'text-rose-950',
+    button: 'bg-rose-500 text-white',
+    chip: 'bg-rose-100 text-rose-900',
+  },
+  Electrical: {
+    selectedChip: 'bg-violet-600 text-white',
+    card: 'border-violet-200 bg-violet-50/70',
+    badge: 'text-violet-950',
+    button: 'bg-violet-600 text-white',
+    chip: 'bg-violet-100 text-violet-900',
+  },
+  Envelope: {
+    selectedChip: 'bg-sky-700 text-white',
+    card: 'border-sky-200 bg-sky-50/70',
+    badge: 'text-sky-950',
+    button: 'bg-sky-700 text-white',
+    chip: 'bg-sky-100 text-sky-900',
+  },
+  'Fire Alarm': {
+    selectedChip: 'bg-red-600 text-white',
+    card: 'border-red-200 bg-red-50/70',
+    badge: 'text-red-950',
+    button: 'bg-red-600 text-white',
+    chip: 'bg-red-100 text-red-900',
+  },
+  'Hazardous Materials': {
+    selectedChip: 'bg-orange-700 text-white',
+    card: 'border-orange-200 bg-orange-50/70',
+    badge: 'text-orange-950',
+    button: 'bg-orange-700 text-white',
+    chip: 'bg-orange-100 text-orange-900',
+  },
+  'Historic Preservation': {
+    selectedChip: 'bg-stone-600 text-white',
+    card: 'border-stone-200 bg-stone-50/70',
+    badge: 'text-stone-950',
+    button: 'bg-stone-600 text-white',
+    chip: 'bg-stone-100 text-stone-900',
+  },
+  Landscape: {
+    selectedChip: 'bg-lime-600 text-white',
+    card: 'border-lime-200 bg-lime-50/70',
+    badge: 'text-lime-950',
+    button: 'bg-lime-600 text-white',
+    chip: 'bg-lime-100 text-lime-900',
+  },
+  Mechanical: {
+    selectedChip: 'bg-emerald-600 text-white',
+    card: 'border-emerald-200 bg-emerald-50/70',
+    badge: 'text-emerald-950',
+    button: 'bg-emerald-600 text-white',
+    chip: 'bg-emerald-100 text-emerald-900',
+  },
+  Plumbing: {
+    selectedChip: 'bg-cyan-600 text-white',
+    card: 'border-cyan-200 bg-cyan-50/70',
+    badge: 'text-cyan-950',
+    button: 'bg-cyan-600 text-white',
+    chip: 'bg-cyan-100 text-cyan-900',
+  },
+  Structural: {
+    selectedChip: 'bg-blue-600 text-white',
+    card: 'border-blue-200 bg-blue-50/70',
+    badge: 'text-blue-950',
+    button: 'bg-blue-600 text-white',
+    chip: 'bg-blue-100 text-blue-900',
+  },
+  Security: {
+    selectedChip: 'bg-slate-700 text-white',
+    card: 'border-slate-200 bg-slate-50/80',
+    badge: 'text-slate-950',
+    button: 'bg-slate-700 text-white',
+    chip: 'bg-slate-100 text-slate-900',
+  },
+  Telecom: {
+    selectedChip: 'bg-teal-700 text-white',
+    card: 'border-teal-200 bg-teal-50/70',
+    badge: 'text-teal-950',
+    button: 'bg-teal-700 text-white',
+    chip: 'bg-teal-100 text-teal-900',
+  },
+}
+
+function getConsultantTheme(type: ConsultantType) {
+  return CONSULTANT_THEME[type]
+}
+
 export default function NewProjectPage() {
   const router = useRouter()
   const [user] = useState<SafeUser | null>(() => getCurrentUser())
@@ -162,8 +276,8 @@ export default function NewProjectPage() {
 
   return (
     <main className="min-h-screen bg-[radial-gradient(circle_at_top_left,_rgba(251,191,36,0.18),_transparent_24%),radial-gradient(circle_at_top_right,_rgba(45,212,191,0.18),_transparent_26%),linear-gradient(180deg,_#fffdf7_0%,_#f8fafc_46%,_#eef2f7_100%)] px-4 py-6 md:px-6">
-      <div className="mx-auto max-w-7xl">
-        <div className="mb-8 overflow-hidden rounded-[2rem] border border-white/70 bg-white/72 px-6 py-6 shadow-[0_30px_100px_rgba(15,23,42,0.12)] backdrop-blur-2xl">
+      <div className="mx-auto max-w-5xl">
+        <div className="mb-6 overflow-hidden rounded-[2rem] border border-white/70 bg-white/72 px-6 py-6 shadow-[0_30px_100px_rgba(15,23,42,0.12)] backdrop-blur-2xl">
           <div className="flex flex-col gap-5 lg:flex-row lg:items-center lg:justify-between">
           <div>
             <p className="text-xs font-semibold uppercase tracking-[0.25em] text-amber-700/70">
@@ -172,9 +286,6 @@ export default function NewProjectPage() {
             <h1 className="mt-2 text-4xl font-semibold tracking-tight text-slate-950">
               Create Project
             </h1>
-            <p className="mt-3 text-base text-slate-600">
-              Start with FAA for architecture, then add consultant teams.
-            </p>
           </div>
 
           <Link
@@ -209,37 +320,23 @@ export default function NewProjectPage() {
           </div>
         ) : null}
 
-        <form onSubmit={handleSubmit} className="space-y-6">
-          <div className="rounded-[2rem] border border-white/70 bg-white/76 p-6 shadow-[0_24px_90px_rgba(15,23,42,0.12)] backdrop-blur-2xl">
-            <label
-              htmlFor="project-name"
-              className="mb-2 block text-sm font-medium text-gray-700"
-            >
-              Project Name
-            </label>
+        <form onSubmit={handleSubmit} className="space-y-5">
+          <div className="rounded-[2rem] border border-white/70 bg-white/76 p-5 shadow-[0_24px_90px_rgba(15,23,42,0.12)] backdrop-blur-2xl">
             <input
               id="project-name"
               name="project-name"
               value={projectName}
               onChange={(e) => setProjectName(e.target.value)}
-              placeholder="Enter project name"
+              placeholder="Project name"
               className="w-full rounded-2xl border border-slate-200 bg-white/95 px-4 py-3 text-sm outline-none transition focus:border-teal-600 focus:ring-2 focus:ring-teal-100"
             />
           </div>
 
-          <div className="rounded-[2rem] border border-white/70 bg-white/76 p-6 shadow-[0_24px_90px_rgba(15,23,42,0.12)] backdrop-blur-2xl">
-            <div className="mb-4">
-              <h2 className="text-lg font-semibold text-slate-950">
-                Add Consultant Types
-              </h2>
-              <p className="mt-1 text-sm text-slate-500">
-                Click a consultant type to add its section below.
-              </p>
-            </div>
-
+          <div className="rounded-[2rem] border border-white/70 bg-white/76 p-5 shadow-[0_24px_90px_rgba(15,23,42,0.12)] backdrop-blur-2xl">
             <div className="flex flex-wrap gap-3">
               {CONSULTANT_TYPES.map((type) => {
                 const isSelected = selectedTypes.includes(type)
+                const theme = getConsultantTheme(type)
 
                 return (
                   <button
@@ -249,7 +346,7 @@ export default function NewProjectPage() {
                     disabled={isSelected}
                     className={`rounded-full px-4 py-2 text-sm font-medium transition ${
                       isSelected
-                        ? 'bg-[linear-gradient(135deg,#0f172a_0%,#1e293b_45%,#0f766e_100%)] text-white'
+                        ? theme.selectedChip
                         : 'border border-slate-300 bg-white/95 text-slate-700 hover:-translate-y-[1px] hover:border-slate-400'
                     }`}
                   >
@@ -261,18 +358,18 @@ export default function NewProjectPage() {
           </div>
 
           <div className="grid gap-5">
-            {consultants.map((consultant) => (
+            {consultants.map((consultant) => {
+              const theme = getConsultantTheme(consultant.type)
+
+              return (
               <div
                 key={consultant.type}
-                className="rounded-[2rem] border border-white/70 bg-white/80 p-6 shadow-[0_24px_90px_rgba(15,23,42,0.12)] backdrop-blur-2xl"
+                className={`rounded-[2rem] border p-5 shadow-[0_24px_90px_rgba(15,23,42,0.12)] backdrop-blur-2xl ${theme.card}`}
               >
                 <div className="mb-5 flex items-start justify-between gap-4">
                   <div>
-                    <div className="mb-2 inline-flex rounded-full bg-[linear-gradient(135deg,#0f172a_0%,#1e293b_45%,#0f766e_100%)] px-3 py-1 text-xs font-medium text-white">
+                    <h2 className={`text-xl font-semibold ${theme.badge}`}>
                       {consultant.type}
-                    </div>
-                    <h2 className="text-xl font-semibold text-slate-950">
-                      {consultant.type} Consultant
                     </h2>
                   </div>
 
@@ -293,12 +390,6 @@ export default function NewProjectPage() {
 
                 <div className="grid gap-4 md:grid-cols-[1.2fr_1fr]">
                   <div>
-                    <label
-                      htmlFor={`org-name-${consultant.type}`}
-                      className="mb-2 block text-sm font-medium text-slate-700"
-                    >
-                      Organization Name
-                    </label>
                     <input
                       id={`org-name-${consultant.type}`}
                       name={`org-name-${consultant.type}`}
@@ -310,18 +401,12 @@ export default function NewProjectPage() {
                           e.target.value
                         )
                       }
-                      placeholder="Enter organization name"
+                      placeholder="Organization"
                       className="w-full rounded-2xl border border-slate-200 bg-white/95 px-4 py-3 text-sm outline-none transition focus:border-teal-600 focus:ring-2 focus:ring-teal-100"
                     />
                   </div>
 
                   <div>
-                    <label
-                      htmlFor={`email-input-${consultant.type}`}
-                      className="mb-2 block text-sm font-medium text-slate-700"
-                    >
-                      Add Email
-                    </label>
                     <div className="flex gap-2">
                       <input
                         id={`email-input-${consultant.type}`}
@@ -340,7 +425,7 @@ export default function NewProjectPage() {
                       <button
                         type="button"
                         onClick={() => addEmail(consultant.type)}
-                        className="rounded-2xl bg-[linear-gradient(135deg,#0f172a_0%,#1e293b_45%,#0f766e_100%)] px-4 py-3 text-sm font-medium text-white"
+                        className={`rounded-2xl px-4 py-3 text-sm font-medium ${theme.button}`}
                       >
                         Add
                       </button>
@@ -349,14 +434,12 @@ export default function NewProjectPage() {
                 </div>
 
                 <div className="mt-4">
-                  <p className="mb-2 text-sm font-medium text-slate-700">Emails</p>
-
                   {consultant.emails.length > 0 ? (
                     <div className="flex flex-wrap gap-2">
                       {consultant.emails.map((email) => (
                         <div
                           key={email}
-                          className="flex items-center gap-2 rounded-full bg-slate-100 px-3 py-2 text-xs text-slate-700"
+                          className={`flex items-center gap-2 rounded-full px-3 py-2 text-xs ${theme.chip}`}
                         >
                           <span>{email}</span>
                           <button
@@ -372,12 +455,12 @@ export default function NewProjectPage() {
                     </div>
                   ) : (
                     <div className="rounded-2xl border border-dashed border-slate-200 px-4 py-4 text-sm text-slate-400">
-                      No emails added yet.
+                      No emails yet
                     </div>
                   )}
                 </div>
               </div>
-            ))}
+            )})}
           </div>
 
           <div className="flex justify-end">

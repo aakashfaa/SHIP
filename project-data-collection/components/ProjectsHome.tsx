@@ -35,7 +35,7 @@ export default function ProjectsHome({ user, projects }: ProjectsHomeProps) {
           <div className="flex flex-col gap-5 lg:flex-row lg:items-start lg:justify-between">
             <div className="max-w-3xl">
               <p className="text-xs font-semibold uppercase tracking-[0.25em] text-amber-700/70">
-                Project Data Collection
+                Master Plan Dashboard
               </p>
               <h1 className="mt-3 text-4xl font-semibold tracking-tight text-slate-950">
                 {isAdmin ? 'Project Control Room' : 'Assigned Projects'}

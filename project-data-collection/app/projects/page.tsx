@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import ProjectsHome from '@/components/ProjectsHome'
 import { getCurrentUser } from '@/lib/auth'
@@ -10,7 +10,7 @@ import { Project, SafeUser } from '@/lib/types'
 export default function ProjectsPage() {
   const router = useRouter()
   const [user] = useState<SafeUser | null>(() => getCurrentUser())
-  const [refreshKey, setRefreshKey] = useState(0)
+  const [, setRefreshKey] = useState(0)
 
   useEffect(() => {
     if (!user) {
@@ -24,7 +24,7 @@ export default function ProjectsPage() {
     return () => window.removeEventListener('focus', handleFocus)
   }, [])
 
-  const projects = useMemo(() => {
+  const projects = (() => {
     const allProjects = getStoredProjects()
 
     if (!user) return []
@@ -32,7 +32,7 @@ export default function ProjectsPage() {
     return user.role === 'admin'
       ? allProjects
       : allProjects.filter((project) => project.assignedUsers.includes(user.email))
-  }, [user, refreshKey])
+  })()
 
   if (!user) {
     return (

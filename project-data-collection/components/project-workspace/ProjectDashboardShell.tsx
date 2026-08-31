@@ -10,7 +10,7 @@ import SettingsTab from './SettingsTab'
 import AddDataTab from './AddDataTab'
 import MasterViewTab from './MasterViewTab'
 import ChunkingTab from './ChunkingTab'
-import VisualsTab from './VisualsTab'
+import TimelineTab from './TimelineTab'
 
 type ProjectDashboardShellProps = {
   user: SafeUser
@@ -22,7 +22,7 @@ type TabKey =
   | 'add-data'
   | 'master-view'
   | 'chunking'
-  | 'visuals'
+  | 'timeline'
 
 type Tab = {
   key: TabKey
@@ -44,13 +44,13 @@ export default function ProjectDashboardShell({
         { key: 'add-data', label: 'Add Data' },
         { key: 'master-view', label: 'Master View' },
         { key: 'chunking', label: 'Chunking' },
-        { key: 'visuals', label: 'Visuals' },
+        { key: 'timeline', label: 'Timeline' },
       ]
     : [
         { key: 'add-data', label: 'Add Data' },
         { key: 'master-view', label: 'Master View' },
         { key: 'chunking', label: 'Chunking' },
-        { key: 'visuals', label: 'Visuals' },
+        { key: 'timeline', label: 'Timeline' },
       ]
 
   const [activeTab, setActiveTab] = useState<TabKey>('add-data')
@@ -72,23 +72,24 @@ export default function ProjectDashboardShell({
         return <MasterViewTab project={project} />
       case 'chunking':
         return <ChunkingTab project={project} />
-      case 'visuals':
-        return <VisualsTab />
+      case 'timeline':
+        return <TimelineTab project={project} />
       default:
         return null
     }
   }
 
   const currentTab = tabs.find((tab) => tab.key === activeTab)
-  const isWideTab = activeTab === 'master-view' || activeTab === 'chunking'
+  const widthClass =
+    activeTab === 'master-view' || activeTab === 'timeline'
+      ? 'max-w-full'
+      : activeTab === 'chunking'
+        ? 'max-w-[88rem]'
+        : 'max-w-7xl'
 
   return (
     <div className="min-h-screen bg-[radial-gradient(circle_at_top_left,_rgba(251,191,36,0.18),_transparent_24%),radial-gradient(circle_at_top_right,_rgba(56,189,248,0.18),_transparent_28%),linear-gradient(180deg,_#fffdf7_0%,_#f7f8fc_50%,_#edf2f7_100%)]">
-      <div
-        className={`mx-auto px-4 pb-32 pt-6 md:px-6 ${
-          isWideTab ? 'max-w-full' : 'max-w-7xl'
-        }`}
-      >
+      <div className={`mx-auto px-4 pb-32 pt-6 md:px-6 ${widthClass}`}>
         <div className="mb-6 overflow-hidden rounded-[2rem] border border-white/70 bg-white/72 px-5 py-5 shadow-[0_30px_100px_rgba(15,23,42,0.12)] backdrop-blur-2xl md:px-7">
           <div className="flex flex-col gap-5 lg:flex-row lg:items-start lg:justify-between">
             <div>
@@ -98,10 +99,10 @@ export default function ProjectDashboardShell({
               <h1 className="mt-2 text-3xl font-semibold tracking-tight text-slate-950 md:text-4xl">
                 {project.name}
               </h1>
-              <div className="mt-4 flex flex-wrap gap-2">
-                <div className="rounded-full border border-amber-200 bg-amber-50 px-3 py-1.5 text-xs font-medium text-amber-900">
-                  {currentTab?.label}
-                </div>
+              <div className="mt-4">
+                <div className="text-lg font-medium text-slate-700">{currentTab?.label}</div>
+              </div>
+              <div className="mt-3 flex flex-wrap gap-2">
                 <div className="rounded-full border border-sky-200 bg-sky-50 px-3 py-1.5 text-xs font-medium text-sky-900">
                   {user.name}
                 </div>
@@ -127,7 +128,7 @@ export default function ProjectDashboardShell({
 
         <div
           className={`rounded-[2rem] border border-white/70 bg-white/78 shadow-[0_30px_100px_rgba(15,23,42,0.12)] backdrop-blur-2xl ${
-            isWideTab ? 'p-4 md:p-5' : 'p-6'
+            activeTab === 'master-view' || activeTab === 'timeline' ? 'p-4 md:p-5' : 'p-6'
           }`}
         >
           <AnimatePresence mode="wait">

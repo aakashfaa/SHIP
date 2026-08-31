@@ -112,6 +112,7 @@ export type LineItem = {
   benefitToUsers: RelativeImpact
   benefitToPublic: RelativeImpact
   relativeFirstCost: RelativeFirstCost
+  estimatedFirstCost: string
   relativeOperationCostImpact: RelativeOperationCostImpact
   relativeOperationalEnergyUsage: RelativeOperationalEnergyUsage
   electrificationEO594: RelativeImpact
@@ -130,11 +131,37 @@ export type ChunkProjectItem = {
   quantity: string
 }
 
+export type ChunkTimelineSegment = {
+  id: string
+  start: number
+  duration: number
+}
+
+export type TimelineInterval =
+  | 'monthly'
+  | 'quarterly'
+  | 'yearly'
+  | 'bi-yearly'
+  | '3-yearly'
+  | '5-yearly'
+
 export type ChunkProject = {
   id: string
   projectId: string
   chunkNumber: string
   name: string
   itemLinks: ChunkProjectItem[]
+  timelineSegments: ChunkTimelineSegment[]
+  timelineStart: number
+  timelineDuration: number
   createdAt: string
+}
+
+export type ProjectTimelineSettings = {
+  projectId: string
+  years: number
+  interval: TimelineInterval
+  zoomLevel: number
+  escalationPercent: number
+  escalationEveryYears: number
 }
