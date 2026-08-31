@@ -5,7 +5,7 @@ import Link from 'next/link'
 import { useRouter } from 'next/navigation'
 import { getSupabaseBrowserClient } from '@/lib/supabase/client'
 
-type Status = 'idle' | 'submitting' | 'check-email' | 'no-invite'
+type Status = 'idle' | 'submitting' | 'check-email' | 'no-invite' | 'existing-account'
 
 const PAGE_SHELL =
   'flex min-h-screen items-center justify-center bg-[radial-gradient(circle_at_top_left,_rgba(251,191,36,0.18),_transparent_26%),radial-gradient(circle_at_top_right,_rgba(45,212,191,0.18),_transparent_28%),linear-gradient(180deg,_#fffdf7_0%,_#f8fafc_50%,_#eef2f7_100%)] px-4'
@@ -51,6 +51,14 @@ export default function SignUpPage() {
     })
 
     if (signUpError) {
+      // This Supabase project's auth.users is shared with another,
+      // unrelated app. Someone already invited via ship.pending_invites
+      // can perfectly well already exist there — that's a normal,
+      // expected path here, not a failure worth a bare red error.
+      if (signUpError.message.toLowerCase().includes('already registered')) {
+        setStatus('existing-account')
+        return
+      }
       setError(signUpError.message)
       setStatus('idle')
       return
@@ -99,6 +107,31 @@ export default function SignUpPage() {
             <span className="font-medium">{email.trim()}</span>. Click it to finish setting
             up your account.
           </p>
+        </div>
+      </main>
+    )
+  }
+
+  if (status === 'existing-account') {
+    return (
+      <main className={PAGE_SHELL}>
+        <div className={CARD}>
+          <p className="mb-2 text-xs font-semibold uppercase tracking-[0.25em] text-amber-700/70">
+            Master Plan Dashboard
+          </p>
+          <h1 className="text-3xl font-semibold tracking-tight text-slate-950">
+            You already have an account
+          </h1>
+          <p className="mt-3 text-sm leading-6 text-slate-600">
+            <span className="font-medium">{email.trim()}</span> already has an account on
+            this platform. Please sign in instead.
+          </p>
+          <Link
+            href="/"
+            className="mt-6 inline-block text-sm font-medium text-teal-700 hover:text-teal-800"
+          >
+            Back to sign in
+          </Link>
         </div>
       </main>
     )
