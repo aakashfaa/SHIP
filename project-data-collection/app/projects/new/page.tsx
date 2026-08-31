@@ -3,18 +3,21 @@
 import { useEffect, useMemo, useState } from 'react'
 import Link from 'next/link'
 import { useRouter } from 'next/navigation'
-import { getCurrentUser } from '@/lib/auth'
-import { CONSULTANT_TYPES } from '@/lib/mock-projects'
-import { createProject, getDefaultConsultantPassword } from '@/lib/store'
-import { ConsultantType, ProjectConsultant, SafeUser } from '@/lib/types'
+import { useAuth } from '@/lib/auth-context'
+import { CONSULTANT_TYPES } from '@/lib/constants'
+import { createProject } from '@/lib/store'
+import { ConsultantType, Project, ProjectConsultant } from '@/lib/types'
 
 type ConsultantDraft = ProjectConsultant & {
   emailInput: string
 }
 
-type CreatedUserSummary = {
+type InviteResult = {
   email: string
-  password: string
+  invited: boolean
+  alreadyExisted: boolean
+  actionLink: string | null
+  error: string | null
 }
 
 const createConsultantDraft = (
@@ -144,15 +147,24 @@ function getConsultantTheme(type: ConsultantType) {
 
 export default function NewProjectPage() {
   const router = useRouter()
-  const [user] = useState<SafeUser | null>(() => getCurrentUser())
+  const { user, loading: authLoading } = useAuth()
   const [projectName, setProjectName] = useState('')
+  const [formError, setFormError] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
-  const [createdUsers, setCreatedUsers] = useState<CreatedUserSummary[]>([])
   const [consultants, setConsultants] = useState<ConsultantDraft[]>([
     createConsultantDraft('Architecture', 'FAA', ['admin@gmail.com']),
   ])
 
+  const [createdProject, setCreatedProject] = useState<Project | null>(null)
+  const [invitedEmails, setInvitedEmails] = useState<string[]>([])
+  const [inviteLoading, setInviteLoading] = useState(false)
+  const [inviteError, setInviteError] = useState<string | null>(null)
+  const [inviteResults, setInviteResults] = useState<InviteResult[] | null>(null)
+  const [copiedEmail, setCopiedEmail] = useState<string | null>(null)
+
   useEffect(() => {
+    if (authLoading) return
+
     if (!user) {
       router.replace('/')
       return
@@ -161,14 +173,14 @@ export default function NewProjectPage() {
     if (user.role !== 'admin') {
       router.replace('/projects')
     }
-  }, [user, router])
+  }, [user, authLoading, router])
 
   const selectedTypes = useMemo(
     () => consultants.map((consultant) => consultant.type),
     [consultants]
   )
 
-  if (!user || user.role !== 'admin') {
+  if (authLoading || !user || user.role !== 'admin') {
     return (
       <main className="flex min-h-screen items-center justify-center">
         <p className="text-sm text-gray-500">Redirecting...</p>
@@ -223,55 +235,98 @@ export default function NewProjectPage() {
     )
   }
 
-  function validateForm() {
+  function validateForm(): string | null {
     if (!projectName.trim()) {
-      alert('Please enter a project name.')
-      return false
+      return 'Please enter a project name.'
     }
 
     for (const consultant of consultants) {
       if (!consultant.orgName.trim()) {
-        alert(`Please enter an organization name for ${consultant.type}.`)
-        return false
+        return `Please enter an organization name for ${consultant.type}.`
       }
 
       if (consultant.emails.length === 0) {
-        alert(`Please add at least one email for ${consultant.type}.`)
-        return false
+        return `Please add at least one email for ${consultant.type}.`
       }
     }
 
-    return true
+    return null
   }
 
-  function handleSubmit(e: React.FormEvent) {
-    e.preventDefault()
+  async function sendInvites(emails: string[]) {
+    setInviteLoading(true)
+    setInviteError(null)
 
-    if (!validateForm()) return
+    try {
+      const res = await fetch('/api/admin/invite', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ emails }),
+      })
+
+      if (!res.ok) {
+        throw new Error(`Invite request failed with status ${res.status}`)
+      }
+
+      const payload = (await res.json()) as { results: InviteResult[] }
+      setInviteResults(payload.results)
+    } catch (err) {
+      // Non-fatal: the project already exists. The admin can invite these
+      // consultants manually later.
+      setInviteError(
+        err instanceof Error ? err.message : 'Failed to send invites.'
+      )
+    } finally {
+      setInviteLoading(false)
+    }
+  }
+
+  async function handleSubmit(e: React.FormEvent) {
+    e.preventDefault()
+    setFormError(null)
+
+    const validationError = validateForm()
+    if (validationError) {
+      setFormError(validationError)
+      return
+    }
 
     setSubmitting(true)
 
-    const result = createProject({
-      name: projectName,
-      consultants: consultants.map((consultant) => ({
-        type: consultant.type,
-        orgName: consultant.orgName,
-        emails: consultant.emails,
-      })),
-    })
+    try {
+      const result = await createProject({
+        name: projectName,
+        consultants: consultants.map((consultant) => ({
+          type: consultant.type,
+          orgName: consultant.orgName,
+          emails: consultant.emails,
+        })),
+      })
 
-    setCreatedUsers(
-      result.newUsers.map((user) => ({
-        email: user.email,
-        password: getDefaultConsultantPassword(),
-      }))
-    )
+      setCreatedProject(result.project)
+      setInvitedEmails(result.invitedEmails)
+      setSubmitting(false)
 
-    setSubmitting(false)
+      if (result.invitedEmails.length > 0) {
+        await sendInvites(result.invitedEmails)
+      }
+    } catch (err) {
+      setSubmitting(false)
+      setFormError(
+        err instanceof Error ? err.message : 'Failed to create project.'
+      )
+    }
+  }
 
-    setTimeout(() => {
-      router.push(`/projects/${result.project.id}`)
-    }, 1400)
+  async function copyToClipboard(value: string, email: string) {
+    try {
+      await navigator.clipboard.writeText(value)
+      setCopiedEmail(email)
+      window.setTimeout(() => setCopiedEmail(null), 1800)
+    } catch {
+      // Clipboard access can fail (permissions, insecure context) — the link
+      // text is still selectable/visible, so this is a soft failure.
+    }
   }
 
   return (
@@ -297,182 +352,246 @@ export default function NewProjectPage() {
           </div>
         </div>
 
-        {createdUsers.length > 0 ? (
+        {createdProject ? (
           <div className="mb-6 rounded-[2rem] border border-emerald-200 bg-emerald-50/90 p-5 shadow-sm">
             <h2 className="text-lg font-semibold text-emerald-900">
               Project created
             </h2>
             <p className="mt-1 text-sm text-emerald-800">
-              New consultant login accounts were created with default password{' '}
-              <span className="font-semibold">{getDefaultConsultantPassword()}</span>.
+              {invitedEmails.length > 0
+                ? "The consultants below have been invited and will receive a set-up link by email."
+                : 'No new consultant accounts were needed — every email already has access.'}
             </p>
 
-            <div className="mt-4 space-y-2">
-              {createdUsers.map((user) => (
-                <div
-                  key={user.email}
-                  className="rounded-2xl bg-white px-4 py-3 text-sm text-emerald-900"
-                >
-                  {user.email}
-                </div>
-              ))}
+            {inviteLoading ? (
+              <p className="mt-4 text-sm text-emerald-700">Sending invites...</p>
+            ) : null}
+
+            {inviteError ? (
+              <div className="mt-4 rounded-2xl bg-amber-50 px-4 py-3 text-sm text-amber-800">
+                The project was created, but sending invites failed ({inviteError}).
+                You can invite these consultants manually from Settings.
+              </div>
+            ) : null}
+
+            {inviteResults && inviteResults.length > 0 ? (
+              <div className="mt-4 space-y-2">
+                {inviteResults.map((result) => (
+                  <div
+                    key={result.email}
+                    className="rounded-2xl bg-white px-4 py-3 text-sm text-emerald-900"
+                  >
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <span className="font-medium">{result.email}</span>
+                      {result.error ? (
+                        <span className="text-xs text-rose-600">
+                          Invite failed: {result.error}
+                        </span>
+                      ) : result.alreadyExisted ? (
+                        <span className="text-xs text-slate-500">
+                          Already has an account
+                        </span>
+                      ) : (
+                        <span className="text-xs text-emerald-600">Invited</span>
+                      )}
+                    </div>
+
+                    {result.actionLink ? (
+                      <div className="mt-2 flex items-center gap-2">
+                        <input
+                          readOnly
+                          value={result.actionLink}
+                          onFocus={(e) => e.currentTarget.select()}
+                          className="flex-1 truncate rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-600"
+                        />
+                        <button
+                          type="button"
+                          onClick={() =>
+                            copyToClipboard(result.actionLink as string, result.email)
+                          }
+                          className="whitespace-nowrap rounded-xl bg-black px-3 py-2 text-xs font-medium text-white"
+                        >
+                          {copiedEmail === result.email ? 'Copied' : 'Copy set-up link'}
+                        </button>
+                      </div>
+                    ) : null}
+                  </div>
+                ))}
+              </div>
+            ) : null}
+
+            <div className="mt-5">
+              <Link
+                href={`/projects/${createdProject.id}`}
+                className="inline-flex rounded-2xl bg-[linear-gradient(135deg,#0f172a_0%,#1e293b_45%,#0f766e_100%)] px-5 py-3 text-sm font-medium text-white shadow-lg transition hover:-translate-y-[1px]"
+              >
+                Go to project
+              </Link>
             </div>
           </div>
         ) : null}
 
-        <form onSubmit={handleSubmit} className="space-y-5">
-          <div className="rounded-[2rem] border border-white/70 bg-white/76 p-5 shadow-[0_24px_90px_rgba(15,23,42,0.12)] backdrop-blur-2xl">
-            <input
-              id="project-name"
-              name="project-name"
-              value={projectName}
-              onChange={(e) => setProjectName(e.target.value)}
-              placeholder="Project name"
-              className="w-full rounded-2xl border border-slate-200 bg-white/95 px-4 py-3 text-sm outline-none transition focus:border-teal-600 focus:ring-2 focus:ring-teal-100"
-            />
-          </div>
+        {!createdProject ? (
+          <form onSubmit={handleSubmit} className="space-y-5">
+            {formError ? (
+              <div className="rounded-[2rem] border border-rose-200 bg-rose-50/90 px-5 py-4 text-sm text-rose-700 shadow-sm">
+                {formError}
+              </div>
+            ) : null}
 
-          <div className="rounded-[2rem] border border-white/70 bg-white/76 p-5 shadow-[0_24px_90px_rgba(15,23,42,0.12)] backdrop-blur-2xl">
-            <div className="flex flex-wrap gap-3">
-              {CONSULTANT_TYPES.map((type) => {
-                const isSelected = selectedTypes.includes(type)
-                const theme = getConsultantTheme(type)
+            <div className="rounded-[2rem] border border-white/70 bg-white/76 p-5 shadow-[0_24px_90px_rgba(15,23,42,0.12)] backdrop-blur-2xl">
+              <input
+                id="project-name"
+                name="project-name"
+                value={projectName}
+                onChange={(e) => setProjectName(e.target.value)}
+                placeholder="Project name"
+                className="w-full rounded-2xl border border-slate-200 bg-white/95 px-4 py-3 text-sm outline-none transition focus:border-teal-600 focus:ring-2 focus:ring-teal-100"
+              />
+            </div>
+
+            <div className="rounded-[2rem] border border-white/70 bg-white/76 p-5 shadow-[0_24px_90px_rgba(15,23,42,0.12)] backdrop-blur-2xl">
+              <div className="flex flex-wrap gap-3">
+                {CONSULTANT_TYPES.map((type) => {
+                  const isSelected = selectedTypes.includes(type)
+                  const theme = getConsultantTheme(type)
+
+                  return (
+                    <button
+                      key={type}
+                      type="button"
+                      onClick={() => !isSelected && addConsultantType(type)}
+                      disabled={isSelected}
+                      className={`rounded-full px-4 py-2 text-sm font-medium transition ${
+                        isSelected
+                          ? theme.selectedChip
+                          : 'border border-slate-300 bg-white/95 text-slate-700 hover:-translate-y-[1px] hover:border-slate-400'
+                      }`}
+                    >
+                      {type}
+                    </button>
+                  )
+                })}
+              </div>
+            </div>
+
+            <div className="grid gap-5">
+              {consultants.map((consultant) => {
+                const theme = getConsultantTheme(consultant.type)
 
                 return (
-                  <button
-                    key={type}
-                    type="button"
-                    onClick={() => !isSelected && addConsultantType(type)}
-                    disabled={isSelected}
-                    className={`rounded-full px-4 py-2 text-sm font-medium transition ${
-                      isSelected
-                        ? theme.selectedChip
-                        : 'border border-slate-300 bg-white/95 text-slate-700 hover:-translate-y-[1px] hover:border-slate-400'
-                    }`}
-                  >
-                    {type}
-                  </button>
-                )
-              })}
-            </div>
-          </div>
-
-          <div className="grid gap-5">
-            {consultants.map((consultant) => {
-              const theme = getConsultantTheme(consultant.type)
-
-              return (
-              <div
-                key={consultant.type}
-                className={`rounded-[2rem] border p-5 shadow-[0_24px_90px_rgba(15,23,42,0.12)] backdrop-blur-2xl ${theme.card}`}
-              >
-                <div className="mb-5 flex items-start justify-between gap-4">
-                  <div>
-                    <h2 className={`text-xl font-semibold ${theme.badge}`}>
-                      {consultant.type}
-                    </h2>
-                  </div>
-
-                  {consultant.type !== 'Architecture' ? (
-                    <button
-                      type="button"
-                      onClick={() => removeConsultant(consultant.type)}
-                      className="rounded-full border border-rose-200 px-3 py-1 text-sm font-medium text-rose-600 hover:bg-rose-50"
-                    >
-                      Remove
-                    </button>
-                  ) : (
-                    <div className="rounded-full bg-slate-100 px-3 py-1 text-xs font-medium text-slate-500">
-                      Default
+                <div
+                  key={consultant.type}
+                  className={`rounded-[2rem] border p-5 shadow-[0_24px_90px_rgba(15,23,42,0.12)] backdrop-blur-2xl ${theme.card}`}
+                >
+                  <div className="mb-5 flex items-start justify-between gap-4">
+                    <div>
+                      <h2 className={`text-xl font-semibold ${theme.badge}`}>
+                        {consultant.type}
+                      </h2>
                     </div>
-                  )}
-                </div>
 
-                <div className="grid gap-4 md:grid-cols-[1.2fr_1fr]">
-                  <div>
-                    <input
-                      id={`org-name-${consultant.type}`}
-                      name={`org-name-${consultant.type}`}
-                      value={consultant.orgName}
-                      onChange={(e) =>
-                        updateConsultant(
-                          consultant.type,
-                          'orgName',
-                          e.target.value
-                        )
-                      }
-                      placeholder="Organization"
-                      className="w-full rounded-2xl border border-slate-200 bg-white/95 px-4 py-3 text-sm outline-none transition focus:border-teal-600 focus:ring-2 focus:ring-teal-100"
-                    />
+                    {consultant.type !== 'Architecture' ? (
+                      <button
+                        type="button"
+                        onClick={() => removeConsultant(consultant.type)}
+                        className="rounded-full border border-rose-200 px-3 py-1 text-sm font-medium text-rose-600 hover:bg-rose-50"
+                      >
+                        Remove
+                      </button>
+                    ) : (
+                      <div className="rounded-full bg-slate-100 px-3 py-1 text-xs font-medium text-slate-500">
+                        Default
+                      </div>
+                    )}
                   </div>
 
-                  <div>
-                    <div className="flex gap-2">
+                  <div className="grid gap-4 md:grid-cols-[1.2fr_1fr]">
+                    <div>
                       <input
-                        id={`email-input-${consultant.type}`}
-                        name={`email-input-${consultant.type}`}
-                        value={consultant.emailInput}
+                        id={`org-name-${consultant.type}`}
+                        name={`org-name-${consultant.type}`}
+                        value={consultant.orgName}
                         onChange={(e) =>
                           updateConsultant(
                             consultant.type,
-                            'emailInput',
+                            'orgName',
                             e.target.value
                           )
                         }
-                        placeholder="name@company.com"
-                        className="flex-1 rounded-2xl border border-slate-200 bg-white/95 px-4 py-3 text-sm outline-none transition focus:border-teal-600 focus:ring-2 focus:ring-teal-100"
+                        placeholder="Organization"
+                        className="w-full rounded-2xl border border-slate-200 bg-white/95 px-4 py-3 text-sm outline-none transition focus:border-teal-600 focus:ring-2 focus:ring-teal-100"
                       />
-                      <button
-                        type="button"
-                        onClick={() => addEmail(consultant.type)}
-                        className={`rounded-2xl px-4 py-3 text-sm font-medium ${theme.button}`}
-                      >
-                        Add
-                      </button>
+                    </div>
+
+                    <div>
+                      <div className="flex gap-2">
+                        <input
+                          id={`email-input-${consultant.type}`}
+                          name={`email-input-${consultant.type}`}
+                          value={consultant.emailInput}
+                          onChange={(e) =>
+                            updateConsultant(
+                              consultant.type,
+                              'emailInput',
+                              e.target.value
+                            )
+                          }
+                          placeholder="name@company.com"
+                          className="flex-1 rounded-2xl border border-slate-200 bg-white/95 px-4 py-3 text-sm outline-none transition focus:border-teal-600 focus:ring-2 focus:ring-teal-100"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => addEmail(consultant.type)}
+                          className={`rounded-2xl px-4 py-3 text-sm font-medium ${theme.button}`}
+                        >
+                          Add
+                        </button>
+                      </div>
                     </div>
                   </div>
-                </div>
 
-                <div className="mt-4">
-                  {consultant.emails.length > 0 ? (
-                    <div className="flex flex-wrap gap-2">
-                      {consultant.emails.map((email) => (
-                        <div
-                          key={email}
-                          className={`flex items-center gap-2 rounded-full px-3 py-2 text-xs ${theme.chip}`}
-                        >
-                          <span>{email}</span>
-                          <button
-                            type="button"
-                            onClick={() => removeEmail(consultant.type, email)}
-                            className="text-gray-500"
-                            aria-label={`Remove ${email}`}
+                  <div className="mt-4">
+                    {consultant.emails.length > 0 ? (
+                      <div className="flex flex-wrap gap-2">
+                        {consultant.emails.map((email) => (
+                          <div
+                            key={email}
+                            className={`flex items-center gap-2 rounded-full px-3 py-2 text-xs ${theme.chip}`}
                           >
-                            ×
-                          </button>
-                        </div>
-                      ))}
-                    </div>
-                  ) : (
-                    <div className="rounded-2xl border border-dashed border-slate-200 px-4 py-4 text-sm text-slate-400">
-                      No emails yet
-                    </div>
-                  )}
+                            <span>{email}</span>
+                            <button
+                              type="button"
+                              onClick={() => removeEmail(consultant.type, email)}
+                              className="text-gray-500"
+                              aria-label={`Remove ${email}`}
+                            >
+                              ×
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="rounded-2xl border border-dashed border-slate-200 px-4 py-4 text-sm text-slate-400">
+                        No emails yet
+                      </div>
+                    )}
+                  </div>
                 </div>
-              </div>
-            )})}
-          </div>
+              )})}
+            </div>
 
-          <div className="flex justify-end">
-            <button
-              type="submit"
-              disabled={submitting}
-              className="rounded-2xl bg-[linear-gradient(135deg,#0f172a_0%,#1e293b_45%,#0f766e_100%)] px-6 py-3 text-sm font-medium text-white shadow-lg transition hover:-translate-y-[1px] disabled:opacity-50"
-            >
-              {submitting ? 'Creating...' : 'Create Project'}
-            </button>
-          </div>
-        </form>
+            <div className="flex justify-end">
+              <button
+                type="submit"
+                disabled={submitting}
+                className="rounded-2xl bg-[linear-gradient(135deg,#0f172a_0%,#1e293b_45%,#0f766e_100%)] px-6 py-3 text-sm font-medium text-white shadow-lg transition hover:-translate-y-[1px] disabled:opacity-50"
+              >
+                {submitting ? 'Creating...' : 'Create Project'}
+              </button>
+            </div>
+          </form>
+        ) : null}
       </div>
     </main>
   )

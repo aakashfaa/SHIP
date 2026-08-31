@@ -1,7 +1,31 @@
-import { SEED_PROJECTS } from './mock-projects'
-import { MockUser, SEED_USERS } from './mock-users'
-import { SEED_CHUNK_PROJECTS, SEED_TIMELINE_SETTINGS } from './mock-chunks'
-import { SEED_LINE_ITEMS } from './mock-line-items'
+/**
+ * Data layer for the SHIP app: thin wrappers over Supabase queries against the
+ * `ship` schema, plus the row <-> domain mappers in `lib/mappers.ts`.
+ *
+ * Everything here runs against the browser client, so these functions are for
+ * Client Components. Slug generation, item/chunk numbering, company-name
+ * derivation, discipline normalization and invite seeding all live in SQL
+ * (triggers + the `create_project` / `update_project` RPCs) and are no longer
+ * duplicated here.
+ *
+ * RLS denials surface as an empty result set on reads and as an error on
+ * writes; both are allowed to propagate to the caller.
+ */
+
+import { getSupabaseBrowserClient } from './supabase/client'
+import {
+  ChunkProjectRow,
+  LineItemRow,
+  ProjectRow,
+  TimelineSettingsRow,
+  lineItemToRow,
+  normalizeTimelineSegments,
+  rowToChunkProject,
+  rowToLineItem,
+  rowToProject,
+  rowToTimelineSettings,
+  timelineSettingsToRow,
+} from './mappers'
 import {
   ChunkProject,
   ConsultantType,
@@ -11,208 +35,143 @@ import {
   ProjectTimelineSettings,
 } from './types'
 
-const PROJECTS_KEY = 'pdc_projects'
-const USERS_KEY = 'pdc_users'
+const PROJECT_SELECT = '*, project_consultants(*), project_members(*)'
+const CHUNK_SELECT = '*, chunk_project_items(*)'
 
-const DEFAULT_CONSULTANT_PASSWORD = 'welcome123'
-
-function slugify(value: string) {
-  return value
-    .toLowerCase()
-    .trim()
-    .replace(/[^a-z0-9\s-]/g, '')
-    .replace(/\s+/g, '-')
-    .replace(/-+/g, '-')
+function fail(context: string, error: { message: string } | null): never {
+  throw new Error(`${context}: ${error?.message ?? 'unknown Supabase error'}`)
 }
 
-function uniqueStrings(values: string[]) {
-  return [...new Set(values.map((v) => v.trim().toLowerCase()).filter(Boolean))]
+/**
+ * The jsonb `create_project` / `update_project` both return:
+ *   { "project_id": "some-slug", "invited_emails": ["a@b.com"] }
+ *
+ * `invited_emails` is the set the DB actually added to the allowlist on
+ * THIS call -- not the project's member list. Callers POST it straight to
+ * /api/admin/invite, which mails every address in it, and this Supabase
+ * project shares a ~2-4 emails/hour project-wide quota with an unrelated
+ * production app. Never widen this to `project.assignedUsers`: that would
+ * re-mail every existing consultant on every Save.
+ */
+type ProjectMutationResult = {
+  project_id: string
+  invited_emails: string[] | null
 }
 
-function mergeByKey<T>(seed: T[], custom: T[], getKey: (item: T) => string) {
-  const merged = new Map(seed.map((item) => [getKey(item), item]))
-  custom.forEach((item) => merged.set(getKey(item), item))
-  return Array.from(merged.values())
-}
+/** Narrow the RPC's jsonb defensively -- a malformed payload must not
+ *  become a silent blast of invite emails. */
+function readMutationResult(context: string, data: unknown): ProjectMutationResult {
+  const payload = (data ?? {}) as Partial<ProjectMutationResult>
+  const projectId = payload.project_id
 
-export function getDefaultConsultantPassword() {
-  return DEFAULT_CONSULTANT_PASSWORD
-}
+  if (typeof projectId !== 'string' || projectId === '') {
+    fail(context, { message: 'RPC did not return a project_id' })
+  }
 
-export function getStoredUsers(): MockUser[] {
-  if (typeof window === 'undefined') return SEED_USERS
-
-  const raw = localStorage.getItem(USERS_KEY)
-  if (!raw) return SEED_USERS
-
-  try {
-    const parsed = JSON.parse(raw) as MockUser[]
-    return [...SEED_USERS, ...parsed]
-  } catch {
-    return SEED_USERS
+  const invited = payload.invited_emails
+  return {
+    project_id: projectId,
+    invited_emails: Array.isArray(invited)
+      ? invited.filter((email): email is string => typeof email === 'string')
+      : [],
   }
 }
 
-export function saveStoredUsers(users: MockUser[]) {
-  if (typeof window === 'undefined') return
+/* -------------------------------------------------------------- projects -- */
 
-  const seedEmails = new Set(SEED_USERS.map((u) => u.email.toLowerCase()))
-  const customUsers = users.filter((u) => !seedEmails.has(u.email.toLowerCase()))
-  localStorage.setItem(USERS_KEY, JSON.stringify(customUsers))
+export async function getStoredProjects(): Promise<Project[]> {
+  const supabase = getSupabaseBrowserClient()
+
+  const { data, error } = await supabase
+    .from('projects')
+    .select(PROJECT_SELECT)
+    .order('created_at', { ascending: false })
+
+  if (error) fail('Failed to load projects', error)
+
+  return ((data ?? []) as unknown as ProjectRow[]).map(rowToProject)
 }
 
-export function getStoredProjects(): Project[] {
-  if (typeof window === 'undefined') return SEED_PROJECTS
+export async function getProjectById(id: string): Promise<Project | null> {
+  const supabase = getSupabaseBrowserClient()
 
-  const raw = localStorage.getItem(PROJECTS_KEY)
-  if (!raw) return SEED_PROJECTS
+  const { data, error } = await supabase
+    .from('projects')
+    .select(PROJECT_SELECT)
+    .eq('id', id)
+    .maybeSingle()
 
-  try {
-    const parsed = JSON.parse(raw) as Project[]
-    return mergeByKey(SEED_PROJECTS, parsed, (item) => item.id)
-  } catch {
-    return SEED_PROJECTS
-  }
+  if (error) fail(`Failed to load project "${id}"`, error)
+  if (!data) return null
+
+  return rowToProject(data as unknown as ProjectRow)
 }
 
-export function saveStoredProjects(projects: Project[]) {
-  if (typeof window === 'undefined') return
-  localStorage.setItem(PROJECTS_KEY, JSON.stringify(projects))
-}
-
-export function ensureConsultantUsers(emails: string[]) {
-  const allUsers = getStoredUsers()
-  const existingEmails = new Set(allUsers.map((u) => u.email.toLowerCase()))
-
-  const newUsers: MockUser[] = []
-
-  uniqueStrings(emails).forEach((email) => {
-    if (!existingEmails.has(email)) {
-      const baseName = email.split('@')[0] || 'Consultant'
-      const niceName = baseName
-        .replace(/[._-]+/g, ' ')
-        .replace(/\b\w/g, (c) => c.toUpperCase())
-
-      newUsers.push({
-        email,
-        password: DEFAULT_CONSULTANT_PASSWORD,
-        role: 'consultant',
-        name: niceName,
-      })
-    }
-  })
-
-  if (newUsers.length > 0) {
-    saveStoredUsers([...allUsers, ...newUsers])
-  }
-
-  return newUsers
-}
-
-export function createProject(input: {
+export async function createProject(input: {
   name: string
   consultants: ProjectConsultant[]
-}) {
-  const projects = getStoredProjects()
+}): Promise<{ project: Project; invitedEmails: string[] }> {
+  const supabase = getSupabaseBrowserClient()
 
-  const baseId = slugify(input.name) || 'new-project'
-  let candidateId = baseId
-  let counter = 2
-
-  while (projects.some((p) => p.id === candidateId)) {
-    candidateId = `${baseId}-${counter}`
-    counter += 1
-  }
-
-  const consultantEmails = uniqueStrings(
-    input.consultants.flatMap((consultant) => consultant.emails)
-  )
-
-  const assignedUsers = consultantEmails.filter(
-    (email) => email.toLowerCase() !== 'admin@gmail.com'
-  )
-
-  const newProject: Project = {
-    id: candidateId,
-    name: input.name.trim(),
-    createdAt: new Date().toISOString().slice(0, 10),
-    consultants: input.consultants.map((consultant) => ({
-      ...consultant,
-      emails: uniqueStrings(consultant.emails),
-    })),
-    assignedUsers,
-  }
-
-  saveStoredProjects([newProject, ...projects])
-
-  const newUsers = ensureConsultantUsers(assignedUsers)
-
-  return {
-    project: newProject,
-    newUsers,
-  }
-}
-
-export function updateProject(projectId: string, updates: Partial<Project>) {
-  const projects = getStoredProjects()
-
-  const updatedProjects = projects.map((project) => {
-    if (project.id !== projectId) return project
-
-    const updatedConsultants = updates.consultants
-      ? updates.consultants.map((consultant) => ({
-          ...consultant,
-          emails: uniqueStrings(consultant.emails),
-        }))
-      : project.consultants
-
-    const assignedUsers = uniqueStrings(
-      updatedConsultants
-        .flatMap((consultant) => consultant.emails)
-        .filter((email) => email !== 'admin@gmail.com')
-    )
-
-    return {
-      ...project,
-      ...updates,
-      consultants: updatedConsultants,
-      assignedUsers,
-    }
+  const { data, error } = await supabase.rpc('create_project', {
+    p_name: input.name.trim(),
+    p_consultants: input.consultants,
   })
 
-  saveStoredProjects(updatedProjects)
+  if (error) fail('Failed to create project', error)
 
-  const updatedProject = updatedProjects.find((p) => p.id === projectId)
-  if (!updatedProject) return null
+  const result = readMutationResult('Failed to create project', data)
+  const projectId = result.project_id
 
-  const newUsers = ensureConsultantUsers(updatedProject.assignedUsers)
+  const project = await getProjectById(projectId)
+  if (!project) fail('Failed to create project', { message: `project "${projectId}" not readable after creation` })
 
-  return {
-    project: updatedProject,
-    newUsers,
-  }
+  return { project, invitedEmails: result.invited_emails ?? [] }
 }
 
-export function addConsultantToProject(
+export async function updateProject(
   projectId: string,
-  consultant: ProjectConsultant
-) {
-  const project = getStoredProjects().find((p) => p.id === projectId)
+  updates: Partial<Project>
+): Promise<{ project: Project; invitedEmails: string[] } | null> {
+  const supabase = getSupabaseBrowserClient()
+
+  const existing = await getProjectById(projectId)
+  if (!existing) return null
+
+  const { data, error } = await supabase.rpc('update_project', {
+    p_project_id: projectId,
+    p_name: (updates.name ?? existing.name).trim(),
+    p_consultants: updates.consultants ?? existing.consultants,
+  })
+
+  if (error) fail(`Failed to update project "${projectId}"`, error)
+
+  const result = readMutationResult(`Failed to update project "${projectId}"`, data)
+
+  const project = await getProjectById(result.project_id)
   if (!project) return null
 
-  const alreadyExists = project.consultants.some((c) => c.type === consultant.type)
-  if (alreadyExists) return null
+  return { project, invitedEmails: result.invited_emails ?? [] }
+}
+
+export async function addConsultantToProject(
+  projectId: string,
+  consultant: ProjectConsultant
+): Promise<{ project: Project; invitedEmails: string[] } | null> {
+  const project = await getProjectById(projectId)
+  if (!project) return null
+  if (project.consultants.some((c) => c.type === consultant.type)) return null
 
   return updateProject(projectId, {
     consultants: [...project.consultants, consultant],
   })
 }
 
-export function removeConsultantFromProject(
+export async function removeConsultantFromProject(
   projectId: string,
   consultantType: ConsultantType
-) {
-  const project = getStoredProjects().find((p) => p.id === projectId)
+): Promise<{ project: Project; invitedEmails: string[] } | null> {
+  const project = await getProjectById(projectId)
   if (!project) return null
 
   return updateProject(projectId, {
@@ -220,422 +179,292 @@ export function removeConsultantFromProject(
   })
 }
 
-const LINE_ITEMS_KEY = 'pdc_line_items'
+/* ------------------------------------------------------------ line items -- */
 
-function normalizeLineItem(item: LineItem): LineItem {
-  const consultantType =
-    item.consultantType === 'Admin' ? 'Architecture' : item.consultantType
-  const discipline = item.discipline === 'Admin' ? 'Architecture' : item.discipline
+export async function getLineItemsForProject(projectId: string): Promise<LineItem[]> {
+  const supabase = getSupabaseBrowserClient()
 
-  return {
-    ...item,
-    consultantType,
-    discipline,
-    estimatedFirstCost: item.estimatedFirstCost || '',
-  }
+  const { data, error } = await supabase
+    .from('line_items')
+    .select('*')
+    .eq('project_id', projectId)
+    .order('created_at', { ascending: true })
+
+  if (error) fail(`Failed to load line items for project "${projectId}"`, error)
+
+  return ((data ?? []) as unknown as LineItemRow[]).map(rowToLineItem)
 }
 
-function getDisciplinePrefix(discipline: string) {
-  const cleaned = discipline.trim().toUpperCase()
-
-  const specialMap: Record<string, string> = {
-    ARCHITECTURE: 'A',
-    ACCESSIBILITY: 'AC',
-    CIVIL: 'C',
-    ELECTRICAL: 'E',
-    ENVELOPE: 'EN',
-    'FIRE ALARM': 'FA',
-    'HAZARDOUS MATERIALS': 'HM',
-    'HISTORIC PRESERVATION': 'HP',
-    LANDSCAPE: 'L',
-    MECHANICAL: 'M',
-    PLUMBING: 'P',
-    STRUCTURAL: 'S',
-    SECURITY: 'SE',
-    TELECOM: 'T',
-    ADMIN: 'AD',
-  }
-
-  if (specialMap[cleaned]) return specialMap[cleaned]
-
-  const words = cleaned.split(/\s+/).filter(Boolean)
-  if (words.length === 1) return words[0].slice(0, 2)
-  return words.slice(0, 2).map((w) => w[0]).join('')
-}
-
-function getNextItemNumber(discipline: string) {
-  const items = getStoredLineItems()
-  const prefix = getDisciplinePrefix(discipline)
-
-  const matching = items.filter((item) => item.discipline === discipline)
-
-  return `${prefix}${matching.length + 1}`
-}
-
-export function getStoredLineItems(): LineItem[] {
-  if (typeof window === 'undefined') return SEED_LINE_ITEMS
-
-  const raw = localStorage.getItem(LINE_ITEMS_KEY)
-  if (!raw) return SEED_LINE_ITEMS
-
-  try {
-    return mergeByKey(
-      SEED_LINE_ITEMS.map(normalizeLineItem),
-      (JSON.parse(raw) as LineItem[]).map(normalizeLineItem),
-      (item) => item.id
-    )
-  } catch {
-    return SEED_LINE_ITEMS
-  }
-}
-
-export function saveStoredLineItems(items: LineItem[]) {
-  if (typeof window === 'undefined') return
-  localStorage.setItem(
-    LINE_ITEMS_KEY,
-    JSON.stringify(items.map(normalizeLineItem))
-  )
-}
-
-export function getLineItemsForProjectUser(projectId: string, userEmail: string) {
-  return getStoredLineItems()
-    .filter((item) => item.projectId === projectId && item.userEmail === userEmail)
-    .sort(
-      (a, b) =>
-        new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime()
-    )
-}
-
-export function deleteLineItem(lineItemId: string) {
-  const items = getStoredLineItems()
-  const updated = items.filter((item) => item.id !== lineItemId)
-  saveStoredLineItems(updated)
-}
-
-function getCompanyNameForUser(project: Project, userEmail: string, discipline: string) {
-  if (discipline === 'Admin') return 'FAA'
-
-  const consultant = project.consultants.find(
-    (c) => c.type === discipline && c.emails.includes(userEmail)
-  )
-
-  if (consultant?.orgName) return consultant.orgName
-
-  const fallbackConsultant = project.consultants.find((c) =>
-    c.emails.includes(userEmail)
-  )
-
-  return fallbackConsultant?.orgName || 'Unknown Organization'
-}
-
-export function createLineItem(
-  input: Omit<LineItem, 'id' | 'createdAt' | 'companyName' | 'discipline' | 'itemNumber'>,
-  project: Project
-) {
-  const normalizedDiscipline =
-    input.consultantType === 'Admin' ? 'Architecture' : input.consultantType
-
-  const companyName =
-    input.consultantType === 'Admin'
-      ? 'FAA'
-      : getCompanyNameForUser(project, input.userEmail, normalizedDiscipline)
-
-  const itemNumber = getNextItemNumber(normalizedDiscipline)
-
-  const items = getStoredLineItems()
-
-  const newItem: LineItem = {
-    ...input,
-    id: crypto.randomUUID(),
-    createdAt: new Date().toISOString(),
-    companyName,
-    discipline: normalizedDiscipline,
-    itemNumber,
-  }
-
-  const updated = [...items, newItem]
-  saveStoredLineItems(updated)
-
-  return newItem
-}
-
-export function updateLineItem(lineItemId: string, updates: Partial<LineItem>) {
-  const items = getStoredLineItems()
-
-  let updatedItem: LineItem | null = null
-
-  const updated = items.map((item) => {
-    if (item.id !== lineItemId) return item
-
-    updatedItem = normalizeLineItem({
-      ...item,
-      ...updates,
-    })
-
-    return updatedItem
-  })
-
-  saveStoredLineItems(updated)
-  return updatedItem
-}
-
-export function getLineItemsForProject(projectId: string) {
-  return getStoredLineItems().filter((item) => item.projectId === projectId)
-}
-
-const CHUNK_PROJECTS_KEY = 'pdc_chunk_projects'
-const TIMELINE_SETTINGS_KEY = 'pdc_timeline_settings'
-
-function normalizeTimelineSettings(settings: ProjectTimelineSettings): ProjectTimelineSettings {
-  const years =
-    typeof settings.years === 'number' && settings.years >= 0 ? Math.round(settings.years) : 10
-  const zoomLevel =
-    typeof settings.zoomLevel === 'number'
-      ? Math.min(Math.max(Math.round(settings.zoomLevel), 1), 5)
-      : 3
-  const escalationPercent =
-    typeof settings.escalationPercent === 'number' && settings.escalationPercent >= 0
-      ? settings.escalationPercent
-      : 0
-  const escalationEveryYears =
-    typeof settings.escalationEveryYears === 'number' && settings.escalationEveryYears > 0
-      ? Math.round(settings.escalationEveryYears)
-      : 5
-
-  return {
-    ...settings,
-    years,
-    interval: settings.interval || 'yearly',
-    zoomLevel,
-    escalationPercent,
-    escalationEveryYears,
-  }
-}
-
-function normalizeChunkProject(chunk: ChunkProject): ChunkProject {
-  const fallbackStart =
-    typeof chunk.timelineStart === 'number' && chunk.timelineStart >= 0
-      ? chunk.timelineStart
-      : 0
-  const fallbackDuration =
-    typeof chunk.timelineDuration === 'number' && chunk.timelineDuration > 0
-      ? chunk.timelineDuration
-      : 1
-  const timelineSegments =
-    Array.isArray(chunk.timelineSegments) && chunk.timelineSegments.length > 0
-      ? chunk.timelineSegments.map((segment, index) => ({
-          id: segment.id || `${chunk.id}-segment-${index + 1}`,
-          start: typeof segment.start === 'number' && segment.start >= 0 ? segment.start : 0,
-          duration:
-            typeof segment.duration === 'number' && segment.duration > 0 ? segment.duration : 1,
-        }))
-      : [
-          {
-            id: `${chunk.id}-segment-1`,
-            start: fallbackStart,
-            duration: fallbackDuration,
-          },
-        ]
-
-  return {
-    ...chunk,
-    timelineSegments,
-    timelineStart: timelineSegments[0]?.start ?? fallbackStart,
-    timelineDuration: timelineSegments[0]?.duration ?? fallbackDuration,
-  }
-}
-
-export function getStoredChunkProjects(): ChunkProject[] {
-  if (typeof window === 'undefined') return SEED_CHUNK_PROJECTS.map(normalizeChunkProject)
-
-  const raw = localStorage.getItem(CHUNK_PROJECTS_KEY)
-  if (!raw) return SEED_CHUNK_PROJECTS.map(normalizeChunkProject)
-
-  try {
-    return mergeByKey(
-      SEED_CHUNK_PROJECTS.map(normalizeChunkProject),
-      (JSON.parse(raw) as ChunkProject[]).map(normalizeChunkProject),
-      (item) => item.id
-    )
-  } catch {
-    return SEED_CHUNK_PROJECTS.map(normalizeChunkProject)
-  }
-}
-
-export function saveStoredChunkProjects(projects: ChunkProject[]) {
-  if (typeof window === 'undefined') return
-  localStorage.setItem(
-    CHUNK_PROJECTS_KEY,
-    JSON.stringify(projects.map(normalizeChunkProject))
-  )
-}
-
-export function getChunkProjectsForProject(projectId: string) {
-  return getStoredChunkProjects()
-    .filter((item) => item.projectId === projectId)
-    .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime())
-}
-
-export function getNextChunkNumber(projectId: string) {
-  const existing = getChunkProjectsForProject(projectId)
-
-  const usedNumbers = existing
-    .map((item) => {
-      const match = item.chunkNumber.match(/^PP(\d+)$/)
-      return match ? Number(match[1]) : null
-    })
-    .filter((v): v is number => v !== null)
-
-  const next = usedNumbers.length > 0 ? Math.max(...usedNumbers) + 1 : 10
-  return `PP${next}`
-}
-
-export function createChunkProject(input: { projectId: string; name: string }) {
-  const all = getStoredChunkProjects()
-
-  const newChunk: ChunkProject = {
-    id: crypto.randomUUID(),
-    projectId: input.projectId,
-    chunkNumber: getNextChunkNumber(input.projectId),
-    name: input.name.trim(),
-    itemLinks: [],
-    timelineSegments: [],
-    timelineStart: 0,
-    timelineDuration: 1,
-    createdAt: new Date().toISOString(),
-  }
-
-  saveStoredChunkProjects([...all, newChunk])
-  return newChunk
-}
-
-export function updateChunkProject(chunkId: string, updates: Partial<ChunkProject>) {
-  const all = getStoredChunkProjects()
-
-  const updated = all.map((chunk) =>
-    chunk.id === chunkId ? normalizeChunkProject({ ...chunk, ...updates }) : chunk
-  )
-
-  saveStoredChunkProjects(updated)
-  return updated.find((chunk) => chunk.id === chunkId) || null
-}
-
-export function getStoredTimelineSettings(): ProjectTimelineSettings[] {
-  if (typeof window === 'undefined') return SEED_TIMELINE_SETTINGS.map(normalizeTimelineSettings)
-
-  const raw = localStorage.getItem(TIMELINE_SETTINGS_KEY)
-  if (!raw) return SEED_TIMELINE_SETTINGS.map(normalizeTimelineSettings)
-
-  try {
-    return mergeByKey(
-      SEED_TIMELINE_SETTINGS.map(normalizeTimelineSettings),
-      (JSON.parse(raw) as ProjectTimelineSettings[]).map(normalizeTimelineSettings),
-      (item) => item.projectId
-    )
-  } catch {
-    return SEED_TIMELINE_SETTINGS.map(normalizeTimelineSettings)
-  }
-}
-
-export function getTimelineSettingsForProject(projectId: string): ProjectTimelineSettings {
-  return (
-    getStoredTimelineSettings().find((item) => item.projectId === projectId) || {
-      projectId,
-      years: 10,
-      interval: 'yearly',
-      zoomLevel: 3,
-      escalationPercent: 0,
-      escalationEveryYears: 5,
-    }
-  )
-}
-
-export function updateTimelineSettingsForProject(
+export async function getLineItemsForProjectUser(
   projectId: string,
-  updates: Partial<ProjectTimelineSettings>
-) {
-  if (typeof window === 'undefined') {
-    return {
-      projectId,
-      years: updates.years ?? 10,
-      interval: updates.interval ?? 'yearly',
-      zoomLevel: updates.zoomLevel ?? 3,
-      escalationPercent: updates.escalationPercent ?? 0,
-      escalationEveryYears: updates.escalationEveryYears ?? 5,
-    }
+  userEmail: string
+): Promise<LineItem[]> {
+  const supabase = getSupabaseBrowserClient()
+
+  const { data, error } = await supabase
+    .from('line_items')
+    .select('*')
+    .eq('project_id', projectId)
+    .eq('user_email', userEmail)
+    .order('created_at', { ascending: true })
+
+  if (error) fail(`Failed to load line items for "${userEmail}"`, error)
+
+  return ((data ?? []) as unknown as LineItemRow[]).map(rowToLineItem)
+}
+
+export async function createLineItem(
+  input: Omit<LineItem, 'id' | 'createdAt' | 'companyName' | 'discipline' | 'itemNumber'>
+): Promise<LineItem> {
+  const supabase = getSupabaseBrowserClient()
+
+  // `item_number`, `company_name` and the normalized `discipline` /
+  // `consultant_type` are filled by triggers; never send them from here.
+  const { data, error } = await supabase
+    .from('line_items')
+    .insert(lineItemToRow(input))
+    .select('*')
+    .single()
+
+  if (error) fail('Failed to create line item', error)
+
+  return rowToLineItem(data as unknown as LineItemRow)
+}
+
+export async function updateLineItem(
+  lineItemId: string,
+  updates: Partial<LineItem>
+): Promise<LineItem | null> {
+  const supabase = getSupabaseBrowserClient()
+
+  const row = lineItemToRow(updates)
+  delete row.id
+  delete row.created_at
+
+  const { data, error } = await supabase
+    .from('line_items')
+    .update(row)
+    .eq('id', lineItemId)
+    .select('*')
+    .maybeSingle()
+
+  if (error) fail(`Failed to update line item "${lineItemId}"`, error)
+  if (!data) return null
+
+  return rowToLineItem(data as unknown as LineItemRow)
+}
+
+export async function deleteLineItem(lineItemId: string): Promise<void> {
+  const supabase = getSupabaseBrowserClient()
+
+  const { error } = await supabase.from('line_items').delete().eq('id', lineItemId)
+
+  if (error) fail(`Failed to delete line item "${lineItemId}"`, error)
+}
+
+/* --------------------------------------------------------- chunk projects -- */
+
+async function fetchChunkProject(chunkId: string): Promise<ChunkProject | null> {
+  const supabase = getSupabaseBrowserClient()
+
+  const { data, error } = await supabase
+    .from('chunk_projects')
+    .select(CHUNK_SELECT)
+    .eq('id', chunkId)
+    .maybeSingle()
+
+  if (error) fail(`Failed to load chunk project "${chunkId}"`, error)
+  if (!data) return null
+
+  return rowToChunkProject(data as unknown as ChunkProjectRow)
+}
+
+export async function getChunkProjectsForProject(projectId: string): Promise<ChunkProject[]> {
+  const supabase = getSupabaseBrowserClient()
+
+  const { data, error } = await supabase
+    .from('chunk_projects')
+    .select(CHUNK_SELECT)
+    .eq('project_id', projectId)
+    .order('created_at', { ascending: true })
+
+  if (error) fail(`Failed to load chunk projects for "${projectId}"`, error)
+
+  return ((data ?? []) as unknown as ChunkProjectRow[]).map(rowToChunkProject)
+}
+
+export async function createChunkProject(input: {
+  projectId: string
+  name: string
+}): Promise<ChunkProject> {
+  const supabase = getSupabaseBrowserClient()
+
+  // `chunk_number` is assigned by a trigger.
+  const { data, error } = await supabase
+    .from('chunk_projects')
+    .insert({ project_id: input.projectId, name: input.name.trim() })
+    .select(CHUNK_SELECT)
+    .single()
+
+  if (error) fail('Failed to create chunk project', error)
+
+  return rowToChunkProject(data as unknown as ChunkProjectRow)
+}
+
+export async function updateChunkProject(
+  chunkId: string,
+  updates: Partial<ChunkProject>
+): Promise<ChunkProject | null> {
+  const supabase = getSupabaseBrowserClient()
+
+  const row: Record<string, unknown> = {}
+  if (updates.name !== undefined) row.name = updates.name
+
+  if (updates.timelineSegments !== undefined) {
+    const segments = normalizeTimelineSegments(
+      chunkId,
+      updates.timelineSegments,
+      updates.timelineStart,
+      updates.timelineDuration
+    )
+    // Keep the scalar columns in sync with segment 0.
+    row.timeline_segments = segments
+    row.timeline_start = segments[0].start
+    row.timeline_duration = segments[0].duration
+  } else {
+    if (updates.timelineStart !== undefined) row.timeline_start = updates.timelineStart
+    if (updates.timelineDuration !== undefined) row.timeline_duration = updates.timelineDuration
   }
 
-  const all = getStoredTimelineSettings()
-  const existing = getTimelineSettingsForProject(projectId)
-  const next = normalizeTimelineSettings({
-    ...existing,
-    ...updates,
-    projectId,
-  })
+  if (Object.keys(row).length === 0) return fetchChunkProject(chunkId)
 
-  const remaining = all.filter((item) => item.projectId !== projectId)
-  localStorage.setItem(TIMELINE_SETTINGS_KEY, JSON.stringify([...remaining, next]))
-  return next
+  const { data, error } = await supabase
+    .from('chunk_projects')
+    .update(row)
+    .eq('id', chunkId)
+    .select(CHUNK_SELECT)
+    .maybeSingle()
+
+  if (error) fail(`Failed to update chunk project "${chunkId}"`, error)
+  if (!data) return null
+
+  return rowToChunkProject(data as unknown as ChunkProjectRow)
 }
 
-export function deleteChunkProject(chunkId: string) {
-  const all = getStoredChunkProjects()
-  saveStoredChunkProjects(all.filter((chunk) => chunk.id !== chunkId))
+export async function deleteChunkProject(chunkId: string): Promise<void> {
+  const supabase = getSupabaseBrowserClient()
+
+  const { error } = await supabase.from('chunk_projects').delete().eq('id', chunkId)
+
+  if (error) fail(`Failed to delete chunk project "${chunkId}"`, error)
 }
 
-export function addLineItemToChunkProject(chunkId: string, lineItemId: string) {
-  const all = getStoredChunkProjects()
-
-  const updated = all.map((chunk) => {
-    if (chunk.id !== chunkId) return chunk
-
-    const alreadyExists = chunk.itemLinks.some((link) => link.lineItemId === lineItemId)
-    if (alreadyExists) return chunk
-
-    return {
-      ...chunk,
-      itemLinks: [...chunk.itemLinks, { lineItemId, quantity: '' }],
-    }
-  })
-
-  saveStoredChunkProjects(updated)
-  return updated.find((chunk) => chunk.id === chunkId) || null
+export async function addLineItemToChunkProject(
+  chunkId: string,
+  lineItemId: string
+): Promise<ChunkProject | null> {
+  return addLineItemsToChunkProject(chunkId, [lineItemId])
 }
 
-export function removeLineItemFromChunkProject(chunkId: string, lineItemId: string) {
-  const all = getStoredChunkProjects()
+export async function addLineItemsToChunkProject(
+  chunkId: string,
+  lineItemIds: string[]
+): Promise<ChunkProject | null> {
+  const supabase = getSupabaseBrowserClient()
 
-  const updated = all.map((chunk) => {
-    if (chunk.id !== chunkId) return chunk
+  const chunk = await fetchChunkProject(chunkId)
+  if (!chunk) return null
 
-    return {
-      ...chunk,
-      itemLinks: chunk.itemLinks.filter((link) => link.lineItemId !== lineItemId),
-    }
-  })
+  const existing = new Set(chunk.itemLinks.map((link) => link.lineItemId))
+  const toAdd = [...new Set(lineItemIds)].filter((id) => !existing.has(id))
+  if (toAdd.length === 0) return chunk
 
-  saveStoredChunkProjects(updated)
-  return updated.find((chunk) => chunk.id === chunkId) || null
+  const rows = toAdd.map((lineItemId, index) => ({
+    chunk_project_id: chunkId,
+    line_item_id: lineItemId,
+    quantity: '',
+    position: chunk.itemLinks.length + index,
+  }))
+
+  const { error } = await supabase.from('chunk_project_items').insert(rows)
+
+  if (error) fail(`Failed to add line items to chunk project "${chunkId}"`, error)
+
+  return fetchChunkProject(chunkId)
 }
 
-export function updateChunkProjectItemQuantity(
+export async function removeLineItemFromChunkProject(
+  chunkId: string,
+  lineItemId: string
+): Promise<ChunkProject | null> {
+  const supabase = getSupabaseBrowserClient()
+
+  const { error } = await supabase
+    .from('chunk_project_items')
+    .delete()
+    .eq('chunk_project_id', chunkId)
+    .eq('line_item_id', lineItemId)
+
+  if (error) fail(`Failed to remove line item from chunk project "${chunkId}"`, error)
+
+  return fetchChunkProject(chunkId)
+}
+
+export async function updateChunkProjectItemQuantity(
   chunkId: string,
   lineItemId: string,
   quantity: string
-) {
-  const all = getStoredChunkProjects()
+): Promise<ChunkProject | null> {
+  const supabase = getSupabaseBrowserClient()
 
-  const updated = all.map((chunk) => {
-    if (chunk.id !== chunkId) return chunk
+  const { error } = await supabase
+    .from('chunk_project_items')
+    .update({ quantity })
+    .eq('chunk_project_id', chunkId)
+    .eq('line_item_id', lineItemId)
 
-    return {
-      ...chunk,
-      itemLinks: chunk.itemLinks.map((link) =>
-        link.lineItemId === lineItemId ? { ...link, quantity } : link
-      ),
-    }
-  })
+  if (error) fail(`Failed to update quantity on chunk project "${chunkId}"`, error)
 
-  saveStoredChunkProjects(updated)
-  return updated.find((chunk) => chunk.id === chunkId) || null
+  return fetchChunkProject(chunkId)
+}
+
+/* ------------------------------------------------------ timeline settings -- */
+
+export async function getTimelineSettingsForProject(
+  projectId: string
+): Promise<ProjectTimelineSettings> {
+  const supabase = getSupabaseBrowserClient()
+
+  const { data, error } = await supabase
+    .from('project_timeline_settings')
+    .select('*')
+    .eq('project_id', projectId)
+    .maybeSingle()
+
+  if (error) fail(`Failed to load timeline settings for "${projectId}"`, error)
+
+  return rowToTimelineSettings(data as unknown as TimelineSettingsRow | null, projectId)
+}
+
+export async function updateTimelineSettingsForProject(
+  projectId: string,
+  updates: Partial<ProjectTimelineSettings>
+): Promise<ProjectTimelineSettings> {
+  const supabase = getSupabaseBrowserClient()
+
+  const existing = await getTimelineSettingsForProject(projectId)
+  const next = rowToTimelineSettings(
+    timelineSettingsToRow({ ...existing, ...updates, projectId }),
+    projectId
+  )
+
+  const { data, error } = await supabase
+    .from('project_timeline_settings')
+    .upsert(timelineSettingsToRow(next), { onConflict: 'project_id' })
+    .select('*')
+    .single()
+
+  if (error) fail(`Failed to save timeline settings for "${projectId}"`, error)
+
+  return rowToTimelineSettings(data as unknown as TimelineSettingsRow, projectId)
 }

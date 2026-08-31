@@ -1,40 +1,37 @@
 'use client'
 
-import { useEffect, useState } from 'react'
+import { useEffect } from 'react'
 import { useRouter } from 'next/navigation'
 import ProjectsHome from '@/components/ProjectsHome'
-import { getCurrentUser } from '@/lib/auth'
+import { useAuth } from '@/lib/auth-context'
+import { useAsyncData } from '@/lib/useAsyncData'
 import { getStoredProjects } from '@/lib/store'
-import { Project, SafeUser } from '@/lib/types'
+import { Project } from '@/lib/types'
 
 export default function ProjectsPage() {
   const router = useRouter()
-  const [user] = useState<SafeUser | null>(() => getCurrentUser())
-  const [, setRefreshKey] = useState(0)
+  const { user, loading: authLoading } = useAuth()
 
   useEffect(() => {
-    if (!user) {
+    if (!authLoading && !user) {
       router.replace('/')
     }
-  }, [user, router])
+  }, [authLoading, user, router])
+
+  const {
+    data: allProjects,
+    loading: projectsLoading,
+    error,
+    reload,
+  } = useAsyncData<Project[]>(() => getStoredProjects(), [user?.email], [])
 
   useEffect(() => {
-    const handleFocus = () => setRefreshKey((v) => v + 1)
+    const handleFocus = () => reload()
     window.addEventListener('focus', handleFocus)
     return () => window.removeEventListener('focus', handleFocus)
-  }, [])
+  }, [reload])
 
-  const projects = (() => {
-    const allProjects = getStoredProjects()
-
-    if (!user) return []
-
-    return user.role === 'admin'
-      ? allProjects
-      : allProjects.filter((project) => project.assignedUsers.includes(user.email))
-  })()
-
-  if (!user) {
+  if (authLoading || !user) {
     return (
       <main className="flex min-h-screen items-center justify-center">
         <p className="text-sm text-gray-500">Redirecting...</p>
@@ -42,5 +39,31 @@ export default function ProjectsPage() {
     )
   }
 
-  return <ProjectsHome user={user} projects={projects as Project[]} />
+  // The client-side filter below keeps the UI honest, but RLS is the real
+  // security boundary now — a consultant's fetch never returns projects they
+  // are not assigned to.
+  const projects =
+    user.role === 'admin'
+      ? allProjects
+      : allProjects.filter((project) => project.assignedUsers.includes(user.email))
+
+  if (projectsLoading) {
+    return (
+      <main className="flex min-h-screen items-center justify-center">
+        <p className="text-sm text-gray-500">Loading projects...</p>
+      </main>
+    )
+  }
+
+  if (error) {
+    return (
+      <main className="flex min-h-screen items-center justify-center">
+        <p className="text-sm text-red-500">
+          Could not load projects. Please try again.
+        </p>
+      </main>
+    )
+  }
+
+  return <ProjectsHome user={user} projects={projects} />
 }

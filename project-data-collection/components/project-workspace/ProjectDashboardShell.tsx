@@ -4,7 +4,7 @@ import { useState } from 'react'
 import Link from 'next/link'
 import { useRouter } from 'next/navigation'
 import { AnimatePresence, motion } from 'framer-motion'
-import { logoutUser } from '@/lib/auth'
+import { useAuth } from '@/lib/auth-context'
 import { Project, SafeUser } from '@/lib/types'
 import SettingsTab from './SettingsTab'
 import AddDataTab from './AddDataTab'
@@ -35,6 +35,7 @@ export default function ProjectDashboardShell({
   project: initialProject,
 }: ProjectDashboardShellProps) {
   const router = useRouter()
+  const { signOut } = useAuth()
   const isAdmin = user.role === 'admin'
   const [project, setProject] = useState(initialProject)
 
@@ -55,8 +56,8 @@ export default function ProjectDashboardShell({
 
   const [activeTab, setActiveTab] = useState<TabKey>('add-data')
 
-  function handleLogout() {
-    logoutUser()
+  async function handleLogout() {
+    await signOut()
     router.replace('/')
   }
 

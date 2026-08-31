@@ -1,10 +1,11 @@
 'use client'
 
 import { AnimatePresence, motion } from 'framer-motion'
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import {
   addLineItemToChunkProject,
+  addLineItemsToChunkProject,
   createChunkProject,
   deleteChunkProject,
   getChunkProjectsForProject,
@@ -13,6 +14,7 @@ import {
   updateChunkProject,
   updateChunkProjectItemQuantity,
 } from '@/lib/store'
+import { useAsyncData } from '@/lib/useAsyncData'
 import { formatCurrency, parseCostInput, parseQuantityInput } from '@/lib/costs'
 import { ChunkProject, LineItem, Project } from '@/lib/types'
 
@@ -103,11 +105,27 @@ function getLineItemTotal(item: LineItem, quantity: string) {
 }
 
 export default function ChunkingTab({ project }: Props) {
-  const [chunkProjects, setChunkProjects] = useState<ChunkProject[]>(() =>
-    getChunkProjectsForProject(project.id)
+  const {
+    data: chunkProjects,
+    loading: chunkProjectsLoading,
+    error: chunkProjectsError,
+    reload: reloadChunks,
+  } = useAsyncData<ChunkProject[]>(
+    () => getChunkProjectsForProject(project.id),
+    [project.id],
+    []
   )
-  const [allLineItems] = useState<LineItem[]>(() =>
-    getLineItemsForProject(project.id).sort((a, b) => itemNumberSort(a.itemNumber, b.itemNumber))
+  const {
+    data: allLineItems,
+    loading: lineItemsLoading,
+    error: lineItemsError,
+  } = useAsyncData<LineItem[]>(
+    async () => {
+      const items = await getLineItemsForProject(project.id)
+      return [...items].sort((a, b) => itemNumberSort(a.itemNumber, b.itemNumber))
+    },
+    [project.id],
+    []
   )
   const [isCreateDialogOpen, setIsCreateDialogOpen] = useState(false)
   const [newChunkName, setNewChunkName] = useState('')
@@ -116,10 +134,26 @@ export default function ChunkingTab({ project }: Props) {
   const [expandedChunkId, setExpandedChunkId] = useState<string | null>(null)
   const [editingChunkId, setEditingChunkId] = useState<string | null>(null)
   const [editingName, setEditingName] = useState('')
+  const [isCreatingChunk, setIsCreatingChunk] = useState(false)
+  const [deletingChunkId, setDeletingChunkId] = useState<string | null>(null)
+  const [savingEditChunkId, setSavingEditChunkId] = useState<string | null>(null)
+  const [addingItemKey, setAddingItemKey] = useState<string | null>(null)
+  const [removingItemKey, setRemovingItemKey] = useState<string | null>(null)
+  const [actionError, setActionError] = useState<string | null>(null)
+  const [quantityDrafts, setQuantityDrafts] = useState<Record<string, string>>({})
+  const [quantityErrors, setQuantityErrors] = useState<Record<string, string>>({})
 
-  function refreshChunks() {
-    setChunkProjects(getChunkProjectsForProject(project.id))
-  }
+  const isMountedRef = useRef(true)
+  const quantityTimers = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map())
+
+  useEffect(() => {
+    isMountedRef.current = true
+    return () => {
+      isMountedRef.current = false
+      quantityTimers.current.forEach((timer) => clearTimeout(timer))
+      quantityTimers.current.clear()
+    }
+  }, [])
 
   function handleToggleSelectedLineItem(lineItemId: string) {
     setSelectedLineItemIds((current) =>
@@ -152,34 +186,56 @@ export default function ChunkingTab({ project }: Props) {
     setSelectedLineItemIds([])
   }
 
-  function handleCreateChunk() {
+  async function handleCreateChunk() {
     if (!newChunkName.trim()) return
 
-    const created = createChunkProject({
-      projectId: project.id,
-      name: newChunkName.trim(),
-    })
+    setActionError(null)
+    setIsCreatingChunk(true)
+    try {
+      const created = await createChunkProject({
+        projectId: project.id,
+        name: newChunkName.trim(),
+      })
 
-    selectedLineItemIds.forEach((lineItemId) => {
-      addLineItemToChunkProject(created.id, lineItemId)
-    })
+      if (selectedLineItemIds.length > 0) {
+        await addLineItemsToChunkProject(created.id, selectedLineItemIds)
+      }
 
-    setNewChunkName('')
-    setSelectedLineItemIds([])
-    setSearchQuery('')
-    setIsCreateDialogOpen(false)
-    refreshChunks()
-    setExpandedChunkId(created.id)
+      if (!isMountedRef.current) return
+
+      setNewChunkName('')
+      setSelectedLineItemIds([])
+      setSearchQuery('')
+      setIsCreateDialogOpen(false)
+      reloadChunks()
+      setExpandedChunkId(created.id)
+    } catch (err) {
+      if (!isMountedRef.current) return
+      setActionError(err instanceof Error ? err.message : 'Failed to create package.')
+    } finally {
+      if (isMountedRef.current) setIsCreatingChunk(false)
+    }
   }
 
-  function handleDeleteChunk(chunkId: string) {
-    deleteChunkProject(chunkId)
-    refreshChunks()
+  async function handleDeleteChunk(chunkId: string) {
+    setActionError(null)
+    setDeletingChunkId(chunkId)
+    try {
+      await deleteChunkProject(chunkId)
+      if (!isMountedRef.current) return
 
-    if (expandedChunkId === chunkId) setExpandedChunkId(null)
-    if (editingChunkId === chunkId) {
-      setEditingChunkId(null)
-      setEditingName('')
+      reloadChunks()
+
+      if (expandedChunkId === chunkId) setExpandedChunkId(null)
+      if (editingChunkId === chunkId) {
+        setEditingChunkId(null)
+        setEditingName('')
+      }
+    } catch (err) {
+      if (!isMountedRef.current) return
+      setActionError(err instanceof Error ? err.message : 'Failed to delete package.')
+    } finally {
+      if (isMountedRef.current) setDeletingChunkId(null)
     }
   }
 
@@ -188,27 +244,108 @@ export default function ChunkingTab({ project }: Props) {
     setEditingName(chunk.name)
   }
 
-  function handleSaveEdit(chunkId: string) {
+  async function handleSaveEdit(chunkId: string) {
     if (!editingName.trim()) return
-    updateChunkProject(chunkId, { name: editingName.trim() })
-    refreshChunks()
-    setEditingChunkId(null)
-    setEditingName('')
+
+    setActionError(null)
+    setSavingEditChunkId(chunkId)
+    try {
+      await updateChunkProject(chunkId, { name: editingName.trim() })
+      if (!isMountedRef.current) return
+
+      reloadChunks()
+      setEditingChunkId(null)
+      setEditingName('')
+    } catch (err) {
+      if (!isMountedRef.current) return
+      setActionError(err instanceof Error ? err.message : 'Failed to rename package.')
+    } finally {
+      if (isMountedRef.current) setSavingEditChunkId(null)
+    }
   }
 
-  function handleAddLineItem(chunkId: string, lineItemId: string) {
-    addLineItemToChunkProject(chunkId, lineItemId)
-    refreshChunks()
+  async function handleAddLineItem(chunkId: string, lineItemId: string) {
+    const key = `${chunkId}:${lineItemId}`
+    setActionError(null)
+    setAddingItemKey(key)
+    try {
+      await addLineItemToChunkProject(chunkId, lineItemId)
+      if (!isMountedRef.current) return
+      reloadChunks()
+    } catch (err) {
+      if (!isMountedRef.current) return
+      setActionError(err instanceof Error ? err.message : 'Failed to add line item.')
+    } finally {
+      if (isMountedRef.current) setAddingItemKey(null)
+    }
   }
 
-  function handleRemoveLineItem(chunkId: string, lineItemId: string) {
-    removeLineItemFromChunkProject(chunkId, lineItemId)
-    refreshChunks()
+  async function handleRemoveLineItem(chunkId: string, lineItemId: string) {
+    const key = `${chunkId}:${lineItemId}`
+    setActionError(null)
+    setRemovingItemKey(key)
+    try {
+      await removeLineItemFromChunkProject(chunkId, lineItemId)
+      if (!isMountedRef.current) return
+      reloadChunks()
+    } catch (err) {
+      if (!isMountedRef.current) return
+      setActionError(err instanceof Error ? err.message : 'Failed to remove line item.')
+    } finally {
+      if (isMountedRef.current) setRemovingItemKey(null)
+    }
+  }
+
+  function getQuantityKey(chunkId: string, lineItemId: string) {
+    return `${chunkId}:${lineItemId}`
+  }
+
+  function getEffectiveQuantity(chunkId: string, lineItemId: string, fallback: string) {
+    const key = getQuantityKey(chunkId, lineItemId)
+    return quantityDrafts[key] ?? fallback
+  }
+
+  async function persistQuantityChange(chunkId: string, lineItemId: string, quantity: string) {
+    const key = getQuantityKey(chunkId, lineItemId)
+    try {
+      await updateChunkProjectItemQuantity(chunkId, lineItemId, quantity)
+      if (!isMountedRef.current) return
+
+      reloadChunks()
+      setQuantityDrafts((prev) => {
+        const next = { ...prev }
+        delete next[key]
+        return next
+      })
+      setQuantityErrors((prev) => {
+        const next = { ...prev }
+        delete next[key]
+        return next
+      })
+    } catch (err) {
+      if (!isMountedRef.current) return
+      setQuantityErrors((prev) => ({
+        ...prev,
+        [key]: err instanceof Error ? err.message : 'Failed to update quantity.',
+      }))
+    }
   }
 
   function handleQuantityChange(chunkId: string, lineItemId: string, quantity: string) {
-    updateChunkProjectItemQuantity(chunkId, lineItemId, quantity)
-    refreshChunks()
+    const key = getQuantityKey(chunkId, lineItemId)
+
+    // Keep the input responsive immediately; only the persistence write is debounced.
+    setQuantityDrafts((prev) => ({ ...prev, [key]: quantity }))
+
+    const existingTimer = quantityTimers.current.get(key)
+    if (existingTimer) clearTimeout(existingTimer)
+
+    const timer = setTimeout(() => {
+      quantityTimers.current.delete(key)
+      void persistQuantityChange(chunkId, lineItemId, quantity)
+    }, 400)
+
+    quantityTimers.current.set(key, timer)
   }
 
   const lineItemMap = useMemo(
@@ -254,9 +391,18 @@ export default function ChunkingTab({ project }: Props) {
         </div>
       </div>
 
+      {chunkProjectsError || lineItemsError || actionError ? (
+        <div className="rounded-[1.5rem] border border-red-200 bg-red-50 px-5 py-4 text-sm text-red-700">
+          {actionError ||
+            chunkProjectsError?.message ||
+            lineItemsError?.message ||
+            'Something went wrong.'}
+        </div>
+      ) : null}
+
       {chunkProjects.length === 0 ? (
         <div className="rounded-[2rem] border border-dashed border-slate-300 bg-white/70 px-6 py-16 text-center text-sm font-medium text-slate-400">
-          No packages
+          {chunkProjectsLoading ? 'Loading packages…' : 'No packages'}
         </div>
       ) : (
         <div className="space-y-5">
@@ -273,7 +419,12 @@ export default function ChunkingTab({ project }: Props) {
               )
               .sort((a, b) => itemNumberSort(a.item.itemNumber, b.item.itemNumber))
             const chunkTotalCost = linkedItems.reduce(
-              (sum, entry) => sum + getLineItemTotal(entry.item, entry.link.quantity),
+              (sum, entry) =>
+                sum +
+                getLineItemTotal(
+                  entry.item,
+                  getEffectiveQuantity(chunk.id, entry.item.id, entry.link.quantity)
+                ),
               0
             )
 
@@ -311,9 +462,10 @@ export default function ChunkingTab({ project }: Props) {
                           <button
                             type="button"
                             onClick={() => handleSaveEdit(chunk.id)}
-                            className="rounded-[1rem] bg-slate-950 px-4 py-2.5 text-sm font-medium text-white"
+                            disabled={savingEditChunkId === chunk.id}
+                            className="rounded-[1rem] bg-slate-950 px-4 py-2.5 text-sm font-medium text-white disabled:cursor-not-allowed disabled:opacity-50"
                           >
-                            Save
+                            {savingEditChunkId === chunk.id ? 'Saving…' : 'Save'}
                           </button>
                           <button
                             type="button"
@@ -321,7 +473,8 @@ export default function ChunkingTab({ project }: Props) {
                               setEditingChunkId(null)
                               setEditingName('')
                             }}
-                            className="rounded-[1rem] border border-slate-200 bg-white px-4 py-2.5 text-sm font-medium text-slate-700"
+                            disabled={savingEditChunkId === chunk.id}
+                            className="rounded-[1rem] border border-slate-200 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 disabled:cursor-not-allowed disabled:opacity-50"
                           >
                             Cancel
                           </button>
@@ -355,9 +508,10 @@ export default function ChunkingTab({ project }: Props) {
                       <button
                         type="button"
                         onClick={() => handleDeleteChunk(chunk.id)}
-                        className="rounded-[1rem] border border-rose-200 bg-rose-50 px-4 py-2.5 text-sm font-medium text-rose-700"
+                        disabled={deletingChunkId === chunk.id}
+                        className="rounded-[1rem] border border-rose-200 bg-rose-50 px-4 py-2.5 text-sm font-medium text-rose-700 disabled:cursor-not-allowed disabled:opacity-50"
                       >
-                        Delete
+                        {deletingChunkId === chunk.id ? 'Deleting…' : 'Delete'}
                       </button>
                     </div>
                   </div>
@@ -406,7 +560,14 @@ export default function ChunkingTab({ project }: Props) {
                           <tbody>
                             {linkedItems.map(({ item, link }) => {
                               const styles = getDisciplineStyles(item.discipline)
-                              const lineItemTotal = getLineItemTotal(item, link.quantity)
+                              const quantityKey = getQuantityKey(chunk.id, item.id)
+                              const effectiveQuantity = getEffectiveQuantity(
+                                chunk.id,
+                                item.id,
+                                link.quantity
+                              )
+                              const lineItemTotal = getLineItemTotal(item, effectiveQuantity)
+                              const quantityError = quantityErrors[quantityKey]
 
                               return (
                                 <tr
@@ -451,12 +612,15 @@ export default function ChunkingTab({ project }: Props) {
                                   </td>
                                   <td className="px-4 py-3 align-top">
                                     <input
-                                      value={link.quantity}
+                                      value={effectiveQuantity}
                                       onChange={(e) =>
                                         handleQuantityChange(chunk.id, item.id, e.target.value)
                                       }
                                       placeholder="Qty"
-                                      className="w-28 rounded-[0.95rem] border border-slate-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-teal-500 focus:ring-2 focus:ring-teal-100"
+                                      title={quantityError}
+                                      className={`w-28 rounded-[0.95rem] border bg-white px-3 py-2 text-sm outline-none transition focus:border-teal-500 focus:ring-2 focus:ring-teal-100 ${
+                                        quantityError ? 'border-red-300' : 'border-slate-200'
+                                      }`}
                                     />
                                   </td>
                                 </tr>
@@ -514,9 +678,10 @@ export default function ChunkingTab({ project }: Props) {
                                   <button
                                     type="button"
                                     onClick={() => handleAddLineItem(chunk.id, item.id)}
-                                    className="rounded-[1rem] bg-slate-950 px-3 py-2 text-xs font-semibold text-white"
+                                    disabled={addingItemKey === `${chunk.id}:${item.id}`}
+                                    className="rounded-[1rem] bg-slate-950 px-3 py-2 text-xs font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50"
                                   >
-                                    Add
+                                    {addingItemKey === `${chunk.id}:${item.id}` ? 'Adding…' : 'Add'}
                                   </button>
                                 </div>
                               )
@@ -567,9 +732,12 @@ export default function ChunkingTab({ project }: Props) {
                                   <button
                                     type="button"
                                     onClick={() => handleRemoveLineItem(chunk.id, item.id)}
-                                    className="rounded-[1rem] border border-rose-200 bg-rose-50 px-3 py-2 text-xs font-semibold text-rose-700"
+                                    disabled={removingItemKey === `${chunk.id}:${item.id}`}
+                                    className="rounded-[1rem] border border-rose-200 bg-rose-50 px-3 py-2 text-xs font-semibold text-rose-700 disabled:cursor-not-allowed disabled:opacity-50"
                                   >
-                                    Remove
+                                    {removingItemKey === `${chunk.id}:${item.id}`
+                                      ? 'Removing…'
+                                      : 'Remove'}
                                   </button>
                                 </div>
                               )
@@ -622,6 +790,12 @@ export default function ChunkingTab({ project }: Props) {
 
                 <div className="max-h-[80vh] overflow-y-auto p-6">
                   <div className="space-y-4">
+                    {actionError && isCreateDialogOpen ? (
+                      <div className="rounded-[1.4rem] border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+                        {actionError}
+                      </div>
+                    ) : null}
+
                     <div className="flex flex-wrap items-end gap-4">
                       <div className="min-w-[320px] flex-1">
                         <input
@@ -666,10 +840,10 @@ export default function ChunkingTab({ project }: Props) {
                         <button
                           type="button"
                           onClick={handleCreateChunk}
-                          disabled={!newChunkName.trim()}
+                          disabled={!newChunkName.trim() || isCreatingChunk}
                           className="rounded-[1.2rem] bg-[linear-gradient(135deg,#0f172a_0%,#1e293b_48%,#0f766e_100%)] px-5 py-3 text-sm font-medium text-white shadow-lg transition hover:-translate-y-[1px] disabled:cursor-not-allowed disabled:bg-slate-300"
                         >
-                          Create
+                          {isCreatingChunk ? 'Creating…' : 'Create'}
                         </button>
                       </div>
 

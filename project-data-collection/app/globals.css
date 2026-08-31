@@ -12,12 +12,16 @@
   --font-mono: var(--font-geist-mono);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
-}
+/*
+ * No dark-mode media query here on purpose. The component layer hardcodes
+ * a light theme throughout (bg-white/76 glassmorphism cards, text-slate-950
+ * body copy, light gradient page backgrounds), so flipping --background /
+ * --foreground for prefers-color-scheme: dark previously produced dark
+ * page chrome behind light-only components — i.e. dark-on-dark text.
+ * The app is deliberately light-only until those components are audited
+ * and given real dark-mode styles; reinstate this block only after that
+ * audit.
+ */
 
 body {
   background: var(--background);

@@ -1,7 +1,6 @@
 'use client'
 
 import {
-  startTransition,
   useEffect,
   useMemo,
   useRef,
@@ -16,7 +15,17 @@ import {
   updateChunkProject,
   updateTimelineSettingsForProject,
 } from '@/lib/store'
-import { ChunkProject, ChunkTimelineSegment, LineItem, Project, TimelineInterval } from '@/lib/types'
+import { useAsyncData } from '@/lib/useAsyncData'
+import {
+  ChunkProject,
+  ChunkTimelineSegment,
+  LineItem,
+  Project,
+  ProjectTimelineSettings,
+  TimelineInterval,
+} from '@/lib/types'
+
+const SETTINGS_PERSIST_DEBOUNCE_MS = 400
 
 type Props = {
   project: Project
@@ -190,16 +199,56 @@ function sortSegments(segments: ChunkTimelineSegment[]) {
   return [...segments].map(normalizeSegment).sort((a, b) => a.start - b.start)
 }
 
+const DEFAULT_TIMELINE_SETTINGS: Omit<ProjectTimelineSettings, 'projectId'> = {
+  years: 10,
+  interval: 'yearly',
+  zoomLevel: 3,
+  escalationPercent: 0,
+  escalationEveryYears: 1,
+}
+
 export default function TimelineTab({ project }: Props) {
-  const [chunkProjects, setChunkProjects] = useState<ChunkProject[]>(() =>
-    getChunkProjectsForProject(project.id)
+  const {
+    data: chunkProjects,
+    setData: setChunkProjects,
+    loading: chunkProjectsLoading,
+    error: chunkProjectsError,
+  } = useAsyncData<ChunkProject[]>(
+    () => getChunkProjectsForProject(project.id),
+    [project.id],
+    []
   )
-  const [lineItems] = useState<LineItem[]>(() => getLineItemsForProject(project.id))
-  const [timelineSettings, setTimelineSettings] = useState(() =>
-    getTimelineSettingsForProject(project.id)
+  const {
+    data: lineItems,
+    loading: lineItemsLoading,
+    error: lineItemsError,
+  } = useAsyncData<LineItem[]>(() => getLineItemsForProject(project.id), [project.id], [])
+  const {
+    data: timelineSettings,
+    setData: setTimelineSettings,
+    loading: timelineSettingsLoading,
+    error: timelineSettingsError,
+  } = useAsyncData<ProjectTimelineSettings>(
+    () => getTimelineSettingsForProject(project.id),
+    [project.id],
+    { projectId: project.id, ...DEFAULT_TIMELINE_SETTINGS }
   )
   const [activeInteraction, setActiveInteraction] = useState<ActiveInteraction | null>(null)
+  const [segmentSaveError, setSegmentSaveError] = useState<string | null>(null)
+  const [settingsSaveError, setSettingsSaveError] = useState<string | null>(null)
   const chunkProjectsRef = useRef(chunkProjects)
+
+  const isMountedRef = useRef(true)
+  const pendingSettingsUpdateRef = useRef<Partial<ProjectTimelineSettings>>({})
+  const settingsTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  useEffect(() => {
+    isMountedRef.current = true
+    return () => {
+      isMountedRef.current = false
+      if (settingsTimerRef.current) clearTimeout(settingsTimerRef.current)
+    }
+  }, [])
 
   useEffect(() => {
     chunkProjectsRef.current = chunkProjects
@@ -304,39 +353,65 @@ export default function TimelineTab({ project }: Props) {
 
   const timelineWidth = Math.max(slotCount * CELL_WIDTH, CELL_WIDTH)
 
+  // Persistence for the timeline settings sliders is debounced (trailing, ~400ms) so a drag
+  // doesn't fire a write per pointer event against the database. The local state update above
+  // each call site happens synchronously and immediately, so the UI stays responsive at 60fps —
+  // only the network write is delayed and coalesced.
+  async function flushTimelineSettingsPersist() {
+    const updates = pendingSettingsUpdateRef.current
+    pendingSettingsUpdateRef.current = {}
+    if (Object.keys(updates).length === 0) return
+
+    try {
+      await updateTimelineSettingsForProject(project.id, updates)
+      if (!isMountedRef.current) return
+      setSettingsSaveError(null)
+    } catch (err) {
+      if (!isMountedRef.current) return
+      setSettingsSaveError(
+        err instanceof Error ? err.message : 'Failed to save timeline settings.'
+      )
+    }
+  }
+
+  function scheduleTimelineSettingsPersist(updates: Partial<ProjectTimelineSettings>) {
+    pendingSettingsUpdateRef.current = { ...pendingSettingsUpdateRef.current, ...updates }
+
+    if (settingsTimerRef.current) clearTimeout(settingsTimerRef.current)
+
+    settingsTimerRef.current = setTimeout(() => {
+      settingsTimerRef.current = null
+      void flushTimelineSettingsPersist()
+    }, SETTINGS_PERSIST_DEBOUNCE_MS)
+  }
+
   function handleYearsChange(years: number) {
-    startTransition(() => {
-      setTimelineSettings((prev) => ({ ...prev, years }))
-      updateTimelineSettingsForProject(project.id, { years })
-    })
+    setTimelineSettings((prev) => ({ ...prev, years }))
+    scheduleTimelineSettingsPersist({ years })
   }
 
   function handleZoomChange(zoomLevel: number) {
     const interval = getIntervalForZoom(zoomLevel)
-    startTransition(() => {
-      setTimelineSettings((prev) => ({ ...prev, zoomLevel, interval }))
-      updateTimelineSettingsForProject(project.id, { zoomLevel, interval })
-    })
+    setTimelineSettings((prev) => ({ ...prev, zoomLevel, interval }))
+    scheduleTimelineSettingsPersist({ zoomLevel, interval })
   }
 
   function handleEscalationPercentChange(escalationPercent: number) {
-    startTransition(() => {
-      setTimelineSettings((prev) => ({ ...prev, escalationPercent }))
-      updateTimelineSettingsForProject(project.id, { escalationPercent })
-    })
+    setTimelineSettings((prev) => ({ ...prev, escalationPercent }))
+    scheduleTimelineSettingsPersist({ escalationPercent })
   }
 
   function handleEscalationEveryYearsChange(escalationEveryYears: number) {
-    startTransition(() => {
-      setTimelineSettings((prev) => ({ ...prev, escalationEveryYears }))
-      updateTimelineSettingsForProject(project.id, { escalationEveryYears })
-    })
+    setTimelineSettings((prev) => ({ ...prev, escalationEveryYears }))
+    scheduleTimelineSettingsPersist({ escalationEveryYears })
   }
 
   function updateChunkSegments(
     chunkId: string,
     updater: (segments: ChunkTimelineSegment[]) => ChunkTimelineSegment[]
   ) {
+    let updatedChunk: ChunkProject | undefined
+
     setChunkProjects((prev) => {
       const next = prev.map((chunk) => {
         if (chunk.id !== chunkId) return chunk
@@ -352,17 +427,23 @@ export default function TimelineTab({ project }: Props) {
         }
       })
 
-      const updatedChunk = next.find((chunk) => chunk.id === chunkId)
-      if (updatedChunk) {
-        updateChunkProject(chunkId, {
-          timelineSegments: updatedChunk.timelineSegments,
-          timelineStart: updatedChunk.timelineStart,
-          timelineDuration: updatedChunk.timelineDuration,
-        })
-      }
-
+      updatedChunk = next.find((chunk) => chunk.id === chunkId)
       return next
     })
+
+    if (updatedChunk) {
+      const { timelineSegments, timelineStart, timelineDuration } = updatedChunk
+
+      setSegmentSaveError(null)
+      updateChunkProject(chunkId, { timelineSegments, timelineStart, timelineDuration }).catch(
+        (err) => {
+          if (!isMountedRef.current) return
+          setSegmentSaveError(
+            err instanceof Error ? err.message : 'Failed to save package timeline.'
+          )
+        }
+      )
+    }
   }
 
   function handleSplitChunk(chunk: ChunkProject) {
@@ -491,12 +572,20 @@ export default function TimelineTab({ project }: Props) {
     }
 
     const onUp = () => {
+      // The drag/resize itself only ever touches local state via onMove above (setChunkProjects,
+      // called on every pointermove). The network write happens exactly once here, on pointer-up.
       const current = chunkProjectsRef.current.find((chunk) => chunk.id === chunkId)
       if (current) {
+        setSegmentSaveError(null)
         updateChunkProject(chunkId, {
           timelineSegments: current.timelineSegments,
           timelineStart: current.timelineStart,
           timelineDuration: current.timelineDuration,
+        }).catch((err) => {
+          if (!isMountedRef.current) return
+          setSegmentSaveError(
+            err instanceof Error ? err.message : 'Failed to save package timeline.'
+          )
         })
       }
 
@@ -518,7 +607,26 @@ export default function TimelineTab({ project }: Props) {
             Map package chunks across a horizontal timeline, split them into two phases, and
             see base and escalated cost rolled up by timeline bucket.
           </p>
+          {(chunkProjectsLoading || lineItemsLoading || timelineSettingsLoading) &&
+          chunkProjects.length === 0 ? (
+            <p className="mt-2 text-xs font-medium text-slate-400">Loading timeline…</p>
+          ) : null}
         </div>
+
+        {chunkProjectsError ||
+        lineItemsError ||
+        timelineSettingsError ||
+        segmentSaveError ||
+        settingsSaveError ? (
+          <div className="rounded-[1.25rem] border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+            {segmentSaveError ||
+              settingsSaveError ||
+              chunkProjectsError?.message ||
+              lineItemsError?.message ||
+              timelineSettingsError?.message ||
+              'Something went wrong.'}
+          </div>
+        ) : null}
 
         <div className="grid gap-4 xl:grid-cols-[1fr_1fr_1.1fr]">
           <div className="rounded-[1.25rem] border border-slate-200 bg-slate-50/80 p-4">

@@ -1,7 +1,7 @@
 'use client'
 
 import { useMemo, useState } from 'react'
-import { CONSULTANT_TYPES } from '@/lib/mock-projects'
+import { CONSULTANT_TYPES } from '@/lib/constants'
 import { updateProject } from '@/lib/store'
 import { ConsultantType, Project } from '@/lib/types'
 
@@ -24,6 +24,8 @@ function sanitizeTypeId(type: string) {
 export default function SettingsTab({ project, onProjectUpdated }: Props) {
   const [isEditing, setIsEditing] = useState(false)
   const [message, setMessage] = useState('')
+  const [error, setError] = useState('')
+  const [isSaving, setIsSaving] = useState(false)
 
   const [draftName, setDraftName] = useState(project.name)
   const [draftConsultants, setDraftConsultants] = useState<DraftConsultant[]>(
@@ -65,22 +67,53 @@ export default function SettingsTab({ project, onProjectUpdated }: Props) {
     setIsEditing(false)
   }
 
-  function saveChanges() {
+  async function saveChanges() {
     const cleanedConsultants = draftConsultants.map((consultant) => ({
       type: consultant.type,
       orgName: consultant.orgName.trim(),
       emails: consultant.emails.map((email) => email.trim().toLowerCase()).filter(Boolean),
     }))
 
-    const updated = updateProject(project.id, {
-      name: draftName.trim(),
-      consultants: cleanedConsultants,
-    })
+    setIsSaving(true)
+    setError('')
 
-    if (updated?.project) {
+    try {
+      const updated = await updateProject(project.id, {
+        name: draftName.trim(),
+        consultants: cleanedConsultants,
+      })
+
+      if (!updated) {
+        setError('Could not save changes. You may not have access to this project.')
+        return
+      }
+
       onProjectUpdated(updated.project)
       setIsEditing(false)
       showMessage('Project updated')
+
+      if (updated.invitedEmails.length > 0) {
+        try {
+          const res = await fetch('/api/admin/invite', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ emails: updated.invitedEmails }),
+          })
+
+          if (!res.ok) {
+            throw new Error(`Request failed with status ${res.status}`)
+          }
+
+          showMessage('Project updated and new consultants invited')
+        } catch {
+          // Non-fatal: the project changes were already saved.
+          showMessage('Project updated, but sending invites failed. Invite them manually.')
+        }
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to save changes.')
+    } finally {
+      setIsSaving(false)
     }
   }
 
@@ -168,16 +201,18 @@ export default function SettingsTab({ project, onProjectUpdated }: Props) {
               <button
                 type="button"
                 onClick={cancelEditing}
-                className="rounded-2xl border border-gray-300 bg-white px-4 py-3 text-sm font-medium text-gray-700"
+                disabled={isSaving}
+                className="rounded-2xl border border-gray-300 bg-white px-4 py-3 text-sm font-medium text-gray-700 disabled:opacity-50"
               >
                 Cancel
               </button>
               <button
                 type="button"
                 onClick={saveChanges}
-                className="rounded-2xl bg-black px-5 py-3 text-sm font-medium text-white"
+                disabled={isSaving}
+                className="rounded-2xl bg-black px-5 py-3 text-sm font-medium text-white disabled:opacity-50"
               >
-                Save Changes
+                {isSaving ? 'Saving...' : 'Save Changes'}
               </button>
             </div>
           )}
@@ -186,6 +221,12 @@ export default function SettingsTab({ project, onProjectUpdated }: Props) {
         {message ? (
           <div className="mt-4 rounded-2xl bg-emerald-50 px-4 py-3 text-sm text-emerald-700">
             {message}
+          </div>
+        ) : null}
+
+        {error ? (
+          <div className="mt-4 rounded-2xl bg-rose-50 px-4 py-3 text-sm text-rose-700">
+            {error}
           </div>
         ) : null}
       </div>

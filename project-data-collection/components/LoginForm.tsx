@@ -1,9 +1,9 @@
 'use client'
 
 import { useState } from 'react'
+import Link from 'next/link'
 import { useRouter } from 'next/navigation'
-import { loginUser } from '@/lib/auth'
-import { getDefaultConsultantPassword } from '@/lib/store'
+import { getSupabaseBrowserClient } from '@/lib/supabase/client'
 
 export default function LoginForm() {
   const router = useRouter()
@@ -12,30 +12,19 @@ export default function LoginForm() {
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
 
-  function handleDemoFill(type: 'admin' | 'consultant1' | 'consultant2') {
-    if (type === 'admin') {
-      setEmail('admin@gmail.com')
-      setPassword('admin123')
-    }
-    if (type === 'consultant1') {
-      setEmail('consultant1@gmail.com')
-      setPassword('consultant123')
-    }
-    if (type === 'consultant2') {
-      setEmail('consultant2@gmail.com')
-      setPassword('consultant123')
-    }
-  }
-
-  function handleSubmit(e: React.FormEvent) {
+  async function handleSubmit(e: React.FormEvent) {
     e.preventDefault()
     setLoading(true)
     setError('')
 
-    const user = loginUser(email, password)
+    const supabase = getSupabaseBrowserClient()
+    const { error: signInError } = await supabase.auth.signInWithPassword({
+      email: email.trim().toLowerCase(),
+      password,
+    })
 
-    if (!user) {
-      setError('Invalid email or password')
+    if (signInError) {
+      setError(signInError.message)
       setLoading(false)
       return
     }
@@ -99,39 +88,11 @@ export default function LoginForm() {
         </button>
       </form>
 
-      <div className="mt-5 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs leading-6 text-amber-900">
-        Newly created consultant users can sign in with their consultant email and
-        default password <span className="font-semibold">{getDefaultConsultantPassword()}</span>.
-      </div>
-
-      <div className="mt-6">
-        <p className="mb-3 text-xs font-semibold uppercase tracking-wide text-slate-500">
-          Demo users
-        </p>
-
-        <div className="grid gap-2">
-          <button
-            type="button"
-            onClick={() => handleDemoFill('admin')}
-            className="rounded-2xl border border-slate-200 bg-white/90 px-4 py-3 text-left text-sm text-slate-700 transition hover:-translate-y-[1px] hover:border-slate-300"
-          >
-            Admin
-          </button>
-          <button
-            type="button"
-            onClick={() => handleDemoFill('consultant1')}
-            className="rounded-2xl border border-slate-200 bg-white/90 px-4 py-3 text-left text-sm text-slate-700 transition hover:-translate-y-[1px] hover:border-slate-300"
-          >
-            Consultant 1
-          </button>
-          <button
-            type="button"
-            onClick={() => handleDemoFill('consultant2')}
-            className="rounded-2xl border border-slate-200 bg-white/90 px-4 py-3 text-left text-sm text-slate-700 transition hover:-translate-y-[1px] hover:border-slate-300"
-          >
-            Consultant 2
-          </button>
-        </div>
+      <div className="mt-6 text-center text-sm text-slate-600">
+        First time here?{' '}
+        <Link href="/auth/sign-up" className="font-medium text-teal-700 hover:text-teal-800">
+          Set up your account
+        </Link>
       </div>
     </div>
   )

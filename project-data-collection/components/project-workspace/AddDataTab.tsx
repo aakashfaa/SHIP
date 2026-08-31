@@ -1,7 +1,7 @@
 'use client'
 
 import { AnimatePresence, motion } from 'framer-motion'
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import {
   createLineItem,
@@ -9,6 +9,7 @@ import {
   getLineItemsForProjectUser,
   updateLineItem,
 } from '@/lib/store'
+import { useAsyncData } from '@/lib/useAsyncData'
 import {
   BuildingAreaImpacted,
   BuildingLevelImpacted,
@@ -222,14 +223,33 @@ function ChoicePills<T extends string>({
 }
 
 export default function AddDataTab({ project, user }: Props) {
-  const [lineItems, setLineItems] = useState<LineItem[]>(() =>
-    getLineItemsForProjectUser(project.id, user.email)
+  const {
+    data: lineItems,
+    loading: lineItemsLoading,
+    error: lineItemsError,
+    reload: reloadLineItems,
+  } = useAsyncData<LineItem[]>(
+    () => getLineItemsForProjectUser(project.id, user.email),
+    [project.id, user.email],
+    []
   )
   const [isCreating, setIsCreating] = useState(false)
   const [step, setStep] = useState(0)
   const [expandedId, setExpandedId] = useState<string | null>(null)
   const [draft, setDraft] = useState<DraftLineItem>(() => makeInitialDraft(project, user))
   const [editingDrafts, setEditingDrafts] = useState<Record<string, DraftLineItem>>({})
+  const [isSavingNew, setIsSavingNew] = useState(false)
+  const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null)
+  const [savingEditId, setSavingEditId] = useState<string | null>(null)
+  const [actionError, setActionError] = useState<string | null>(null)
+
+  const isMountedRef = useRef(true)
+  useEffect(() => {
+    isMountedRef.current = true
+    return () => {
+      isMountedRef.current = false
+    }
+  }, [])
 
   const consultantType = getUserConsultantType(project, user)
 
@@ -269,26 +289,46 @@ export default function AddDataTab({ project, user }: Props) {
     }))
   }
 
-  function handleDelete(id: string) {
-    deleteLineItem(id)
-    setLineItems(getLineItemsForProjectUser(project.id, user.email))
-    setEditingDrafts((prev) => {
-      const next = { ...prev }
-      delete next[id]
-      return next
-    })
-    if (expandedId === id) setExpandedId(null)
+  async function handleDelete(id: string) {
+    setActionError(null)
+    setPendingDeleteId(id)
+    try {
+      await deleteLineItem(id)
+      if (!isMountedRef.current) return
+      reloadLineItems()
+      setEditingDrafts((prev) => {
+        const next = { ...prev }
+        delete next[id]
+        return next
+      })
+      if (expandedId === id) setExpandedId(null)
+    } catch (err) {
+      if (!isMountedRef.current) return
+      setActionError(err instanceof Error ? err.message : 'Failed to delete line item.')
+    } finally {
+      if (isMountedRef.current) setPendingDeleteId(null)
+    }
   }
 
-  function saveLineItem() {
-    const created = createLineItem(draft, project)
-    setLineItems(getLineItemsForProjectUser(project.id, user.email))
-    setExpandedId(created.id)
-    setEditingDrafts((prev) => ({
-      ...prev,
-      [created.id]: makeEditableDraft(created),
-    }))
-    setIsCreating(false)
+  async function saveLineItem() {
+    setActionError(null)
+    setIsSavingNew(true)
+    try {
+      const created = await createLineItem(draft)
+      if (!isMountedRef.current) return
+      reloadLineItems()
+      setExpandedId(created.id)
+      setEditingDrafts((prev) => ({
+        ...prev,
+        [created.id]: makeEditableDraft(created),
+      }))
+      setIsCreating(false)
+    } catch (err) {
+      if (!isMountedRef.current) return
+      setActionError(err instanceof Error ? err.message : 'Failed to create line item.')
+    } finally {
+      if (isMountedRef.current) setIsSavingNew(false)
+    }
   }
 
   function ensureEditDraft(item: LineItem) {
@@ -350,18 +390,28 @@ export default function AddDataTab({ project, user }: Props) {
     )
   }
 
-  function saveEditedLineItem(lineItemId: string) {
+  async function saveEditedLineItem(lineItemId: string) {
     const currentDraft = editingDrafts[lineItemId]
     if (!currentDraft) return
 
-    const updated = updateLineItem(lineItemId, currentDraft)
-    if (!updated) return
+    setActionError(null)
+    setSavingEditId(lineItemId)
+    try {
+      const updated = await updateLineItem(lineItemId, currentDraft)
+      if (!updated) return
+      if (!isMountedRef.current) return
 
-    setLineItems((prev) => prev.map((item) => (item.id === lineItemId ? updated : item)))
-    setEditingDrafts((prev) => ({
-      ...prev,
-      [lineItemId]: makeEditableDraft(updated),
-    }))
+      reloadLineItems()
+      setEditingDrafts((prev) => ({
+        ...prev,
+        [lineItemId]: makeEditableDraft(updated),
+      }))
+    } catch (err) {
+      if (!isMountedRef.current) return
+      setActionError(err instanceof Error ? err.message : 'Failed to save changes.')
+    } finally {
+      if (isMountedRef.current) setSavingEditId(null)
+    }
   }
 
   return (
@@ -384,11 +434,21 @@ export default function AddDataTab({ project, user }: Props) {
           </button>
         </div>
 
+        {lineItemsError || actionError ? (
+          <div className="rounded-[1.5rem] border border-red-200 bg-red-50 px-5 py-4 text-sm text-red-700">
+            {actionError || lineItemsError?.message || 'Something went wrong.'}
+          </div>
+        ) : null}
+
         {lineItems.length === 0 ? (
           <div className="rounded-[2rem] border border-dashed border-gray-300 bg-white p-12 text-center">
-            <h4 className="text-lg font-semibold text-gray-900">No line items yet</h4>
+            <h4 className="text-lg font-semibold text-gray-900">
+              {lineItemsLoading ? 'Loading line items…' : 'No line items yet'}
+            </h4>
             <p className="mt-2 text-sm text-gray-500">
-              Start your list with a guided entry.
+              {lineItemsLoading
+                ? 'Fetching your line items.'
+                : 'Start your list with a guided entry.'}
             </p>
           </div>
         ) : (
@@ -614,9 +674,10 @@ export default function AddDataTab({ project, user }: Props) {
                             <button
                               type="button"
                               onClick={() => handleDelete(item.id)}
-                              className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm font-medium text-red-700 transition hover:bg-red-100"
+                              disabled={pendingDeleteId === item.id}
+                              className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm font-medium text-red-700 transition hover:bg-red-100 disabled:cursor-not-allowed disabled:opacity-50"
                             >
-                              Delete Line Item
+                              {pendingDeleteId === item.id ? 'Deleting…' : 'Delete Line Item'}
                             </button>
 
                             <div className="flex flex-wrap gap-3">
@@ -630,9 +691,10 @@ export default function AddDataTab({ project, user }: Props) {
                               <button
                                 type="button"
                                 onClick={() => saveEditedLineItem(item.id)}
-                                className="rounded-2xl bg-black px-5 py-3 text-sm font-medium text-white shadow-lg"
+                                disabled={savingEditId === item.id}
+                                className="rounded-2xl bg-black px-5 py-3 text-sm font-medium text-white shadow-lg disabled:cursor-not-allowed disabled:opacity-50"
                               >
-                                Save Changes
+                                {savingEditId === item.id ? 'Saving…' : 'Save Changes'}
                               </button>
                             </div>
                           </div>
@@ -1031,6 +1093,12 @@ export default function AddDataTab({ project, user }: Props) {
                     </AnimatePresence>
                   </div>
 
+                  {actionError && isCreating ? (
+                    <div className="mx-8 mb-4 rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+                      {actionError}
+                    </div>
+                  ) : null}
+
                   <div className="flex items-center justify-between border-t border-gray-100 px-8 py-6">
                     <button
                       type="button"
@@ -1053,9 +1121,10 @@ export default function AddDataTab({ project, user }: Props) {
                       <button
                         type="button"
                         onClick={saveLineItem}
-                        className="rounded-2xl bg-black px-5 py-3 text-sm font-medium text-white shadow-lg"
+                        disabled={isSavingNew}
+                        className="rounded-2xl bg-black px-5 py-3 text-sm font-medium text-white shadow-lg disabled:cursor-not-allowed disabled:opacity-50"
                       >
-                        Save Line Item
+                        {isSavingNew ? 'Saving…' : 'Save Line Item'}
                       </button>
                     )}
                   </div>

@@ -1,23 +1,27 @@
 'use client'
 
-import { useEffect, useState } from 'react'
+import { useEffect } from 'react'
 import { motion } from 'framer-motion'
 import { useRouter } from 'next/navigation'
 import LoginForm from '@/components/LoginForm'
-import { getCurrentUser } from '@/lib/auth'
-import { SafeUser } from '@/lib/types'
+import { useAuth } from '@/lib/auth-context'
 
 export default function HomePage() {
   const router = useRouter()
-  const [user] = useState<SafeUser | null>(() => getCurrentUser())
+  const { user, loading, noAccess } = useAuth()
 
   useEffect(() => {
     if (user) {
       router.replace('/projects')
+      return
     }
-  }, [user, router])
 
-  if (user) {
+    if (noAccess) {
+      router.replace('/no-access')
+    }
+  }, [user, noAccess, router])
+
+  if (loading || user || noAccess) {
     return (
       <main className="flex min-h-screen items-center justify-center bg-[radial-gradient(circle_at_top_left,_rgba(251,191,36,0.18),_transparent_26%),radial-gradient(circle_at_top_right,_rgba(45,212,191,0.18),_transparent_28%),linear-gradient(180deg,_#fffdf7_0%,_#f8fafc_50%,_#eef2f7_100%)] px-4">
         <p className="text-sm text-slate-500">Redirecting...</p>

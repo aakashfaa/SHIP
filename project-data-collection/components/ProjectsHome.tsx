@@ -3,7 +3,7 @@
 import Link from 'next/link'
 import { useRouter } from 'next/navigation'
 import { motion } from 'framer-motion'
-import { logoutUser } from '@/lib/auth'
+import { useAuth } from '@/lib/auth-context'
 import { Project, SafeUser } from '@/lib/types'
 
 type ProjectsHomeProps = {
@@ -21,10 +21,11 @@ function formatProjectDate(dateString: string) {
 
 export default function ProjectsHome({ user, projects }: ProjectsHomeProps) {
   const router = useRouter()
+  const { signOut } = useAuth()
   const isAdmin = user.role === 'admin'
 
-  function handleLogout() {
-    logoutUser()
+  async function handleLogout() {
+    await signOut()
     router.replace('/')
   }
 

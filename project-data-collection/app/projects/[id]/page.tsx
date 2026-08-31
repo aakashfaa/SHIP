@@ -1,30 +1,35 @@
 'use client'
 
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect } from 'react'
 import { useParams, useRouter } from 'next/navigation'
-import { getCurrentUser } from '@/lib/auth'
-import { getStoredProjects } from '@/lib/store'
-import { Project, SafeUser } from '@/lib/types'
+import { useAuth } from '@/lib/auth-context'
+import { useAsyncData } from '@/lib/useAsyncData'
+import { getProjectById } from '@/lib/store'
+import { Project } from '@/lib/types'
 import ProjectDashboardShell from '@/components/project-workspace/ProjectDashboardShell'
 
 export default function ProjectDashboardPage() {
   const params = useParams<{ id: string }>()
   const router = useRouter()
-  const [user] = useState<SafeUser | null>(() => getCurrentUser())
+  const { user, loading: authLoading } = useAuth()
 
   useEffect(() => {
-    if (!user) {
+    if (!authLoading && !user) {
       router.replace('/')
     }
-  }, [user, router])
+  }, [authLoading, user, router])
 
-  const project = useMemo(() => {
-    return getStoredProjects().find((item) => item.id === params.id) as
-      | Project
-      | undefined
-  }, [params.id])
+  const {
+    data: project,
+    loading: projectLoading,
+    error,
+  } = useAsyncData<Project | null>(
+    () => getProjectById(params.id),
+    [params.id],
+    null
+  )
 
-  if (!user) {
+  if (authLoading || !user) {
     return (
       <main className="flex min-h-screen items-center justify-center">
         <p className="text-sm text-gray-500">Redirecting...</p>
@@ -32,22 +37,21 @@ export default function ProjectDashboardPage() {
     )
   }
 
-  if (!project) {
+  if (projectLoading) {
     return (
       <main className="flex min-h-screen items-center justify-center">
-        <p className="text-sm text-gray-500">Project not found.</p>
+        <p className="text-sm text-gray-500">Loading project...</p>
       </main>
     )
   }
 
-  const isAllowed =
-    user.role === 'admin' || project.assignedUsers.includes(user.email)
-
-  if (!isAllowed) {
+  // With RLS enforced server-side, a project this user cannot access simply
+  // comes back null, so "not found" and "no access" collapse into one state.
+  if (error || !project) {
     return (
       <main className="flex min-h-screen items-center justify-center">
         <p className="text-sm text-gray-500">
-          You do not have access to this project.
+          This project was not found, or you do not have access to it.
         </p>
       </main>
     )

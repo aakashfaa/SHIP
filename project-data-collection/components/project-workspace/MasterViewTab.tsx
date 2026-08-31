@@ -1,6 +1,7 @@
 'use client'
 
 import { useDeferredValue, useMemo, useRef, useState } from 'react'
+import { useAsyncData } from '@/lib/useAsyncData'
 import { getLineItemsForProject } from '@/lib/store'
 import { LineItem, Project } from '@/lib/types'
 
@@ -78,15 +79,25 @@ export default function MasterViewTab({ project }: Props) {
   const [sortKey, setSortKey] = useState<SortKey>('itemNumber')
   const deferredQuery = useDeferredValue(query)
 
+  const {
+    data: rawLineItems,
+    loading: lineItemsLoading,
+    error: lineItemsError,
+  } = useAsyncData<LineItem[]>(
+    () => getLineItemsForProject(project.id),
+    [project.id],
+    []
+  )
+
   const lineItems = useMemo(
     () =>
-      getLineItemsForProject(project.id).map((item) => ({
+      rawLineItems.map((item) => ({
         ...item,
         discipline: normalizeDiscipline(item.discipline),
         companyName: item.companyName || 'FAA',
         estimatedFirstCost: item.estimatedFirstCost || '',
       })),
-    [project.id]
+    [rawLineItems]
   )
 
   const disciplineOptions = useMemo(
@@ -240,7 +251,15 @@ export default function MasterViewTab({ project }: Props) {
         </div>
       </div>
 
-      {filteredItems.length === 0 ? (
+      {lineItemsLoading ? (
+        <div className="rounded-[2rem] border border-dashed border-gray-300 bg-white p-12 text-center">
+          <p className="text-sm text-gray-500">Loading line items...</p>
+        </div>
+      ) : lineItemsError ? (
+        <div className="rounded-[2rem] border border-dashed border-rose-300 bg-white p-12 text-center">
+          <p className="text-sm text-rose-600">Could not load line items. Please try again.</p>
+        </div>
+      ) : filteredItems.length === 0 ? (
         <div className="rounded-[2rem] border border-dashed border-gray-300 bg-white p-12 text-center">
           <h4 className="text-lg font-semibold text-gray-900">No matching line items</h4>
           <p className="mt-2 text-sm text-gray-500">Adjust the search or filters to widen the view.</p>
