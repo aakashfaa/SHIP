@@ -6,7 +6,12 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "db:start": "supabase start",
+    "db:stop": "supabase stop",
+    "db:reset": "supabase db reset && node scripts/seed-local-users.mjs",
+    "db:users": "node scripts/seed-local-users.mjs",
+    "db:psql": "docker exec -it supabase_db_project-data-collection psql -U postgres -d postgres"
   },
   "dependencies": {
     "@supabase/ssr": "^0.12.5",
@@ -24,6 +29,7 @@
     "@types/react-dom": "^19",
     "eslint": "^9",
     "eslint-config-next": "16.2.0",
+    "supabase": "^2.117.0",
     "tailwindcss": "^4",
     "typescript": "^5"
   }
