@@ -35,6 +35,10 @@ import {
   ProjectCostSettings,
   ProjectEnergySettings,
   ProjectTimelineSettings,
+  Scenario,
+  ScenarioDependency,
+  ScenarioPayload,
+  ScenarioPhase,
   TimelineInterval,
 } from './types'
 
@@ -721,5 +725,113 @@ export function energySettingsToRow(settings: ProjectEnergySettings): ProjectEne
     unit_label: settings.unitLabel,
     baseline_annual: settings.baselineAnnual,
     interaction_factor: settings.interactionFactor,
+  }
+}
+
+/* ------------------------------------------------------------- scenarios -- */
+
+export type ScenarioRow = {
+  id: string
+  project_id: string
+  name: string
+  description: string | null
+  owner_email: string
+  visibility: string
+  payload: unknown
+  payload_version?: number | null
+  baseline_fingerprint: string | null
+  created_at: string
+  updated_at: string
+  published_at: string | null
+}
+
+/**
+ * The payload is a jsonb blob the database builds, so nothing in the schema
+ * constrains its shape on the way out. It is narrowed defensively rather than
+ * cast: a malformed payload must render as an empty overlay (the user sees the
+ * baseline and can discard the scenario) rather than throwing inside a render
+ * and taking the whole Timeline down with it.
+ */
+function toScenarioPayload(value: unknown): ScenarioPayload {
+  const raw = (value ?? {}) as Record<string, unknown>
+
+  const phases = Array.isArray(raw.phases)
+    ? raw.phases.flatMap((entry): ScenarioPhase[] => {
+        const p = entry as Record<string, unknown>
+        if (typeof p.id !== 'string') return []
+        return [
+          {
+            id: p.id,
+            chunkProjectId: String(p.chunk_project_id ?? ''),
+            name: String(p.name ?? ''),
+            kind: (p.kind as ScenarioPhase['kind']) ?? 'construction',
+            sortOrder: toNumber(p.sort_order) ?? 0,
+            pctOfTpc: toNumber(p.pct_of_tpc) ?? 0,
+            startSlot: toNumber(p.start_slot) ?? 0,
+            durationSlots: Math.max(toNumber(p.duration_slots) ?? 1, 1),
+            durationLocked: p.duration_locked === true,
+          },
+        ]
+      })
+    : []
+
+  const dependencies = Array.isArray(raw.dependencies)
+    ? raw.dependencies.flatMap((entry): ScenarioDependency[] => {
+        const d = entry as Record<string, unknown>
+        if (typeof d.id !== 'string') return []
+        return [
+          {
+            id: d.id,
+            predecessorPhaseId: String(d.predecessor_phase_id ?? ''),
+            successorPhaseId: String(d.successor_phase_id ?? ''),
+            depType: (d.dep_type as ScenarioDependency['depType']) ?? 'FS',
+            lagSlots: toNumber(d.lag_slots) ?? 0,
+          },
+        ]
+      })
+    : []
+
+  return { phases, dependencies }
+}
+
+export function rowToScenario(row: ScenarioRow): Scenario {
+  return {
+    id: row.id,
+    projectId: row.project_id,
+    name: row.name,
+    description: row.description ?? '',
+    ownerEmail: row.owner_email,
+    visibility: row.visibility === 'project' ? 'project' : 'private',
+    payload: toScenarioPayload(row.payload),
+    baselineFingerprint: row.baseline_fingerprint ?? '',
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    publishedAt: row.published_at,
+  }
+}
+
+/** Domain phases -> the payload shape the publish RPC reads. Only the movable
+ *  fields are written back; everything else in the payload is carried through
+ *  untouched so a future column does not silently get reset to a default. */
+export function scenarioPayloadToRow(payload: ScenarioPayload): Record<string, unknown> {
+  return {
+    phases: payload.phases.map((p) => ({
+      id: p.id,
+      chunk_project_id: p.chunkProjectId,
+      name: p.name,
+      kind: p.kind,
+      sort_order: p.sortOrder,
+      pct_of_tpc: p.pctOfTpc,
+      start_slot: p.startSlot,
+      duration_slots: p.durationSlots,
+      duration_locked: p.durationLocked,
+    })),
+    dependencies: payload.dependencies.map((d) => ({
+      id: d.id,
+      predecessor_phase_id: d.predecessorPhaseId,
+      successor_phase_id: d.successorPhaseId,
+      dep_type: d.depType,
+      lag_slots: d.lagSlots,
+    })),
   }
 }

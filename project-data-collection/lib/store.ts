@@ -24,6 +24,7 @@ import {
   ProjectCostSettingsRow,
   ProjectEnergySettingsRow,
   ProjectRow,
+  ScenarioRow,
   TimelineSettingsRow,
   chunkPhaseToRow,
   costSettingsToRow,
@@ -39,7 +40,9 @@ import {
   rowToPhaseDependency,
   rowToPhaseTemplate,
   rowToProject,
+  rowToScenario,
   rowToTimelineSettings,
+  scenarioPayloadToRow,
   timelineSettingsToRow,
 } from './mappers'
 import {
@@ -55,6 +58,8 @@ import {
   ProjectCostSettings,
   ProjectEnergySettings,
   ProjectTimelineSettings,
+  Scenario,
+  ScenarioPayload,
 } from './types'
 
 const PROJECT_SELECT = '*, project_consultants(*), project_members(*)'
@@ -850,4 +855,129 @@ export async function updateEnergySettingsForProject(
   }
 
   return getEnergySettingsForProject(projectId)
+}
+
+/* --------------------------------------------------------------- scenarios -- */
+
+/**
+ * Scenarios are created, published and rebased exclusively through RPCs.
+ *
+ * There is no `createScenario` that INSERTs: the table grants no INSERT to
+ * `authenticated` at all. The payload names real row ids that
+ * `publish_scenario()` later writes back, so a client able to author one would
+ * hold an arbitrary-write primitive into the baseline. Building it server-side
+ * means a payload can only ever describe rows that already exist in a project
+ * the caller belongs to. See supabase/migrations/0010_ship_scenarios.sql.
+ */
+
+export async function getScenariosForProject(projectId: string): Promise<Scenario[]> {
+  const supabase = getSupabaseBrowserClient()
+
+  const { data, error } = await supabase
+    .from('scenarios')
+    .select('*')
+    .eq('project_id', projectId)
+    .order('created_at', { ascending: false })
+
+  if (error) fail(`Failed to load scenarios for "${projectId}"`, error)
+
+  return ((data ?? []) as unknown as ScenarioRow[]).map(rowToScenario)
+}
+
+export async function createScenario(
+  projectId: string,
+  name: string,
+  description = ''
+): Promise<Scenario> {
+  const supabase = getSupabaseBrowserClient()
+
+  const { data, error } = await supabase.rpc('create_scenario', {
+    p_project_id: projectId,
+    p_name: name.trim(),
+    p_description: description,
+  })
+
+  if (error) fail('Failed to create the scenario', error)
+
+  return rowToScenario(data as unknown as ScenarioRow)
+}
+
+/** Persists the in-memory overlay back onto the scenario row — NOT onto the
+ *  baseline. This is the "save my sandbox" write; `publishScenario` is the
+ *  separate, deliberate act of pushing it to the shared plan. */
+export async function saveScenarioPayload(
+  scenarioId: string,
+  payload: ScenarioPayload
+): Promise<Scenario | null> {
+  const supabase = getSupabaseBrowserClient()
+
+  const { data, error } = await supabase
+    .from('scenarios')
+    .update({ payload: scenarioPayloadToRow(payload), updated_at: new Date().toISOString() })
+    .eq('id', scenarioId)
+    .select('*')
+    .maybeSingle()
+
+  if (error) fail('Failed to save the scenario', error)
+  if (!data) return null
+
+  return rowToScenario(data as unknown as ScenarioRow)
+}
+
+export type PublishScenarioResult =
+  | { ok: true; phasesUpdated: number; dependenciesUpdated: number }
+  /** The baseline moved under the scenario. This is the Revit
+   *  sync-with-central conflict, and it is surfaced rather than resolved: the
+   *  alternative is one user silently reverting another's work. */
+  | { ok: false; reason: 'conflict' | 'already-published' | 'denied'; message: string }
+
+export async function publishScenario(scenarioId: string): Promise<PublishScenarioResult> {
+  const supabase = getSupabaseBrowserClient()
+
+  const { data, error } = await supabase.rpc('publish_scenario', {
+    p_scenario_id: scenarioId,
+  })
+
+  if (error) {
+    // The RPC raises with meaningful SQLSTATEs so the UI can offer the right
+    // next action — rebase on a conflict, nothing on an already-published
+    // scenario — rather than showing one generic failure for all three.
+    const reason =
+      error.code === '40001'
+        ? 'conflict'
+        : error.code === '22023'
+          ? 'already-published'
+          : 'denied'
+    return { ok: false, reason, message: error.message }
+  }
+
+  const payload = (data ?? {}) as Record<string, unknown>
+  return {
+    ok: true,
+    phasesUpdated: Number(payload.phases_updated ?? 0),
+    dependenciesUpdated: Number(payload.dependencies_updated ?? 0),
+  }
+}
+
+/** Re-reads the current baseline into the scenario, keeping its own placements
+ *  where the underlying row still exists. The way out of a publish conflict
+ *  that is not "lose your work". */
+export async function rebaseScenario(scenarioId: string): Promise<Scenario> {
+  const supabase = getSupabaseBrowserClient()
+
+  const { data, error } = await supabase.rpc('rebase_scenario', {
+    p_scenario_id: scenarioId,
+  })
+
+  if (error) fail('Failed to rebase the scenario', error)
+
+  return rowToScenario(data as unknown as ScenarioRow)
+}
+
+export async function deleteScenario(scenarioId: string): Promise<void> {
+  const supabase = getSupabaseBrowserClient()
+
+  const { error } = await supabase.from('scenarios').delete().eq('id', scenarioId)
+
+  if (error) fail('Failed to discard the scenario', error)
 }

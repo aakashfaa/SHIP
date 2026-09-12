@@ -1,8 +1,8 @@
 'use client'
 
-import { useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import Link from 'next/link'
-import { useRouter } from 'next/navigation'
+import { useRouter, useSearchParams } from 'next/navigation'
 import { AnimatePresence, motion } from 'framer-motion'
 import { useAuth } from '@/lib/auth-context'
 import { Project, SafeUser } from '@/lib/types'
@@ -57,7 +57,43 @@ export default function ProjectDashboardShell({
         { key: 'timeline', label: 'Timeline' },
       ]
 
-  const [activeTab, setActiveTab] = useState<TabKey>('add-data')
+  /**
+   * The active tab lives in the URL.
+   *
+   * It used to be local state, which meant a refresh silently dropped you back
+   * to Add Data. That is a small annoyance in normal use and a real one in the
+   * situation this tool is built for — presenting a plan to a client, where
+   * the Timeline is the whole point and an accidental reload takes it away.
+   *
+   * Putting it in the query string also makes a tab linkable, so "here's the
+   * phasing schedule" can be a URL rather than a set of instructions.
+   *
+   * An unknown or absent `?tab=` falls back to Add Data, and a tab the user's
+   * role cannot see falls back too — otherwise a link shared with a consultant
+   * would render a blank panel.
+   */
+  const searchParams = useSearchParams()
+  const requestedTab = searchParams.get('tab') as TabKey | null
+  const isKnownTab = tabs.some((tab) => tab.key === requestedTab)
+  const activeTab: TabKey = isKnownTab ? (requestedTab as TabKey) : 'add-data'
+
+  const setActiveTab = useCallback(
+    (key: TabKey) => {
+      const params = new URLSearchParams(searchParams.toString())
+      params.set('tab', key)
+      // `replace`, not `push`: tab switching is navigation within one view, and
+      // filling the back stack with it would make Back mean "previous tab"
+      // rather than "previous page", which is not what anyone expects.
+      router.replace(`?${params.toString()}`, { scroll: false })
+    },
+    [router, searchParams]
+  )
+
+  // Normalise a stale or unauthorised ?tab= back into the URL, so the address
+  // bar never disagrees with what is on screen.
+  useEffect(() => {
+    if (requestedTab && !isKnownTab) setActiveTab('add-data')
+  }, [requestedTab, isKnownTab, setActiveTab])
 
   async function handleLogout() {
     await signOut()

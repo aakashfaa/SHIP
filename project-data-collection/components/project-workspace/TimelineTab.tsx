@@ -28,13 +28,19 @@ import {
   type TimelineGeometry,
 } from '@/lib/cost-model'
 import {
+  createScenario,
+  deleteScenario,
   getChunkPhasesForProject,
   getChunkProjectsForProject,
   getCostSettingsForProject,
   getEnergySettingsForProject,
   getLineItemsForProject,
   getPhaseDependenciesForProject,
+  getScenariosForProject,
   getTimelineSettingsForProject,
+  publishScenario,
+  rebaseScenario,
+  saveScenarioPayload,
   updateChunkPhase,
   updateTimelineSettingsForProject,
 } from '@/lib/store'
@@ -48,6 +54,8 @@ import type {
   ProjectCostSettings,
   ProjectEnergySettings,
   ProjectTimelineSettings,
+  Scenario,
+  ScenarioPayload,
   TimelineInterval,
 } from '@/lib/types'
 import TimelineGrid, {
@@ -58,6 +66,7 @@ import TimelineGrid, {
 import EnergyChart from './timeline/EnergyChart'
 import type { ArrowLink } from './timeline/DependencyArrows'
 import ExportBar from './ExportBar'
+import SandboxBar from './timeline/SandboxBar'
 import {
   BAR_HEIGHT,
   CELL_WIDTH,
@@ -223,6 +232,29 @@ export default function TimelineTab({ project }: Props) {
   const [hoveredSlot, setHoveredSlot] = useState<number | null>(null)
   const [saveError, setSaveError] = useState<string | null>(null)
 
+  /**
+   * Sandbox state.
+   *
+   * `activeScenarioId` is the branch the user is inside; null means the live
+   * plan. `overlay` holds that branch's phase placements in memory.
+   *
+   * The overlay is applied on TOP of the loaded baseline rather than replacing
+   * it, and the baseline rows are never mutated while a scenario is active.
+   * That is what makes "Back to live plan" a state change rather than a reload,
+   * and it is why discarding a scenario cannot damage anything.
+   */
+  const {
+    data: scenarios,
+    setData: setScenarios,
+    reload: reloadScenarios,
+  } = useAsyncData<Scenario[]>(() => getScenariosForProject(project.id), [project.id], [])
+  const [activeScenarioId, setActiveScenarioId] = useState<string | null>(null)
+  const [overlay, setOverlay] = useState<Map<string, ScenarioPayload['phases'][number]> | null>(
+    null
+  )
+  const [sandboxBusy, setSandboxBusy] = useState(false)
+  const [conflict, setConflict] = useState<string | null>(null)
+
   const phasesRef = useRef(phases)
   const isMountedRef = useRef(true)
   const pendingSettingsRef = useRef<Partial<ProjectTimelineSettings>>({})
@@ -302,14 +334,44 @@ export default function TimelineTab({ project }: Props) {
     [chunkProjects, lineItemMap]
   )
 
+  const activeScenario = useMemo(
+    () => scenarios.find((s) => s.id === activeScenarioId) ?? null,
+    [scenarios, activeScenarioId]
+  )
+
+  /**
+   * The phases the screen actually draws.
+   *
+   * When a scenario is active this is the baseline with the branch's
+   * placements laid over it. Everything downstream — costs, the energy
+   * staircase, the dependency arrows, the fiscal-year totals — reads from here,
+   * so a what-if reprices the whole plan exactly as a real edit would. That is
+   * the entire point: "What if we do this?" has to produce a real number, not a
+   * preview of one.
+   */
+  const effectivePhases = useMemo<ChunkPhase[]>(() => {
+    if (!overlay) return phases
+    return phases.map((phase) => {
+      const moved = overlay.get(phase.id)
+      if (!moved) return phase
+      return {
+        ...phase,
+        startSlot: moved.startSlot,
+        durationSlots: moved.durationSlots,
+        pctOfTpc: moved.pctOfTpc,
+        durationLocked: moved.durationLocked,
+      }
+    })
+  }, [phases, overlay])
+
   const phasesByChunk = useMemo(() => {
     const map = new Map<string, ChunkPhase[]>()
-    for (const phase of phases) {
+    for (const phase of effectivePhases) {
       map.set(phase.chunkProjectId, [...(map.get(phase.chunkProjectId) ?? []), phase])
     }
     for (const list of map.values()) list.sort((a, b) => a.sortOrder - b.sortOrder)
     return map
-  }, [phases])
+  }, [effectivePhases])
 
   const summaries = useMemo(
     () =>
@@ -333,7 +395,7 @@ export default function TimelineTab({ project }: Props) {
 
   const fiscalTotals = useMemo(() => computeFiscalYearTotals(slotCosts), [slotCosts])
 
-  const enginePhases = useMemo(() => phases.map(toEnginePhase), [phases])
+  const enginePhases = useMemo(() => effectivePhases.map(toEnginePhase), [effectivePhases])
   const engineDependencies = useMemo(
     () => dependencies.map(toEngineDependency),
     [dependencies]
@@ -444,6 +506,47 @@ export default function TimelineTab({ project }: Props) {
 
   /* ------------------------------------------------------------ mutation -- */
 
+  // Refs, not state, because the pointerup handler is created once per drag and
+  // would otherwise close over the values as they were when the drag started.
+  const activeScenarioIdRef = useRef(activeScenarioId)
+  const overlayRef = useRef(overlay)
+  const baselinePhasesRef = useRef(phases)
+  const activeScenarioRef = useRef<Scenario | null>(null)
+
+  useEffect(() => {
+    activeScenarioIdRef.current = activeScenarioId
+  }, [activeScenarioId])
+  useEffect(() => {
+    overlayRef.current = overlay
+  }, [overlay])
+  useEffect(() => {
+    activeScenarioRef.current = activeScenario
+  }, [activeScenario])
+  useEffect(() => {
+    // Only track the baseline while we are on it; inside a scenario `phases`
+    // is transiently the dragged state and must not overwrite the saved
+    // baseline snapshot.
+    if (!activeScenarioId) baselinePhasesRef.current = phases
+  }, [phases, activeScenarioId])
+
+  const persistOverlay = useCallback(
+    async (next: Map<string, ScenarioPayload['phases'][number]>) => {
+      const scenarioId = activeScenarioIdRef.current
+      if (!scenarioId) return
+      try {
+        await saveScenarioPayload(scenarioId, {
+          phases: [...next.values()],
+          dependencies: activeScenarioRef.current?.payload.dependencies ?? [],
+        })
+        if (isMountedRef.current) setSaveError(null)
+      } catch (err) {
+        if (!isMountedRef.current) return
+        setSaveError(err instanceof Error ? err.message : 'Failed to save the what-if.')
+      }
+    },
+    []
+  )
+
   const persistPhases = useCallback(async (changed: ChunkPhase[]) => {
     try {
       await Promise.all(
@@ -460,6 +563,105 @@ export default function TimelineTab({ project }: Props) {
       setSaveError(err instanceof Error ? err.message : 'Failed to save the schedule.')
     }
   }, [])
+
+  /* ------------------------------------------------------------- sandbox -- */
+
+  function overlayFromScenario(scenario: Scenario) {
+    return new Map(scenario.payload.phases.map((phase) => [phase.id, phase]))
+  }
+
+  async function handleBranch(name: string) {
+    setSandboxBusy(true)
+    setConflict(null)
+    try {
+      const scenario = await createScenario(project.id, name)
+      setScenarios((prev) => [scenario, ...prev])
+      setActiveScenarioId(scenario.id)
+      setOverlay(overlayFromScenario(scenario))
+      setSaveError(null)
+    } catch (err) {
+      setSaveError(err instanceof Error ? err.message : 'Could not start the what-if.')
+    } finally {
+      setSandboxBusy(false)
+    }
+  }
+
+  function handleEnterScenario(scenarioId: string) {
+    const scenario = scenarios.find((s) => s.id === scenarioId)
+    if (!scenario) return
+    setConflict(null)
+    setActiveScenarioId(scenario.id)
+    setOverlay(overlayFromScenario(scenario))
+  }
+
+  /** Leaves the branch without touching it. The baseline was never modified,
+   *  so this is purely dropping the overlay. */
+  function handleExitScenario() {
+    setActiveScenarioId(null)
+    setOverlay(null)
+    setConflict(null)
+    setPhases(baselinePhasesRef.current)
+  }
+
+  async function handlePublish() {
+    if (!activeScenarioId) return
+    setSandboxBusy(true)
+    setConflict(null)
+    try {
+      const result = await publishScenario(activeScenarioId)
+      if (!result.ok) {
+        if (result.reason === 'conflict') {
+          setConflict(
+            'Someone edited the plan while you were exploring. Pull their changes in, keeping yours on top, then publish again.'
+          )
+        } else {
+          setSaveError(result.message)
+        }
+        return
+      }
+      // The branch is now the baseline. Drop the overlay and re-read, rather
+      // than assuming what landed — publish_scenario() reports how many rows
+      // it touched precisely because that can differ from what was sent.
+      setActiveScenarioId(null)
+      setOverlay(null)
+      await reloadScenarios()
+      setPhases(await getChunkPhasesForProject(project.id))
+    } catch (err) {
+      setSaveError(err instanceof Error ? err.message : 'Could not publish.')
+    } finally {
+      setSandboxBusy(false)
+    }
+  }
+
+  async function handleDiscard() {
+    if (!activeScenarioId) return
+    setSandboxBusy(true)
+    try {
+      await deleteScenario(activeScenarioId)
+      setScenarios((prev) => prev.filter((s) => s.id !== activeScenarioId))
+      handleExitScenario()
+    } catch (err) {
+      setSaveError(err instanceof Error ? err.message : 'Could not discard the what-if.')
+    } finally {
+      setSandboxBusy(false)
+    }
+  }
+
+  async function handleRebase() {
+    if (!activeScenarioId) return
+    setSandboxBusy(true)
+    try {
+      const rebased = await rebaseScenario(activeScenarioId)
+      setScenarios((prev) => prev.map((s) => (s.id === rebased.id ? rebased : s)))
+      setOverlay(overlayFromScenario(rebased))
+      setPhases(await getChunkPhasesForProject(project.id))
+      setConflict(null)
+    } catch (err) {
+      setSaveError(err instanceof Error ? err.message : 'Could not pull in the changes.')
+    } finally {
+      setSandboxBusy(false)
+    }
+  }
 
   const handleToggleExpand = useCallback((chunkProjectId: string) => {
     setExpanded((prev) => {
@@ -572,6 +774,36 @@ export default function TimelineTab({ project }: Props) {
       })
 
       setPhases(next)
+
+      // Inside a scenario the drag must NOT reach chunk_phases. It updates the
+      // in-memory overlay and is saved to the scenario row instead — that
+      // separation is the whole feature, and getting it wrong means a
+      // "what-if" silently rewrites the live plan in front of a client.
+      if (activeScenarioIdRef.current) {
+        const nextOverlay = new Map(overlayRef.current ?? [])
+        for (const phaseRow of next) {
+          nextOverlay.set(phaseRow.id, {
+            id: phaseRow.id,
+            chunkProjectId: phaseRow.chunkProjectId,
+            name: phaseRow.name,
+            kind: phaseRow.kind,
+            sortOrder: phaseRow.sortOrder,
+            pctOfTpc: phaseRow.pctOfTpc,
+            startSlot: phaseRow.startSlot,
+            durationSlots: phaseRow.durationSlots,
+            durationLocked: phaseRow.durationLocked,
+          })
+        }
+        setOverlay(nextOverlay)
+        // Restore the baseline rows we just mutated locally: `setPhases` above
+        // is what makes the bar follow the cursor, but `phases` is the
+        // BASELINE, and leaving a scenario's placement in it would make
+        // "Back to live plan" show the scenario's schedule.
+        setPhases(baselinePhasesRef.current)
+        void persistOverlay(nextOverlay)
+        return
+      }
+
       // `dragged` is always persisted even when propagation moved nothing,
       // because the drag itself is the change the user made.
       const toPersist = changed.length > 0 ? changed : [dragged]
@@ -667,6 +899,23 @@ export default function TimelineTab({ project }: Props) {
             </div>
           </div>
         </div>
+
+        {/* Megan: "how do you know that you're looking at the official published
+            one versus your own? [...] if it's active, that means that you're
+            looking at a local copy." The active state is a full-width amber
+            bar for exactly that reason. */}
+        <SandboxBar
+          scenarios={scenarios}
+          activeScenario={activeScenario}
+          busy={sandboxBusy}
+          conflict={conflict}
+          onBranch={(name) => void handleBranch(name)}
+          onEnter={handleEnterScenario}
+          onExit={handleExitScenario}
+          onPublish={() => void handlePublish()}
+          onDiscard={() => void handleDiscard()}
+          onRebase={() => void handleRebase()}
+        />
 
         {loadError || saveError ? (
           <div className="rounded-[1.25rem] border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">

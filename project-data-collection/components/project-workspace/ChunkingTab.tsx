@@ -8,15 +8,19 @@ import {
   addLineItemsToChunkProject,
   createChunkProject,
   deleteChunkProject,
+  getChunkPhasesForProject,
   getChunkProjectsForProject,
+  getCostSettingsForProject,
   getLineItemsForProject,
+  getPhaseTemplates,
   removeLineItemFromChunkProject,
   updateChunkProject,
   updateChunkProjectItemQuantity,
 } from '@/lib/store'
 import { useAsyncData } from '@/lib/useAsyncData'
 import { formatCurrency, parseCostInput, parseQuantityInput } from '@/lib/costs'
-import { ChunkProject, LineItem, Project } from '@/lib/types'
+import { ChunkPhase, ChunkProject, LineItem, PhaseTemplate, Project, ProjectCostSettings } from '@/lib/types'
+import PhaseEditor from '@/components/project-workspace/PhaseEditor'
 
 type Props = {
   project: Project
@@ -126,6 +130,26 @@ export default function ChunkingTab({ project }: Props) {
     },
     [project.id],
     []
+  )
+  // Phases are fetched once for the whole project, not per package: every
+  // package's PhaseEditor below just filters this one list by
+  // chunkProjectId. That keeps a mutation in one package's editor a single
+  // reload for everyone, instead of N independent per-chunk queries getting
+  // out of sync with each other.
+  const {
+    data: allPhases,
+    error: phasesError,
+    reload: reloadPhases,
+  } = useAsyncData<ChunkPhase[]>(() => getChunkPhasesForProject(project.id), [project.id], [])
+  const { data: phaseTemplates } = useAsyncData<PhaseTemplate[]>(
+    () => getPhaseTemplates(project.id),
+    [project.id],
+    []
+  )
+  const { data: costSettings } = useAsyncData<ProjectCostSettings | null>(
+    () => getCostSettingsForProject(project.id),
+    [project.id],
+    null
   )
   const [isCreateDialogOpen, setIsCreateDialogOpen] = useState(false)
   const [newChunkName, setNewChunkName] = useState('')
@@ -353,6 +377,25 @@ export default function ChunkingTab({ project }: Props) {
     [allLineItems]
   )
 
+  // Group once per render rather than filtering allPhases inside the .map()
+  // below - that would be O(packages x phases) on every keystroke anywhere
+  // in an expanded editor, since ChunkingTab re-renders the whole list.
+  const phasesByChunk = useMemo(() => {
+    const map = new Map<string, ChunkPhase[]>()
+    for (const phase of allPhases) {
+      const list = map.get(phase.chunkProjectId)
+      if (list) {
+        list.push(phase)
+      } else {
+        map.set(phase.chunkProjectId, [phase])
+      }
+    }
+    for (const list of map.values()) {
+      list.sort((a, b) => a.sortOrder - b.sortOrder)
+    }
+    return map
+  }, [allPhases])
+
   const filteredLineItems = (() => {
     const query = searchQuery.trim().toLowerCase()
 
@@ -391,11 +434,12 @@ export default function ChunkingTab({ project }: Props) {
         </div>
       </div>
 
-      {chunkProjectsError || lineItemsError || actionError ? (
+      {chunkProjectsError || lineItemsError || phasesError || actionError ? (
         <div className="rounded-[1.5rem] border border-red-200 bg-red-50 px-5 py-4 text-sm text-red-700">
           {actionError ||
             chunkProjectsError?.message ||
             lineItemsError?.message ||
+            phasesError?.message ||
             'Something went wrong.'}
         </div>
       ) : null}
@@ -427,6 +471,23 @@ export default function ChunkingTab({ project }: Props) {
                 ),
               0
             )
+            // eccAmount (not estimatedFirstCost) is the package's ECC for
+            // phase costing, to match lib/cost-model.ts's PackageInput.eccBase
+            // exactly: it is the trigger-derived numeric column, not a
+            // re-parse of the free-text first-cost field the table above
+            // displays. The two can differ by a rounding hair; phase dollars
+            // should agree with the engine that will eventually escalate them,
+            // not with the display-only total above.
+            const chunkEccBase = linkedItems.reduce(
+              (sum, entry) =>
+                sum +
+                entry.item.eccAmount *
+                  parseQuantityInput(
+                    getEffectiveQuantity(chunk.id, entry.item.id, entry.link.quantity)
+                  ),
+              0
+            )
+            const chunkPhases = phasesByChunk.get(chunk.id) ?? []
 
             const availableItems = allLineItems.filter(
               (item) => !chunk.itemLinks.some((link) => link.lineItemId === item.id)
@@ -497,8 +558,15 @@ export default function ChunkingTab({ project }: Props) {
                         </button>
                       ) : null}
 
+                      {/* The visible label stays short, but the accessible name
+                          carries the package number. Five cards in a row each
+                          offering a button called "Edit" tells a screen-reader
+                          user nothing about which package they are about to
+                          open. */}
                       <button
                         type="button"
+                        aria-expanded={expanded}
+                        aria-label={`${expanded ? 'Hide' : 'Edit'} package ${chunk.chunkNumber}`}
                         onClick={() => setExpandedChunkId(expanded ? null : chunk.id)}
                         className="rounded-[1rem] border border-slate-200 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 transition hover:border-slate-300"
                       >
@@ -745,6 +813,18 @@ export default function ChunkingTab({ project }: Props) {
                           )}
                         </div>
                       </div>
+                    </div>
+
+                    <div className="mt-6">
+                      <PhaseEditor
+                        chunkProjectId={chunk.id}
+                        phases={chunkPhases}
+                        templates={phaseTemplates}
+                        defaultTemplateId={costSettings?.defaultPhaseTemplateId ?? null}
+                        eccBase={chunkEccBase}
+                        tpcFactor={costSettings?.tpcFactor ?? 1}
+                        onChanged={reloadPhases}
+                      />
                     </div>
                   </div>
                 ) : null}

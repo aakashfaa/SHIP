@@ -282,3 +282,36 @@ select pred.id, succ.id, 'FS', 1
    );
 
 commit;
+
+-- ---------------------------------------------------------------------
+-- Per-project roles
+--
+-- Migration 0009's backfill runs before the seeds on a fresh database (the
+-- CLI applies migrations first), so locally it finds no members and does
+-- nothing. Without this block every seeded consultant would fall through to
+-- 0009's default and the four-tier matrix would never actually be exercised
+-- by anything running against the fixture.
+--
+-- The assignment is chosen to put one real person in each tier, so a
+-- permissions bug shows up as a person who cannot do their job rather than as
+-- a failing assertion nobody reads:
+--
+--   admin       full control, including granting roles
+--   editor      full CRUD on the plan, no say over who else gets in
+--   consultant  owns their own line items, can only SUGGEST on other people's
+--   viewer      reads everything, writes nothing, sandbox only
+--
+-- The viewer deliberately OWNS line items (E1/E2). A viewer who owns nothing
+-- is a weak test: the interesting question is whether read-only holds on your
+-- own work, not just on someone else's.
+-- ---------------------------------------------------------------------
+insert into ship.project_roles (project_id, email, role)
+values
+  ('federal-campus-master-plan', 'admin@gmail.com',             'admin'),
+  ('federal-campus-master-plan', 'consultant2@gmail.com',       'admin'),
+  ('federal-campus-master-plan', 'civil@terrainlab.com',        'editor'),
+  ('federal-campus-master-plan', 'planning@atlasmech.com',      'editor'),
+  ('federal-campus-master-plan', 'structural@coredesign.com',   'consultant'),
+  ('federal-campus-master-plan', 'consultant1@gmail.com',       'consultant'),
+  ('federal-campus-master-plan', 'electrical@voltworks.com',    'viewer')
+on conflict (project_id, email) do nothing;

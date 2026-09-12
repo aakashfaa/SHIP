@@ -21,10 +21,23 @@ const BASE_URL = `http://127.0.0.1:${PORT}`
 
 export default defineConfig({
   testDir: './tests',
-  fullyParallel: true,
+  /**
+   * Serial, single worker, and that is deliberate.
+   *
+   * Every spec runs against ONE local Postgres, and several of them write to
+   * it — creating what-if scenarios, editing phases. Run in parallel, a
+   * scenario created by the sandbox spec appears in the Timeline spec's
+   * "Resume…" control while its screenshot is being taken, and the resulting
+   * diff looks exactly like a rendering regression. It is not; it is a fixture
+   * leak between workers.
+   *
+   * The alternative is a database per worker, which is real work for a suite
+   * this size. Serial costs about 30 seconds.
+   */
+  fullyParallel: false,
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 2 : 0,
-  workers: process.env.CI ? 2 : 4,
+  workers: 1,
   timeout: 60_000,
   reporter: [['html', { open: 'never' }], ['list']],
 

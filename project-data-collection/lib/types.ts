@@ -290,3 +290,54 @@ export type ProjectEnergySettings = {
   baselineAnnual: number | null
   interactionFactor: number
 }
+
+/**
+ * A branched copy of a project's schedule — the Revit local-copy model the
+ * client asked for by name.
+ *
+ * `payload` is deliberately untyped here. It is built and consumed exclusively
+ * by `ship.create_scenario()` / `publish_scenario()` / `rebase_scenario()`; the
+ * client overlays it in memory but never authors it, because a client-authored
+ * payload would be an arbitrary-write primitive into the baseline. See
+ * supabase/migrations/0010_ship_scenarios.sql.
+ */
+export type Scenario = {
+  id: string
+  projectId: string
+  name: string
+  description: string
+  ownerEmail: string
+  visibility: 'private' | 'project'
+  payload: ScenarioPayload
+  baselineFingerprint: string
+  createdAt: string
+  updatedAt: string
+  publishedAt: string | null
+}
+
+/** The subset of a phase a scenario can move. Structural edits (adding or
+ *  deleting phases) are deliberately out of scope — see the migration. */
+export type ScenarioPhase = {
+  id: string
+  chunkProjectId: string
+  name: string
+  kind: PhaseKind
+  sortOrder: number
+  pctOfTpc: number
+  startSlot: number
+  durationSlots: number
+  durationLocked: boolean
+}
+
+export type ScenarioDependency = {
+  id: string
+  predecessorPhaseId: string
+  successorPhaseId: string
+  depType: DependencyType
+  lagSlots: number
+}
+
+export type ScenarioPayload = {
+  phases: ScenarioPhase[]
+  dependencies: ScenarioDependency[]
+}
