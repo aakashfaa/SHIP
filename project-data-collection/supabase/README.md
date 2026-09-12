@@ -35,7 +35,16 @@ Strictly in order. Each file assumes the previous one has been applied.
 | 2 | `migrations/0002_ship_rls.sql` | `grant usage on schema ship`, table/column grants, 7 `SECURITY DEFINER` RLS helpers, `enable row level security` on all 11 tables, all policies. |
 | 3 | `migrations/0003_ship_numbering.sql` | `ship.discipline_prefix()`, the `normalize_line_item` / `fill_item_number` / `fill_chunk_number` trigger functions, and their triggers. |
 | 4 | `migrations/0004_ship_rpcs.sql` | `ship.slugify()`, `ensure_invites()`, `create_project()`, `update_project()`, `claim_invite()`. |
-| 5 | `seeds/001_seed.sql` | The `lib/mock-*.ts` fixtures + **the counter backfill**. |
+| 5 | `migrations/0005_ship_function_grants.sql` | Tidy-up only: revokes the stray `PUBLIC`/`anon`/`authenticated` EXECUTE grant Postgres defaults onto `fill_item_number()` / `fill_chunk_number()` / `normalize_line_item()`. No new object, no behaviour change (see the Gotchas note below on why it's inert). |
+| 6 | `migrations/0006_ship_cost_and_energy.sql` | `project_cost_settings`, `escalation_rate_overrides`, `project_energy_settings`; `line_items.ecc_amount`/`annual_energy_savings`/`annual_cost_savings`/`energy_notes`; `ship.parse_cost_input()` + the `line_items_cc_sync_ecc` trigger; `project_timeline_settings` calendar-anchor columns. |
+| 7 | `migrations/0007_ship_phases.sql` | `phase_templates`, `phase_template_steps`, `chunk_phases`, `phase_dependencies` — the sub-task level under a package — plus 3 built-in templates, cycle-detection and cross-project-link triggers, and `project_cost_settings.default_phase_template_id`. |
+| 8 | `migrations/0008_ship_taxonomies.sql` | `project_taxonomy_values`; `default_taxonomy_rows()` / `seed_default_taxonomy()` / `taxonomy_value_allowed()`; the `check_line_item_taxonomy` trigger; **drops** the 4 hardcoded CHECK constraints on `line_items`. |
+| 9 | `migrations/0009_ship_roles_and_suggestions.sql` | `project_roles`, `suggestions`; `project_role()` and the whole authority-helper family; **rewrites the entire policy surface** created by 0002/0006/0007/0008 from `FOR ALL` to one policy per command. The biggest, most security-sensitive file in the set — read its header before touching anything downstream of it. |
+| 10 | `migrations/0010_ship_scenarios.sql` | `scenarios`; `baseline_fingerprint()` / `create_scenario()` / `publish_scenario()` / `rebase_scenario()` — the what-if sandbox. |
+| 11 | `migrations/0011_ship_scenario_authority.sql` | Closes a privilege-escalation bug: tightens `create_scenario()` to `can_contribute_project()` and `publish_scenario()` to `can_edit_project()` (0010 shipped both checking only `can_read_project()`, which a `viewer` also satisfies). |
+| 12 | `seeds/001_seed.sql` | The `lib/mock-*.ts` fixtures + **the counter backfill**. |
+| 13 | `seeds/002_v2_phases.sql` | Fixture cost/energy settings, phases and phase dependencies for the v2 Timeline demo. Exists because the CLI applies migrations before seeds, so 0007's own backfill is a no-op on a fresh database — see Gotchas. |
+| 14 | `seeds/003_v2_taxonomy.sql` | Fixture taxonomy rows for all seeded projects, for the same reason 002 exists: 0008's backfill has nothing to join against on a fresh database. |
 
 ### How to apply
 
@@ -50,7 +59,16 @@ psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f supabase/migrations/0001_ship_sche
 psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f supabase/migrations/0002_ship_rls.sql
 psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f supabase/migrations/0003_ship_numbering.sql
 psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f supabase/migrations/0004_ship_rpcs.sql
+psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f supabase/migrations/0005_ship_function_grants.sql
+psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f supabase/migrations/0006_ship_cost_and_energy.sql
+psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f supabase/migrations/0007_ship_phases.sql
+psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f supabase/migrations/0008_ship_taxonomies.sql
+psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f supabase/migrations/0009_ship_roles_and_suggestions.sql
+psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f supabase/migrations/0010_ship_scenarios.sql
+psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f supabase/migrations/0011_ship_scenario_authority.sql
 psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f supabase/seeds/001_seed.sql
+psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f supabase/seeds/002_v2_phases.sql
+psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f supabase/seeds/003_v2_taxonomy.sql
 ```
 
 These files are intentionally **not** in `supabase/migrations/` in the
@@ -58,9 +76,15 @@ CLI's timestamped `<YYYYMMDDHHMMSS>_name.sql` format, because
 `supabase db push` / `db reset` operate on the whole database and this
 database is shared. Apply them deliberately, by hand.
 
-All five must be run as the **owner / superuser** connection (the SQL
+> `0006` through `0011` are developed and applied against the **local**
+> Docker stack only (`supabase/LOCAL-DEV.md`). Each says so in its own
+> header. They have not been applied to the remote project
+> (`gfopaidnirrtyvfmgqwi`) and must not be until that is a separate,
+> deliberate call — same shared-database caution as everything else here.
+
+All of these must be run as the **owner / superuser** connection (the SQL
 editor's `postgres` role, or the service-role connection string). RLS is
-on and the seed writes to tables that `authenticated` cannot write.
+on and the seeds write to tables that `authenticated` cannot write.
 
 ### Re-runnability
 
@@ -75,8 +99,9 @@ Every file is safe to re-run:
 
 **One caveat:** because the tables use `create table if not exists`,
 editing a column or a `CHECK` in `0001` will *not* take effect on a
-database where `0001` already ran. Write a new `0005_*.sql` with the
-`alter table` instead.
+database where `0001` already ran. Write a new `0012_*.sql` with the
+`alter table` instead — exactly what `0006`/`0007`/`0008` did to
+`line_items` and `project_timeline_settings`.
 
 ---
 
@@ -85,7 +110,7 @@ database where `0001` already ran. Write a new `0005_*.sql` with the
 ### Full rollback — remove SHIP entirely
 
 Because every object is inside the `ship` schema, one statement undoes
-all four migrations and the seed:
+all eleven migrations and all three seeds:
 
 ```sql
 begin;
@@ -118,10 +143,39 @@ select count(*) from auth.users;                                  -- unchanged
 
 Reverse order. Each block is a single transaction.
 
+**Undo `seeds/003_v2_taxonomy.sql`:**
+
+```sql
+begin;
+delete from ship.project_taxonomy_values;
+commit;
+```
+
+**Undo `seeds/002_v2_phases.sql`:**
+
+```sql
+begin;
+delete from ship.phase_dependencies;
+delete from ship.chunk_phases;
+delete from ship.escalation_rate_overrides;
+delete from ship.project_energy_settings;
+delete from ship.project_cost_settings;
+-- This seed also inserts fixture ship.project_roles rows and UPDATEs
+-- project_timeline_settings / line_items columns in place. The role rows
+-- are covered by the seeds/001 delete below (project_roles has no
+-- dedicated seed of its own); the UPDATEs have no "undo" short of
+-- restoring from the seeds/001 baseline, since they modify existing rows
+-- rather than adding new ones.
+commit;
+```
+
 **Undo `seeds/001_seed.sql`** (leaves the schema in place, empties it):
 
 ```sql
 begin;
+delete from ship.suggestions;
+delete from ship.scenarios;
+delete from ship.project_roles;
 delete from ship.chunk_project_items;
 delete from ship.chunk_projects;
 delete from ship.line_items;
@@ -136,7 +190,139 @@ commit;
 ```
 
 (`ship.profiles` is deliberately not in that list — it holds real signed-up
-users, not seed data.)
+users, not seed data. `project_taxonomy_values` and the 0006/0007 settings
+tables are already empty at this point if you undid `002`/`003` first;
+`delete from ship.projects` would cascade them anyway via `on delete
+cascade`.)
+
+**Undo `0011_ship_scenario_authority.sql`:**
+
+There is nothing to run. This migration only replaces the *bodies* of
+`create_scenario()`/`publish_scenario()` in place (`create or replace
+function`); it added no object. Reverting to 0010's versions is possible
+but not offered here, because 0010's versions are the privilege-escalation
+bug this file exists to close — see its header. Undo `0010` instead, which
+removes both functions entirely.
+
+**Undo `0010_ship_scenarios.sql`:**
+
+```sql
+begin;
+drop function if exists ship.rebase_scenario(uuid);
+drop function if exists ship.publish_scenario(uuid);
+drop function if exists ship.create_scenario(text, text, text);
+drop function if exists ship.baseline_fingerprint(text);
+drop table    if exists ship.scenarios;
+commit;
+```
+
+Nothing outside `ship.scenarios` is touched by `0010`/`0011`, so this
+cannot lose baseline schedule data.
+
+**Undo `0009_ship_roles_and_suggestions.sql`:**
+
+This is the largest rollback in the set — it drops 2 tables, ~20
+functions, and replaces every policy 0009 wrote with the 0002/0006/0007/
+0008 policies it superseded. Don't hand-roll it: copy the full commented
+`ROLLBACK` block at the bottom of
+`migrations/0009_ship_roles_and_suggestions.sql` verbatim — it restores
+`ship.can_read_project()` to its pre-0009 definition, re-creates every
+`FOR ALL` policy 0009 replaced, and only then drops 0009's functions and
+tables, in that order (Postgres refuses to drop a function a live policy
+still references). It does **not** restore data: dropping
+`ship.project_roles` discards every role ever granted, and dropping
+`ship.suggestions` discards the review history. Back both up first if
+either matters:
+
+```sql
+create table ship._project_roles_backup as select * from ship.project_roles;
+create table ship._suggestions_backup   as select * from ship.suggestions;
+```
+
+**Undo `0008_ship_taxonomies.sql`:**
+
+```sql
+begin;
+drop policy if exists project_taxonomy_values_select on ship.project_taxonomy_values;
+drop policy if exists project_taxonomy_values_insert on ship.project_taxonomy_values;
+drop policy if exists project_taxonomy_values_update on ship.project_taxonomy_values;
+drop policy if exists project_taxonomy_values_delete on ship.project_taxonomy_values;
+
+drop trigger  if exists line_items_dd_check_taxonomy on ship.line_items;
+drop function if exists ship.check_line_item_taxonomy();
+drop function if exists ship.taxonomy_value_allowed(text, text, text);
+drop function if exists ship.seed_default_taxonomy(text);
+drop function if exists ship.default_taxonomy_rows();
+
+drop table if exists ship.project_taxonomy_values;
+
+-- Restoring the 4 original CHECK constraints is safe ONLY if no row has
+-- taken on a value outside the original hardcoded lists since 0008 was
+-- applied. Verify first (repeat for all 4 columns) — see the full
+-- statements in this migration's own ROLLBACK comment:
+--   select distinct building_area_impacted from ship.line_items
+--    where building_area_impacted not in
+--      ('WHOLE BUILDING','ANNEX','WEST WING','EAST WING','BULFINCH','SITE','OTHER *');
+commit;
+```
+
+**Undo `0007_ship_phases.sql`:**
+
+```sql
+begin;
+drop trigger  if exists phase_dependencies_zz_no_cycle     on ship.phase_dependencies;
+drop trigger  if exists phase_dependencies_aa_sync_project on ship.phase_dependencies;
+drop table    if exists ship.phase_dependencies;
+drop table    if exists ship.chunk_phases;
+drop table    if exists ship.phase_template_steps;
+alter table ship.project_cost_settings drop column if exists default_phase_template_id;
+drop table    if exists ship.phase_templates;
+drop function if exists ship.assert_no_dependency_cycle();
+drop function if exists ship.sync_phase_dependency_project();
+drop function if exists ship.can_access_phase(uuid);
+drop function if exists ship.phase_project_id(uuid);
+commit;
+```
+
+`chunk_projects.timeline_segments` was never modified by `0007`, so v1's
+timeline keeps working after this rollback.
+
+**Undo `0006_ship_cost_and_energy.sql`:**
+
+```sql
+begin;
+drop table if exists ship.escalation_rate_overrides;
+drop table if exists ship.project_energy_settings;
+drop table if exists ship.project_cost_settings;
+
+drop trigger  if exists line_items_cc_sync_ecc on ship.line_items;
+drop function if exists ship.sync_line_item_ecc();
+
+alter table ship.line_items
+  drop column if exists ecc_amount,
+  drop column if exists annual_energy_savings,
+  drop column if exists annual_cost_savings,
+  drop column if exists energy_notes;
+
+alter table ship.project_timeline_settings
+  drop constraint if exists project_timeline_settings_fy_month_ck,
+  drop constraint if exists project_timeline_settings_fy_labels_ck,
+  drop column     if exists start_calendar_year,
+  drop column     if exists fiscal_year_start_month,
+  drop column     if exists fiscal_year_labels_by;
+
+drop function if exists ship.parse_cost_input(text);
+commit;
+```
+
+**Undo `0005_ship_function_grants.sql`:**
+
+Nothing to drop — this migration only `revoke`s a stray default `PUBLIC`
+EXECUTE grant on three trigger functions. "Undoing" it would mean
+re-granting `PUBLIC`/`anon`/`authenticated` EXECUTE on
+`ship.fill_item_number()` / `ship.fill_chunk_number()` /
+`ship.normalize_line_item()`. Don't — that grant was the inconsistency
+this migration closed, not a feature to restore.
 
 **Undo `0004_ship_rpcs.sql`:**
 
@@ -218,7 +404,9 @@ above.
 
 ## What lives where
 
-### Tables (11, all in `ship`)
+### Tables (22, all in `ship`)
+
+#### v1 (0001) — 11 tables
 
 | Table | Purpose |
 | --- | --- |
@@ -226,22 +414,71 @@ above.
 | `projects` | `id` is the slug (`federal-campus-master-plan`). |
 | `project_consultants` | One row per discipline per project, with `org_name`. |
 | `project_members` | `(project_id, email, consultant_type)`. Replaces **both** `consultants[].emails` and the derived `assignedUsers`. Every RLS read passes through it. |
-| `line_items` | The 29 `LineItem` fields + `updated_at`. |
-| `chunk_projects` | Chunk / package projects. `timeline_segments` is jsonb. |
+| `line_items` | The 29 `LineItem` fields + `updated_at` (v1) + the 0006 cost/energy columns (v2). |
+| `chunk_projects` | Chunk / package projects. `timeline_segments` is jsonb, unused by new code since 0007 but kept for backward compat. |
 | `chunk_project_items` | Real child table (was the `itemLinks` array). Its `on delete cascade` fixes the orphaned-link bug in `deleteLineItem()`. |
-| `project_timeline_settings` | Per-project timeline config. Column is **`interval_unit`**, not `interval` (reserved type name); the TS field stays `interval` and the mapper renames it. |
+| `project_timeline_settings` | Per-project timeline config. Column is **`interval_unit`**, not `interval` (reserved type name); the TS field stays `interval` and the mapper renames it. Gained calendar-anchor columns in 0006. |
 | `item_number_counters` | Race-safe `(project_id, discipline) → next A1/M2/HP3`. No client grants. |
 | `chunk_number_counters` | Race-safe `project_id → next PP10`. No client grants. |
 | `pending_invites` | The allowlist gating who may become a SHIP user. No client grants. |
 
+#### v2 (0006–0010) — 11 more tables
+
+| Table | Added by | Purpose |
+| --- | --- | --- |
+| `project_cost_settings` | 0006 | Per-project TPC factor + escalation curve. One row per project, defaults if absent. |
+| `escalation_rate_overrides` | 0006 | Per-year escalation-rate pins, keyed by `year_offset` from `base_year`. |
+| `project_energy_settings` | 0006 | Per-project energy unit label, baseline, and the interactive-effects de-rate. |
+| `phase_templates` | 0007 | Named phase taxonomies. `project_id is null` = built-in (readable by everyone, writable by nobody over the API). |
+| `phase_template_steps` | 0007 | The ordered steps of a template — a starting point copied into `chunk_phases`, then edited freely. |
+| `chunk_phases` | 0007 | THE sub-task level: a package's phases, each with its own `pct_of_tpc`, timeline slot, and duration-lock flag. |
+| `phase_dependencies` | 0007 | FS/SS/FF/SF links between phases, with a `lag_slots` (may be negative — a lead). |
+| `project_taxonomy_values` | 0008 | Per-project dropdown vocabulary for the 4 taxonomy-constrained `line_items` columns. |
+| `project_roles` | 0009 | Per-project authority: `(project_id, email) → admin/editor/consultant/viewer`. Keyed on email, like `project_members`, for the same reason. |
+| `suggestions` | 0009 | A proposed patch to someone else's `line_items` row. Applied only by `apply_suggestion()`, never by a direct UPDATE. |
+| `scenarios` | 0010 | A branched, in-jsonb copy of a project's schedule (what-if sandbox). Published back or discarded; never a `scenario_id` column on the live tables — see the 0010 header for why. |
+
 ### RPCs
 
-| Function | Gate | Replaces |
+"Gate" = what the function checks before doing anything; "definer" =
+whether it runs `SECURITY DEFINER` (owner privilege, bypasses RLS — so its
+internal gate check IS the security boundary, not a convenience).
+
+| Function | Gate | Definer | Replaces / purpose |
+| --- | --- | --- | --- |
+| `ship.ensure_invites(text[], text)` | `is_admin()` (platform) | yes | `ensureConsultantUsers()` |
+| `ship.create_project(text, jsonb)` | `is_admin()` (platform) | yes | `createProject()` |
+| `ship.update_project(text, text, jsonb)` | `is_admin()` (platform) | yes | `updateProject()` / SettingsTab save |
+| `ship.claim_invite()` | any signed-in user | yes | *(new)* the signup gate |
+| `ship.parse_cost_input(text)` (0006) | none — pure, granted to `authenticated` | no (`immutable`, touches no table) | Ports `parseCostInput()` from `lib/costs.ts`. Read the Gotchas note below before touching the exponent regex. |
+| `ship.seed_default_taxonomy(text)` (0008) | `is_admin()` (platform) | yes | Populates a new project's taxonomy with the generic defaults. Not yet wired into `create_project()` — that's an app-layer change, out of scope for 0008. |
+| `ship.apply_suggestion(uuid, text)` (0009) | `can_edit_project()` on the suggestion's project | yes | Locks the suggestion row, enforces the column allowlist (`suggestable_line_item_columns()`), applies the patch, flips status to `accepted`. |
+| `ship.reject_suggestion(uuid, text)` (0009) | `can_edit_project()` on the suggestion's project | yes | Same lock discipline as `apply_suggestion`; writes no line item. |
+| `ship.baseline_fingerprint(text)` (0010) | none — read-only, granted to `authenticated` | yes (must see the true baseline past RLS) | md5 over the project's phases + dependencies; used by publish/rebase to detect drift. |
+| `ship.create_scenario(text, text, text)` (0010, tightened 0011) | `can_contribute_project()` | yes | Branches the current baseline into a private `scenarios` row. **0011 tightened this from `can_read_project()`** — a viewer's sandbox must stay ephemeral (SPEC R5.3), and persisting one is not ephemeral. |
+| `ship.publish_scenario(uuid)` (0010, tightened 0011) | `can_edit_project()` | yes | Applies a scenario back onto the baseline; refuses on fingerprint drift. **0011 tightened this from `can_read_project()` — see the Gotchas note; this was a real privilege-escalation bug.** |
+| `ship.rebase_scenario(uuid)` (0010) | scenario owner, or `is_admin()` | yes | Re-reads the current baseline into a stale scenario's payload and re-stamps its fingerprint, so a drift refusal isn't a dead end. |
+
+### RLS / authority helper functions (0007, 0009)
+
+These aren't meant to be called directly by the client — they're the
+predicates every policy above is built from. Full detail (and the
+uncorrelated-vs-correlated performance rule that dictates which shape is
+used where) is in the header of `0009_ship_roles_and_suggestions.sql`
+section 3; don't "simplify" the two shapes into one without reading it
+first.
+
+| Function | Shape | Used for |
 | --- | --- | --- |
-| `ship.ensure_invites(text[], text)` | admin | `ensureConsultantUsers()` |
-| `ship.create_project(text, jsonb)` | admin | `createProject()` |
-| `ship.update_project(text, text, jsonb)` | admin | `updateProject()` / SettingsTab save |
-| `ship.claim_invite()` | any signed-in user | *(new)* the signup gate |
+| `ship.project_role(text)` | returns `text`, per-row | THE authority function — `admin\|editor\|consultant\|viewer\|null` for the caller on one project. Everything else below is a boolean or set-returning projection of it. |
+| `ship.is_project_admin`, `ship.can_edit_project`, `ship.can_contribute_project`, `ship.can_read_project` | boolean, per-row | `INSERT ... WITH CHECK` policies (one known row) and any correlated per-row filter. `can_read_project` was **redefined** in 0009 — see Gotchas. |
+| `ship.my_project_ids`, `my_editable_project_ids`, `my_admin_project_ids`, `my_contributor_project_ids` | `setof text`, no args | `SELECT`/`UPDATE`/`DELETE USING` and `UPDATE WITH CHECK` — uncorrelated, hoisted into one InitPlan per statement instead of one call per row. |
+| `ship.my_readable_chunk_ids`, `my_editable_chunk_ids`, `my_readable_phase_ids`, `my_editable_phase_ids`, `my_readable_template_ids`, `my_editable_template_ids` | `setof uuid`, no args | Same trick, one level down, for tables keyed by a parent id rather than `project_id` directly. |
+| `ship.can_edit_chunk`, `can_edit_phase`, `can_edit_template`, `ship.phase_project_id` (0007), `ship.line_item_project_id` | boolean/text, per-row | `INSERT ... WITH CHECK` on the chunk/phase/template/suggestion tables. |
+
+All are `SECURITY DEFINER`, `stable`, `set search_path = ''`, and
+`revoke ... from public` + `grant execute ... to authenticated` — no
+exceptions.
 
 ---
 
@@ -280,9 +517,10 @@ can, because the exposure is on their side of the database:
 Consequence: **do not invite real SHIP users onto this project ref until
 that is resolved** with the other project's owner (scope their trigger,
 tighten their policies, or give SHIP its own Supabase project). Applying
-migrations `0001`–`0004` is safe and additive today; onboarding users is
-a separate decision. See `PREFLIGHT.md` in this directory for the full
-audit and evidence.
+migrations `0001`–`0005` (the set actually applied to the remote project —
+see `LOCAL-DEV.md`; `0006` onward are local-only so far) is safe and
+additive today; onboarding users is a separate decision. See
+`PREFLIGHT.md` in this directory for the full audit and evidence.
 
 ---
 
@@ -326,8 +564,80 @@ cannot leak into the next statement you run.
   `update (name)` on `ship.profiles`, which is what stops self-escalation.
   Role changes are a service-role / SQL-editor operation. To change that,
   widen the grant in `0002` — the `profiles_admin_all` policy already
-  permits it.
-- **Chunking is writable by any project member, not just admins.**
-  Consultants are routed to the Chunking and Timeline tabs, so an
-  admin-only write policy would give them a UI that silently fails.
-  `0002` marks the three policies to flip if that should change.
+  permits it. That policy is still `FOR ALL` and still gated on the
+  PLATFORM admin flag (`ship.is_admin()`), because `ship.profiles` is a
+  platform-level table with no project to scope to. Do not confuse it with
+  `projects_admin_all`, which 0009 *did* split into
+  `projects_insert`/`projects_update`/`projects_delete`, the latter two
+  gated on `my_admin_project_ids()`.
+- **Chunking is admin + editor write, everyone-else read — NOT "any
+  project member" any more.** That used to be true (0002/0007 both wrote
+  `using (ship.can_read_project(...))` on the chunk/phase/timeline write
+  policies, "so an admin-only write policy wouldn't give consultants a UI
+  that silently fails"). **0009 narrowed it**: per SPEC's role matrix,
+  `consultant` and `viewer` are read-only on packages, schedule and
+  templates; only `admin`/`editor` write. This is a real behaviour change,
+  not a doc fix — 0009's whole backfill strategy (every existing
+  `project_members` row becomes `editor`, not `consultant`) exists
+  specifically so this narrowing didn't silently break anyone's UI. If
+  you're touching chunk/phase policies, the ones to know are
+  `chunk_projects_update`, `chunk_project_items_update`,
+  `chunk_phases_update`, `phase_dependencies_update`,
+  `phase_templates_update`, `phase_template_steps_update`,
+  `project_timeline_settings_update` — all gated on
+  `project_id in (select ship.my_editable_project_ids())` (or the
+  chunk/phase-id equivalent).
+- **`0005_ship_function_grants.sql` is a no-op in practice, on purpose.**
+  It revokes the stray default `PUBLIC` EXECUTE grant on 3 trigger-only
+  functions (`fill_item_number`, `fill_chunk_number`,
+  `normalize_line_item`). A `BEFORE`-row trigger's invocation doesn't
+  check the invoking role's EXECUTE privilege on the trigger function at
+  all — only the table privilege and the function owner's own EXECUTE
+  matter — so this closes a security-advisor WARN without changing any
+  observable behaviour. Don't "fix" it by granting `authenticated`
+  EXECUTE back; that's precisely the inconsistency it removes.
+- **Alphabetical BEFORE-trigger ordering on `line_items` is now a 4-link
+  chain, and the names encode it on purpose:**
+  `line_items_aa_normalize` (fills `discipline`) →
+  `line_items_bb_fill_item_number` (reads `discipline`, from 0003) →
+  `line_items_cc_sync_ecc` (recomputes `ecc_amount` from
+  `estimated_first_cost`, from 0006) →
+  `line_items_dd_check_taxonomy` (validates the 4 taxonomy columns, from
+  0008). `cc` and `dd` don't functionally depend on `aa`/`bb`, but they're
+  named to continue the sequence rather than break the convention.
+  Renumbering any of them changes fire order; don't.
+- **Taxonomy validation fails OPEN, not closed, when a project has zero
+  rows for a `kind`.** `ship.taxonomy_value_allowed()` (0008) returns
+  `true` for every value if `project_taxonomy_values` has no rows at all
+  for `(project_id, kind)` — deliberately, so a kind added later without a
+  matching backfill (or a project created outside the normal flow) can't
+  brick line-item entry. This is a vocabulary, not a security boundary;
+  RLS is the actual boundary and is never fail-open. Once a project has
+  *any* value for a kind, validation is fully enforced for that kind.
+- **`substring(s from pattern)` returns the first CAPTURE GROUP, not the
+  whole match, when the pattern has one.** `ship.parse_cost_input()`
+  (0006) pulls out a leading numeric literal with a regex whose exponent
+  group MUST be non-capturing (`(?:[eE]...)`). A capturing group there
+  returns `NULL` for every input without an exponent — i.e. almost every
+  real cost string — and the function silently parses every cost in the
+  database as `0`. This is called out in the migration precisely because
+  it's the kind of bug that passes review and fails silently in
+  production; if you touch this function, test `'$1.2m'`, `'850k'`, and
+  `'1,250'` against it before committing, not just the exponent case.
+- **`chunk_phases.pct_of_tpc` is deliberately NOT constrained to sum to
+  100 across a package.** A CHECK can't span rows, and a trigger that
+  auto-normalised would silently rescale a number a cost estimator typed
+  — worse than showing them it's wrong. The UI is responsible for
+  surfacing a running total that goes red off 100; the database will
+  happily store 60 or 140.
+- **The v2 backfills in `0007`/`0008` are no-ops on a fresh database —
+  that's why `seeds/002_v2_phases.sql` and `seeds/003_v2_taxonomy.sql`
+  exist.** Both backfills join against `ship.projects`/`ship.line_items`
+  to migrate *existing* data forward. The Supabase CLI applies all
+  migrations before any seed, so on a fresh `db reset` there are zero
+  rows in those tables when 0007/0008 run — the backfills execute, match
+  nothing, and do nothing. The two extra seed files are the fixture
+  equivalent, written to run *after* `001_seed.sql` creates the projects
+  and line items. If you're wondering why local phases/taxonomy don't
+  show up after a reset, check that both seeds ran, in glob order
+  (001 → 002 → 003).

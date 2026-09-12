@@ -1,6 +1,8 @@
 # Masterplan v2 — Phasing, Cost Model, Energy & Collaboration
 
-Status: **spec, approved for build**
+Status: **built**, except the suggestions UI and PDF export (see §7).
+This document is kept as the record of what was agreed and why; for what the
+code actually does, read [`IMPLEMENTATION.md`](./IMPLEMENTATION.md).
 Source of record: `update-info/meeting-processed-transcript.md`, `update-info/meeting-condensed-summary.md`,
 `update-info/additional-context/*.png` (Megan's post-DCAMM follow-up + Steve's cost-split note).
 
@@ -500,24 +502,32 @@ Functional checks that matter more than pixels, and get their own specs:
 
 Sequenced so each step is independently shippable and committable.
 
-| # | Step | Why here |
+Migration numbers below are the ones that actually shipped, which drifted from the
+plan: taxonomies needed a file of their own (`0008`), pushing roles to `0009` and
+scenarios to `0010`, and an eleventh landed to close a privilege escalation found
+during review. See [`IMPLEMENTATION.md`](./IMPLEMENTATION.md) for what each one does.
+
+| # | Step | Status |
 |---|---|---|
-| 1 | Local Supabase stack + seed + Playwright harness | Nothing else is verifiable without it |
-| 2 | Migration `0006`: cost/energy settings, taxonomies, `ecc_amount`, energy columns | Pure additive schema |
-| 3 | `lib/cost-model.ts` + unit tests | Pure logic, no UI risk |
-| 4 | Migration `0007`: `chunk_phase`, `phase_dependency` + backfill from `timeline_segments` | The core model change |
-| 5 | Timeline tab: phase rows, per-phase bars, escalation display | The headline feature |
-| 6 | Dependency arrows, locks, push propagation, violations panel | Jeff's ask |
-| 7 | Cost Model tab | Makes 2–6 configurable |
-| 8 | Energy fields + step chart | Megan's follow-up |
-| 9 | Migration `0008`: `project_roles`, `suggestions` + RLS rewrite | Permissions |
-| 10 | Suggestions UI + review queue | |
-| 11 | Migration `0009`: `scenarios`; sandbox mode + banner + publish/discard | |
-| 12 | Excel + PDF export routes | Explicitly last per the meeting timeline |
+| 1 | Local Supabase stack + seed + Playwright harness | done |
+| 2 | Migration `0006`: cost/energy settings, `ecc_amount`, energy columns | done |
+| 3 | `lib/cost-model.ts` + unit tests | done — 53 assertions |
+| 4 | Migration `0007`: `chunk_phases`, `phase_dependencies` + backfill | done |
+| 5 | Timeline tab: phase rows, per-phase bars, escalation display | done |
+| 6 | Dependency arrows, locks, push propagation, violations panel | done |
+| 7 | Cost Model tab | done |
+| 8 | Energy fields + step chart | done |
+| 8b | Migration `0008`: per-project taxonomies + editor | done — not in the original plan |
+| 9 | Migration `0009`: `project_roles`, `suggestions` + RLS rewrite | done |
+| 10 | Suggestions UI + review queue | **not built** — schema only |
+| 11 | Migration `0010`: `scenarios`; sandbox mode + banner + publish/discard | done |
+| 11b | Migration `0011`: scenario authority fix | done — see §1.5 |
+| 12 | Excel export | done |
+| 12b | PDF export | **not built** |
 
 Steps 1–8 are the two weeks Aakash committed to on the call for "escalation logic and the
-sub-project task-wise number breakdown". Step 9–10 is the consultant onboarding gate. Step 12 is
-the "barely a couple of days" export work.
+sub-project task-wise number breakdown". Step 10 is the consultant onboarding gate and is the
+largest remaining piece of work. Step 12b is the "barely a couple of days" half that is left.
 
 ---
 
