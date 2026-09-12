@@ -11,7 +11,11 @@
     "db:stop": "supabase stop",
     "db:reset": "supabase db reset && node scripts/seed-local-users.mjs",
     "db:users": "node scripts/seed-local-users.mjs",
-    "db:psql": "docker exec -it supabase_db_project-data-collection psql -U postgres -d postgres"
+    "db:psql": "docker exec -it supabase_db_project-data-collection psql -U postgres -d postgres",
+    "test": "playwright test",
+    "test:update": "playwright test --update-snapshots",
+    "test:report": "playwright show-report",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.test.json"
   },
   "dependencies": {
     "@supabase/ssr": "^0.12.5",
@@ -23,6 +27,7 @@
     "server-only": "^0.0.1"
   },
   "devDependencies": {
+    "@playwright/test": "1.63.0",
     "@tailwindcss/postcss": "^4",
     "@types/node": "^20",
     "@types/react": "^19",

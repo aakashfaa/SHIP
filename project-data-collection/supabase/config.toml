@@ -10,7 +10,12 @@ enabled = true
 port = 55421
 # Schemas to expose in your API. Tables, views and stored procedures in this schema will get API
 # endpoints. `public` and `graphql_public` schemas are included by default.
-schemas = ["public", "graphql_public"]
+# `ship` must be listed or PostgREST 404s every request from the app, which is
+# schema-pinned to `ship` via createBrowserClient({ db: { schema: 'ship' } }).
+# The symptom is subtle: sign-in succeeds, then claim_invite() appears to fail
+# and the user lands on /no-access, because the RPC was never reachable.
+# The remote project has `ship` exposed already; this is the local equivalent.
+schemas = ["public", "graphql_public", "ship"]
 # Extra schemas to add to the search_path of every request.
 extra_search_path = ["public", "extensions"]
 # The maximum number of rows returns from a view, table, or stored procedure. Limits payload size

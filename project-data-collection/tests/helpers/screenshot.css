@@ -1,0 +1,39 @@
+/*
+ * Injected during screenshot capture via `expect.toHaveScreenshot.stylePath`.
+ *
+ * This is not the same as `animations: 'disabled'`. That option fast-forwards
+ * finite animations and resets infinite ones, which handles CSS/WAAPI
+ * animations — but it cannot reach a transition that a library re-triggers on
+ * every render, and it does not pierce Shadow DOM. `stylePath` does both.
+ */
+
+*,
+*::before,
+*::after {
+  animation-duration: 0s !important;
+  animation-delay: 0s !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0s !important;
+  transition-delay: 0s !important;
+  scroll-behavior: auto !important;
+}
+
+/* The caret blinks; `caret: 'hide'` covers the focused field, this covers the rest. */
+* {
+  caret-color: transparent !important;
+}
+
+/* Next.js dev-mode overlays. The suite builds for production so these should
+   never appear, but if someone points it at `next dev` the failure should be a
+   real diff rather than a screenshot of the build-activity spinner. */
+nextjs-portal,
+[data-nextjs-toast],
+[data-nextjs-dialog-overlay] {
+  display: none !important;
+}
+
+/* Skeleton shimmer settles to its loaded state rather than a random frame. */
+.animate-pulse {
+  animation: none !important;
+  opacity: 1 !important;
+}

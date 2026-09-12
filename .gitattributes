@@ -1,0 +1,11 @@
+# Screenshot baselines are compared byte-for-byte. Git for Windows defaults
+# core.autocrlf=true, which would rewrite line endings inside them on checkout
+# and make every visual test fail on a fresh clone.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.xlsx binary
+*.xlsm binary
+*.pdf binary
