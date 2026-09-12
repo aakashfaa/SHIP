@@ -1,4 +1,5 @@
 import { test, expect, type Page } from '@playwright/test'
+import { settle } from '../helpers/settle'
 
 /**
  * The per-project role gates, exercised as each role rather than asserted
@@ -18,13 +19,6 @@ import { test, expect, type Page } from '@playwright/test'
 const PROJECT = 'Federal Campus Master Plan'
 const PASSWORD = 'localdev123'
 
-async function settle(page: Page) {
-  await page.waitForLoadState('networkidle')
-  await page.evaluate(() => document.fonts.ready)
-  await page.evaluate(
-    () => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)))
-  )
-}
 
 async function signInAs(page: Page, email: string) {
   await page.goto('/')
@@ -88,7 +82,7 @@ test('an editor gets the plan and the deliverables', async ({ page }) => {
   await expect(page.getByText(/Read-only\. Ask an editor/i)).toHaveCount(0)
 })
 
-test('an admin can edit the project vocabularies', async ({ page }) => {
+test('an admin can edit the line item form', async ({ page }) => {
   await signInAs(page, 'admin@gmail.com')
   await page.getByRole('link', { name: new RegExp(PROJECT, 'i') }).first().click()
   await page.waitForURL(/\/projects\/.+/)
@@ -104,15 +98,74 @@ test('an admin can edit the project vocabularies', async ({ page }) => {
   await page.getByRole('button', { name: 'Settings' }).click()
   await settle(page)
 
-  await expect(page.getByRole('heading', { name: /Line item vocabularies/i })).toBeVisible()
+  await expect(page.getByRole('heading', { name: /Line item form/i })).toBeVisible()
 
-  // 'ANNEX' is here because seeds/003 backfills the values line items already
-  // carry, not just the generic defaults. Without that, every existing item
-  // would fail the taxonomy trigger on its next save.
-  await expect(page.getByText('ANNEX', { exact: true })).toBeVisible()
+  // A built-in field, a custom one, and a field the fixture hides. The three
+  // together are the whole model: built-ins are structural, custom fields are
+  // the point of the feature, and hiding is what you do instead of deleting a
+  // built-in. If any one of them stops rendering, the builder is broken in a
+  // way a screenshot diff alone would not explain.
+  await expect(page.getByText('Estimated first cost', { exact: true })).toBeVisible()
+  await expect(page.getByText('Funding source', { exact: true })).toBeVisible()
+  await expect(page.getByText('Electrification', { exact: true })).toBeVisible()
 
-  // One value is seeded archived so the restore path has a subject.
-  await expect(page.getByRole('button', { name: /1 archived/i })).toBeVisible()
+  await expect(page).toHaveScreenshot('form-builder.png', { fullPage: true })
+})
 
-  await expect(page).toHaveScreenshot('taxonomy-editor.png', { fullPage: true })
+test('built-in fields offer no delete, custom fields do', async ({ page }) => {
+  await signInAs(page, 'admin@gmail.com')
+  await page.getByRole('link', { name: new RegExp(PROJECT, 'i') }).first().click()
+  await page.waitForURL(/\/projects\/.+/)
+  await settle(page)
+  await page.getByRole('button', { name: 'Settings' }).click()
+  await settle(page)
+
+  // Wait for the builder to actually be on screen before counting anything.
+  // `locator.count()` is a ONE-SHOT query with no auto-retry, unlike
+  // `expect(...).toBeVisible()` -- and the tab panel animates in over ~280ms,
+  // so counting straight after the click reliably returns 0 and reads as
+  // "the feature is missing" rather than "the page had not painted yet".
+  await expect(page.getByText('Funding source', { exact: true })).toBeVisible()
+
+  // The database refuses to delete a built-in (migration 0012's guard
+  // trigger). This asserts the UI never offers the action in the first place
+  // -- a button that exists only to produce an error is worse than no button.
+  const deleteCount = await page.getByRole('button', { name: /^Delete$/ }).count()
+
+  // Exactly the two custom fields in the fixture, and none of the 24
+  // built-ins. An upper bound rather than an equality so adding a third
+  // custom field to the seed does not fail this for the wrong reason.
+  expect(deleteCount).toBe(2)
+})
+
+test('a custom field can be added and removed, built-ins are untouched', async ({ page }) => {
+  await signInAs(page, 'admin@gmail.com')
+  await page.getByRole('link', { name: new RegExp(PROJECT, 'i') }).first().click()
+  await page.waitForURL(/\/projects\/.+/)
+  await settle(page)
+  await page.getByRole('button', { name: 'Settings' }).click()
+  await settle(page)
+  await expect(page.getByText('Funding source', { exact: true })).toBeVisible()
+
+  const builtInCount = await page.getByText('Built-in', { exact: true }).count()
+
+  // Add a field. This is the client's actual ask -- "they have 10 fields now,
+  // in the future they add 2 more" -- so it is worth exercising for real
+  // rather than asserting the form that creates it merely renders.
+  await page.getByLabel(/new field label/i).fill('Roof warranty note')
+  await page.getByRole('button', { name: /^Add field$/i }).click()
+  await expect(page.getByText('Roof warranty note', { exact: true })).toBeVisible()
+
+  // Adding must not have disturbed the built-ins. That is the additive
+  // guarantee, observed from the UI rather than from SQL.
+  expect(await page.getByText('Built-in', { exact: true }).count()).toBe(builtInCount)
+
+  // Remove it again, through the two-step inline confirm. A native
+  // window.confirm() here would block the page and hang this test.
+  const row = page.locator('li', { hasText: 'Roof warranty note' }).last()
+  await row.getByRole('button', { name: /^Delete$/ }).click()
+  await row.getByRole('button', { name: /^Confirm delete$/ }).click()
+
+  await expect(page.getByText('Roof warranty note', { exact: true })).toHaveCount(0)
+  expect(await page.getByText('Built-in', { exact: true }).count()).toBe(builtInCount)
 })

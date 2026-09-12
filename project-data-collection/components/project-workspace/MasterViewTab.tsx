@@ -2,9 +2,9 @@
 
 import { useDeferredValue, useMemo, useRef, useState } from 'react'
 import { useAsyncData } from '@/lib/useAsyncData'
-import { getLineItemsForProject } from '@/lib/store'
+import { getFormFieldsForProject, getLineItemsForProject, visibleFormFields } from '@/lib/store'
 import type { ProjectPermissions } from '@/lib/project-role'
-import { LineItem, Project } from '@/lib/types'
+import { FormField, LineItem, Project } from '@/lib/types'
 
 type Props = {
   project: Project
@@ -33,6 +33,56 @@ const DISCIPLINE_COLORS: Record<string, string> = {
   TELECOM: '#A9D18E',
   TELECOMM: '#A9D18E',
   HAZARDOUS_MATERIALS: '#9C6B3A',
+}
+
+/*
+ * migration 0012 turned the fixed column list into `form_fields` data (see
+ * lib/store.ts getFormFieldsForProject / visibleFormFields). Everything a
+ * consultant actually FILLS IN on the form -- name, category, the strategic
+ * flags, a custom "Funding source" a firm added in Settings -- is rendered
+ * here as one column per visible field, in field sort order, instead of a
+ * column list this component owns.
+ *
+ * The columns that survive as hardcoded are the ones that are NOT form
+ * fields at all: the discipline colour stripe, item number, discipline,
+ * organization and submitted-by are system-managed (item/company/discipline
+ * triggers, auth) -- see the "Columns deliberately absent" comment in
+ * migration 0012's default_form_fields().
+ */
+
+/** Same mechanical key->property mapping AddDataTab.tsx uses, and the same
+ *  one exception -- see the comment there. Duplicated rather than shared
+ *  because lib/ is off limits for this change and these two components do
+ *  not otherwise import from each other. */
+const CAMEL_CASE_OVERRIDES: Record<string, string> = {
+  electrification_eo594: 'electrificationEO594',
+}
+
+function toCamelCase(key: string): string {
+  return CAMEL_CASE_OVERRIDES[key] ?? key.replace(/_([a-z0-9])/g, (_, c: string) => c.toUpperCase())
+}
+
+/** Reads a field's value off a line item, hiding the `storage: 'column'` vs
+ *  `'custom'` split the same way AddDataTab's get/set pair does -- this
+ *  side only ever needs to read. */
+function getFieldValue(item: LineItem, field: FormField): unknown {
+  if (field.storage === 'custom') return item.customFields?.[field.key]
+  return (item as unknown as Record<string, unknown>)[toCamelCase(field.key)]
+}
+
+function formatFieldValue(field: FormField, value: unknown): string {
+  if (field.inputType === 'multiselect') {
+    return Array.isArray(value) && value.length > 0 ? value.join(', ') : '-'
+  }
+  if (value === null || value === undefined || value === '') return '-'
+  return String(value)
+}
+
+function columnWidthClass(field: FormField): string {
+  if (field.inputType === 'textarea') return 'min-w-[200px]'
+  if (field.inputType === 'boolean') return 'w-[104px]'
+  if (field.inputType === 'multiselect') return 'w-[140px]'
+  return 'min-w-[128px]'
 }
 
 function getDisciplineKey(value: string) {
@@ -71,10 +121,6 @@ function sortLineItems(items: LineItem[], sortKey: SortKey) {
   })
 }
 
-function yn(value: string) {
-  return value === 'Yes' ? 'Y' : ''
-}
-
 export default function MasterViewTab({ project, permissions }: Props) {
   const exportRef = useRef<HTMLDivElement | null>(null)
   const [query, setQuery] = useState('')
@@ -82,6 +128,22 @@ export default function MasterViewTab({ project, permissions }: Props) {
   const [orgFilter, setOrgFilter] = useState('all')
   const [sortKey, setSortKey] = useState<SortKey>('itemNumber')
   const deferredQuery = useDeferredValue(query)
+
+  const {
+    data: formFields,
+    loading: fieldsLoading,
+  } = useAsyncData<FormField[]>(
+    () => getFormFieldsForProject(project.id),
+    [project.id],
+    []
+  )
+
+  const visibleFields = useMemo(() => visibleFormFields(formFields), [formFields])
+
+  // Empty rather than crashing: an unseeded project has no columns to build,
+  // and the right response is pointing at Settings, not a hardcoded list of
+  // some other firm's questions.
+  const formNotSeeded = !fieldsLoading && visibleFields.length === 0
 
   const {
     data: rawLineItems,
@@ -133,6 +195,7 @@ export default function MasterViewTab({ project, permissions }: Props) {
           item.supportingNotes,
           item.relativeFirstCost,
           item.estimatedFirstCost,
+          JSON.stringify(item.customFields ?? {}),
         ]
           .join(' ')
           .toLowerCase()
@@ -262,7 +325,15 @@ export default function MasterViewTab({ project, permissions }: Props) {
         </div>
       </div>
 
-      {lineItemsLoading ? (
+      {formNotSeeded ? (
+        <div className="rounded-[2rem] border border-dashed border-amber-300 bg-white p-12 text-center">
+          <h4 className="text-lg font-semibold text-gray-900">No form configured</h4>
+          <p className="mt-2 text-sm text-gray-500">
+            This project has no line-item form fields yet. Add fields in Settings &rarr; Line item
+            form.
+          </p>
+        </div>
+      ) : lineItemsLoading || fieldsLoading ? (
         <div className="rounded-[2rem] border border-dashed border-gray-300 bg-white p-12 text-center">
           <p className="text-sm text-gray-500">Loading line items...</p>
         </div>
@@ -287,19 +358,12 @@ export default function MasterViewTab({ project, permissions }: Props) {
                 <HeaderCell className="w-[72px]">#</HeaderCell>
                 <HeaderCell className="min-w-[128px]">Discipline</HeaderCell>
                 <HeaderCell className="min-w-[144px]">Organization</HeaderCell>
-                <HeaderCell className="min-w-[220px]">Name / Description</HeaderCell>
-                <HeaderCell className="w-[140px]">Strategy</HeaderCell>
-                <HeaderCell className="w-[135px]">Location</HeaderCell>
-                <HeaderCell className="w-[128px]">Impacts</HeaderCell>
-                <HeaderCell className="w-[150px]">Cost / Energy</HeaderCell>
-                <HeaderCell className="min-w-[132px]">Resiliency / Sustainability</HeaderCell>
-                <HeaderCell className="min-w-[132px]">Deferred Maintenance</HeaderCell>
-                <HeaderCell className="min-w-[132px]">Code / Life Safety</HeaderCell>
-                <HeaderCell className="min-w-[132px]">Accessibility Improvement</HeaderCell>
-                <HeaderCell className="min-w-[120px]">Historic Impact</HeaderCell>
-                <HeaderCell className="w-[100px]">Synergies</HeaderCell>
-                <HeaderCell className="w-[150px]">Notes</HeaderCell>
-                <HeaderCell className="w-[120px]">Submitted By</HeaderCell>
+                {visibleFields.map((field) => (
+                  <HeaderCell key={field.id} className={columnWidthClass(field)}>
+                    {field.label}
+                  </HeaderCell>
+                ))}
+                <HeaderCell className="w-[150px]">Submitted By</HeaderCell>
               </tr>
             </thead>
             <tbody>
@@ -319,47 +383,20 @@ export default function MasterViewTab({ project, permissions }: Props) {
                     </BodyCell>
                     <BodyCell>{item.discipline}</BodyCell>
                     <BodyCell>{item.companyName}</BodyCell>
-                    <BodyCell>
-                      <div className="font-semibold text-slate-900">{item.name}</div>
-                      <div className="mt-1 text-[10px] text-slate-500">
-                        {item.shortDescription || 'No description'}
-                      </div>
-                    </BodyCell>
-                    <BodyCell>
-                      <div>{item.category}</div>
-                      <div className="mt-1 text-[10px] text-slate-500">{item.timelinePriority}</div>
-                    </BodyCell>
-                    <BodyCell>
-                      <div>{item.buildingAreaImpacted}</div>
-                      <div className="mt-1 text-[10px] text-slate-500">
-                        {item.buildingLevelImpacted}
-                      </div>
-                    </BodyCell>
-                    <BodyCell>
-                      <div>Op: {item.operationalImpact}</div>
-                      <div>User: {item.benefitToUsers}</div>
-                      <div>Public: {item.benefitToPublic}</div>
-                    </BodyCell>
-                    <BodyCell>
-                      <div>{item.relativeFirstCost}</div>
-                      <div className="mt-1 text-[10px] text-slate-500">
-                        {item.estimatedFirstCost || 'No pricing input'}
-                      </div>
-                      <div className="mt-1 text-[10px] text-slate-500">
-                        Op: {item.relativeOperationCostImpact}
-                      </div>
-                      <div className="text-[10px] text-slate-500">
-                        Energy: {item.relativeOperationalEnergyUsage}
-                      </div>
-                      <div className="text-[10px] text-slate-500">EO594: {item.electrificationEO594}</div>
-                    </BodyCell>
-                    <BodyCell centered>{yn(item.addressingResiliencySustainability)}</BodyCell>
-                    <BodyCell centered>{yn(item.addressingDeferredMaintenance)}</BodyCell>
-                    <BodyCell centered>{yn(item.codeLifeSafetyImprovement)}</BodyCell>
-                    <BodyCell centered>{yn(item.accessibilityImprovement)}</BodyCell>
-                    <BodyCell centered>{yn(item.historicImpact)}</BodyCell>
-                    <BodyCell>{item.potentialSynergies.join(', ') || '-'}</BodyCell>
-                    <BodyCell>{item.supportingNotes || '-'}</BodyCell>
+                    {visibleFields.map((field) => {
+                      const raw = getFieldValue(item, field)
+
+                      if (field.inputType === 'boolean') {
+                        const isYes = raw === true || raw === 'Yes'
+                        return (
+                          <BodyCell key={field.id} centered>
+                            {isYes ? 'Y' : ''}
+                          </BodyCell>
+                        )
+                      }
+
+                      return <BodyCell key={field.id}>{formatFieldValue(field, raw)}</BodyCell>
+                    })}
                     <BodyCell>{item.userEmail}</BodyCell>
                   </tr>
                 )

@@ -1,4 +1,5 @@
 import { test, expect, type Page } from '@playwright/test'
+import { settle } from '../helpers/settle'
 
 /**
  * The per-package phase editor in Chunking.
@@ -10,13 +11,6 @@ import { test, expect, type Page } from '@playwright/test'
 
 test.describe.configure({ mode: 'serial' })
 
-async function settle(page: Page) {
-  await page.waitForLoadState('networkidle')
-  await page.evaluate(() => document.fonts.ready)
-  await page.evaluate(
-    () => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)))
-  )
-}
 
 async function openChunkingPackage(page: Page, chunkNumber: string) {
   await page.goto('/projects/federal-campus-master-plan?tab=chunking')

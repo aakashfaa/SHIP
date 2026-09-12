@@ -1,4 +1,5 @@
 import { test, expect, type Page } from '@playwright/test'
+import { settle } from '../helpers/settle'
 
 /**
  * Baseline capture of the v1 workspace, taken before the v2 phasing work lands.
@@ -15,17 +16,6 @@ import { test, expect, type Page } from '@playwright/test'
 
 const SEED_PROJECT = 'Federal Campus Master Plan'
 
-/** Waits for the async data each tab loads on mount to settle. Every tab uses
- *  `useAsyncData`, which renders a "Loading…" string until its promise
- *  resolves; waiting on the network alone races that render. */
-async function settle(page: Page) {
-  await page.waitForLoadState('networkidle')
-  await expect(page.getByText(/loading/i).first()).toBeHidden({ timeout: 15_000 }).catch(() => {})
-  await page.evaluate(() => document.fonts.ready)
-  await page.evaluate(
-    () => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)))
-  )
-}
 
 async function openSeedProject(page: Page) {
   await page.goto('/projects')

@@ -148,6 +148,18 @@ export type LineItem = {
   annualEnergySavings: number
   annualCostSavings: number
   energyNotes: string
+  // v2 (migration 0012). Values for `storage='custom'` form_fields, keyed by
+  // FormField.key. Built-in fields (the properties above) never appear in
+  // here -- they live in their own column and are read/written the normal
+  // way. See the FormField/FormFieldStorage comment below for the full
+  // column-vs-custom split.
+  //
+  // Optional (unlike every other field on this type) because the column
+  // itself is `not null default '{}'`: a caller building a line item that
+  // predates the form builder, or that has no custom fields to set, can
+  // simply omit this and get the same object rowToLineItem would have
+  // produced anyway. lineItemToRow only sends it when present.
+  customFields?: Record<string, unknown>
 }
 
 export type ChunkProjectItem = {
@@ -320,6 +332,84 @@ export type ProjectTaxonomyValue = {
    *  the next edit. Archiving stops it being OFFERED in new dropdowns while
    *  every historical record keeps working. */
   isArchived: boolean
+}
+
+/**
+ * The line-item FORM ITSELF, as data (migration 0012). Supersedes the fixed
+ * 20-question wizard `TaxonomyKind` above was patching the vocabulary for --
+ * this is the fields, not just their values.
+ */
+export type FormFieldInputType =
+  | 'text'
+  | 'textarea'
+  | 'number'
+  | 'currency'
+  | 'select'
+  | 'multiselect'
+  | 'boolean'
+  | 'date'
+
+/**
+ * Where a field's value actually lives, and the reason `storage` and
+ * `isBuiltin` exist at all: every field that shipped before this migration
+ * (name, estimated_first_cost, annual_energy_savings, ...) is a real column
+ * on `line_items`, and other code reads those columns by name -- ecc_amount
+ * is derived from estimated_first_cost, the energy chart reads
+ * annual_energy_savings, numbering reads discipline. Those fields can be
+ * relabelled, reordered, regrouped and hidden from a settings screen, but
+ * deleting one or changing its input type would leave code reading a column
+ * that no longer means what the form claims (or, for delete, a column with
+ * no form control at all), so the database refuses both outright.
+ *
+ *   'column' -- backed by a real line_items column of the same name as
+ *               `key`. Always `isBuiltin: true`.
+ *   'custom' -- lives in LineItem.customFields, keyed by `key`. Fully
+ *               editable and deletable; this is what "add a field" creates.
+ */
+export type FormFieldStorage = 'column' | 'custom'
+
+export type FormFieldOption = {
+  id: string
+  fieldId: string
+  value: string
+  label: string
+  sortOrder: number
+  /** Soft delete, same rationale as ProjectTaxonomyValue.isArchived above: a
+   *  value already written onto a line item cannot be withdrawn without that
+   *  item failing validation on its next edit. */
+  isArchived: boolean
+}
+
+export type FormField = {
+  id: string
+  projectId: string
+  // Stable identifier. For a built-in it IS the line_items column name --
+  // that's what lets code map a field definition onto a column without a
+  // lookup table -- so it is immutable once created (enforced both by the
+  // DB trigger for built-ins and by lib/store.ts createFormField deriving it
+  // once, for custom fields).
+  key: string
+  label: string
+  helpText: string
+  inputType: FormFieldInputType
+  storage: FormFieldStorage
+  // Free text wizard-step name, same reasoning as ship.form_fields.group_label:
+  // a firm that wants a different set of steps should not need a migration.
+  groupLabel: string
+  sortOrder: number
+  isRequired: boolean
+  // Hidden fields are still returned by getFormFieldsForProject -- the
+  // builder needs to show them so they can be un-hidden -- and filtered out
+  // by the pure helper `visibleFormFields` for the actual Add Data form.
+  isHidden: boolean
+  /** See FormFieldStorage above: true for every field ship.seed_default_form
+   *  created. This is what ship.guard_form_field keys off to refuse a delete
+   *  or a retype, and what a settings UI should key off to grey those
+   *  controls out rather than let the user hit the database error. */
+  isBuiltin: boolean
+  config: Record<string, unknown>
+  options: FormFieldOption[]
+  createdAt: string
 }
 
 export type ProjectEnergySettings = {

@@ -17,6 +17,8 @@ import {
   ChunkPhaseRow,
   ChunkProjectRow,
   EscalationRateOverrideRow,
+  FormFieldOptionRow,
+  FormFieldRow,
   LineItemRow,
   PhaseDependencyRow,
   PhaseTemplateRow,
@@ -29,6 +31,7 @@ import {
   chunkPhaseToRow,
   costSettingsToRow,
   energySettingsToRow,
+  formFieldToRow,
   lineItemToRow,
   normalizeTimelineSegments,
   phaseDependencyToRow,
@@ -36,6 +39,8 @@ import {
   rowToChunkProject,
   rowToCostSettings,
   rowToEnergySettings,
+  rowToFormField,
+  rowToFormFieldOption,
   rowToLineItem,
   rowToPhaseDependency,
   rowToPhaseTemplate,
@@ -50,6 +55,9 @@ import {
   ChunkProject,
   ConsultantType,
   DependencyType,
+  FormField,
+  FormFieldInputType,
+  FormFieldOption,
   LineItem,
   PhaseDependency,
   PhaseTemplate,
@@ -66,6 +74,7 @@ import {
 
 const PROJECT_SELECT = '*, project_consultants(*), project_members(*)'
 const CHUNK_SELECT = '*, chunk_project_items(*)'
+const FORM_FIELD_SELECT = '*, form_field_options(*)'
 
 function fail(context: string, error: { message: string } | null): never {
   throw new Error(`${context}: ${error?.message ?? 'unknown Supabase error'}`)
@@ -168,6 +177,20 @@ export async function createProject(input: {
   })
   if (taxonomyError) {
     console.error(`Failed to seed default taxonomy for "${projectId}":`, taxonomyError)
+  }
+
+  // Seed the project's line-item form (migration 0012) the same way, and for
+  // the same reason: without this, a brand new project has zero form_fields
+  // rows, so the Add Data wizard would render no questions at all until an
+  // admin visits the form builder. `seedDefaultForm` is additive-only (ON
+  // CONFLICT DO NOTHING keyed on (project_id, key)), so this can never
+  // overwrite anything even if called again later. Non-fatal for the same
+  // reason as the taxonomy seed above: the project row already exists, so
+  // throwing here would show an error for a project that was in fact created.
+  try {
+    await seedDefaultForm(projectId)
+  } catch (formError) {
+    console.error(`Failed to seed default form for "${projectId}":`, formError)
   }
 
   const project = await getProjectById(projectId)
@@ -1153,4 +1176,310 @@ export async function reorderTaxonomyValues(
     .upsert(rows, { onConflict: 'project_id,kind,value' })
 
   if (error) fail('Failed to reorder values', error)
+}
+
+/* ------------------------------------------------------------ form fields -- */
+// supabase/migrations/0012_ship_form_builder.sql. Supersedes the taxonomy
+// functions above -- a "field" now carries its own label/type/order rather
+// than being one of four hardcoded dropdowns -- but they are left in place
+// (see the file header) because another component still imports them.
+
+/**
+ * A project's whole form definition, fields and options together, in
+ * display order. Hidden fields and archived options are INCLUDED: the form
+ * builder has to show a hidden field to offer "unhide" and an archived
+ * option to offer "restore". Consumers building the actual Add Data form
+ * want `visibleFormFields` / `fieldOptions` below instead.
+ */
+export async function getFormFieldsForProject(projectId: string): Promise<FormField[]> {
+  const supabase = getSupabaseBrowserClient()
+
+  const { data, error } = await supabase
+    .from('form_fields')
+    .select(FORM_FIELD_SELECT)
+    .eq('project_id', projectId)
+    .order('sort_order', { ascending: true })
+
+  if (error) fail(`Failed to load form fields for "${projectId}"`, error)
+
+  return ((data ?? []) as unknown as FormFieldRow[]).map(rowToFormField)
+}
+
+/**
+ * Pure helper for the Add Data form: not hidden, in order. Takes the array
+ * `getFormFieldsForProject` already returned rather than querying again, so
+ * a component can call it on every render (e.g. while the user toggles a
+ * step) without hitting Supabase.
+ */
+export function visibleFormFields(fields: readonly FormField[]): FormField[] {
+  return fields
+    .filter((field) => !field.isHidden)
+    .slice()
+    .sort((a, b) => a.sortOrder - b.sortOrder)
+}
+
+/**
+ * The live choices for one select/multiselect field, in order.
+ *
+ * Same rationale as `taxonomyOptions` above, which this supersedes: `current`
+ * is the value (or, for multiselect, one value) the record being edited
+ * already holds. If that value has since been archived it is still included
+ * here, because dropping it would silently rewrite the record to something
+ * else the moment someone opened the form -- a data change nobody asked for,
+ * caused by rendering. Pure, like `visibleFormFields`: no Supabase call.
+ */
+export function fieldOptions(field: FormField, current?: string): string[] {
+  const options = field.options
+    .filter((option) => !option.isArchived)
+    .sort((a, b) => a.sortOrder - b.sortOrder)
+    .map((option) => option.value)
+
+  if (current && !options.includes(current)) return [current, ...options]
+  return options
+}
+
+/**
+ * Turns a label into a `key` that satisfies the DB's `^[a-z][a-z0-9_]*$`
+ * check and is unique within the project: lowercase, every run of
+ * non-alphanumerics becomes one underscore, and a slug that would start with
+ * a digit (or be empty) gets a `field_` prefix instead of being rejected on
+ * save. Collisions get a numeric suffix.
+ */
+function deriveFieldKey(label: string, existingKeys: readonly string[]): string {
+  const slug = label
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+
+  const base = slug === '' ? 'field' : /^[a-z]/.test(slug) ? slug : `field_${slug}`
+
+  if (!existingKeys.includes(base)) return base
+
+  let suffix = 2
+  while (existingKeys.includes(`${base}_${suffix}`)) suffix++
+  return `${base}_${suffix}`
+}
+
+/**
+ * Creates a CUSTOM field. There is no way to create a built-in one from
+ * here -- `storage: 'custom'` and `is_builtin: false` are hardcoded below,
+ * and `ship.form_fields_builtin_storage_ck` would reject anything else
+ * anyway. `key` is derived from the label rather than accepted as an input:
+ * it only has to exist, be stable and be unique, none of which a form
+ * builder's user needs to think about.
+ */
+export async function createFormField(
+  projectId: string,
+  input: {
+    label: string
+    helpText?: string
+    inputType: FormFieldInputType
+    groupLabel?: string
+    isRequired?: boolean
+  }
+): Promise<FormField> {
+  const supabase = getSupabaseBrowserClient()
+
+  const existing = await getFormFieldsForProject(projectId)
+  const key = deriveFieldKey(
+    input.label,
+    existing.map((field) => field.key)
+  )
+  // Append at the end. `+ 10` rather than `+ 1` matches the gaps the seeder
+  // leaves between built-ins (10, 20, 30, ...), so a field added here can
+  // later be dragged between two adjacent defaults without a renumbering
+  // pass -- see reorderFormFields, which renumbers everything anyway, but
+  // there is no reason to force that on the very next add.
+  const nextSortOrder = existing.reduce((max, field) => Math.max(max, field.sortOrder), 0) + 10
+
+  const { data, error } = await supabase
+    .from('form_fields')
+    .insert({
+      project_id: projectId,
+      key,
+      label: input.label.trim(),
+      help_text: input.helpText ?? '',
+      input_type: input.inputType,
+      storage: 'custom',
+      group_label: input.groupLabel ?? '',
+      sort_order: nextSortOrder,
+      is_required: input.isRequired ?? false,
+      is_builtin: false,
+    })
+    .select(FORM_FIELD_SELECT)
+    .single()
+
+  if (error) fail(`Failed to create form field "${input.label}"`, error)
+
+  return rowToFormField(data as unknown as FormFieldRow)
+}
+
+/**
+ * Label, help text, grouping, required/hidden and order are legal on any
+ * field. `inputType` is legal too, but only actually takes for a custom
+ * field -- `ship.guard_form_field` throws for a built-in, and that error is
+ * left to propagate through `fail()` unchanged rather than being pre-empted
+ * here, because its message ("cannot change the input type of built-in
+ * field...") is the one the user should see.
+ */
+export async function updateFormField(
+  fieldId: string,
+  updates: Partial<
+    Pick<
+      FormField,
+      'label' | 'helpText' | 'groupLabel' | 'isRequired' | 'isHidden' | 'sortOrder' | 'inputType'
+    >
+  >
+): Promise<FormField | null> {
+  const supabase = getSupabaseBrowserClient()
+
+  const { data, error } = await supabase
+    .from('form_fields')
+    .update(formFieldToRow(updates))
+    .eq('id', fieldId)
+    .select(FORM_FIELD_SELECT)
+    .maybeSingle()
+
+  if (error) fail(`Failed to update form field "${fieldId}"`, error)
+  if (!data) return null
+
+  return rowToFormField(data as unknown as FormFieldRow)
+}
+
+/**
+ * `ship.guard_form_field` (0012) refuses this outright for a built-in, with
+ * a 42501 whose message names the field and says "Hide it instead." That
+ * message is worth showing to the user verbatim, so it is not caught or
+ * replaced here -- `fail()` folds it into the thrown Error unchanged, same
+ * as every other write in this file.
+ */
+export async function deleteFormField(fieldId: string): Promise<void> {
+  const supabase = getSupabaseBrowserClient()
+
+  const { error } = await supabase.from('form_fields').delete().eq('id', fieldId)
+
+  if (error) fail(`Failed to delete form field "${fieldId}"`, error)
+}
+
+/** Persist a reordering. One upsert, like `reorderTaxonomyValues` /
+ *  `reorderChunkPhases` above -- these lists are a few dozen entries long at
+ *  most, so a bulk RPC would be machinery for no gain. `project_id` is
+ *  included at the value the caller already asserts these fields belong to,
+ *  purely so a caller that passes a foreign id fails loudly (a project
+ *  mismatch) rather than silently reparenting a field. */
+export async function reorderFormFields(projectId: string, orderedFieldIds: string[]): Promise<void> {
+  const supabase = getSupabaseBrowserClient()
+
+  const rows = orderedFieldIds.map((id, index) => ({
+    id,
+    project_id: projectId,
+    sort_order: index,
+  }))
+
+  if (rows.length === 0) return
+
+  const { error } = await supabase.from('form_fields').upsert(rows, { onConflict: 'id' })
+
+  if (error) fail(`Failed to reorder form fields for "${projectId}"`, error)
+}
+
+/**
+ * Append one option. Uses `upsert` on `(field_id, value)` the same way
+ * `addTaxonomyValue` does, so re-adding an archived value restores it rather
+ * than colliding with the unique constraint.
+ */
+export async function addFieldOption(fieldId: string, value: string): Promise<FormFieldOption> {
+  const supabase = getSupabaseBrowserClient()
+  const trimmed = value.trim()
+
+  if (trimmed === '') throw new Error('An option value cannot be blank.')
+
+  // Working out the next sort order client-side races another editor doing
+  // the same thing, same tradeoff `addTaxonomyValue` accepts: the worst case
+  // is two options sharing a position and sorting arbitrarily, which is
+  // cosmetic and far cheaper than a round trip or a sequence per field.
+  const { data: existingRows, error: existingError } = await supabase
+    .from('form_field_options')
+    .select('sort_order')
+    .eq('field_id', fieldId)
+
+  if (existingError) fail(`Failed to load options for field "${fieldId}"`, existingError)
+
+  const nextSortOrder =
+    ((existingRows ?? []) as Array<{ sort_order: number | string | null }>).reduce(
+      (max, row) => Math.max(max, Number(row.sort_order ?? 0) || 0),
+      -10
+    ) + 10
+
+  const { data, error } = await supabase
+    .from('form_field_options')
+    .upsert(
+      {
+        field_id: fieldId,
+        value: trimmed,
+        label: trimmed,
+        sort_order: nextSortOrder,
+        is_archived: false,
+      },
+      { onConflict: 'field_id,value' }
+    )
+    .select('*')
+    .single()
+
+  if (error) fail(`Failed to add option "${trimmed}"`, error)
+
+  return rowToFormFieldOption(data as unknown as FormFieldOptionRow)
+}
+
+/**
+ * Archive or restore an option. No delete, for the same reason
+ * `setTaxonomyValueArchived` has none: a value already written onto a line
+ * item cannot be removed from the vocabulary without that item failing
+ * validation on its next edit.
+ */
+export async function setFieldOptionArchived(optionId: string, isArchived: boolean): Promise<void> {
+  const supabase = getSupabaseBrowserClient()
+
+  const { error } = await supabase
+    .from('form_field_options')
+    .update({ is_archived: isArchived })
+    .eq('id', optionId)
+
+  if (error) fail(`Failed to update option "${optionId}"`, error)
+}
+
+/** Persist a reordering, one upsert, matching `reorderFormFields` above. */
+export async function reorderFieldOptions(
+  fieldId: string,
+  orderedOptionIds: string[]
+): Promise<void> {
+  const supabase = getSupabaseBrowserClient()
+
+  const rows = orderedOptionIds.map((id, index) => ({
+    id,
+    field_id: fieldId,
+    sort_order: index,
+  }))
+
+  if (rows.length === 0) return
+
+  const { error } = await supabase.from('form_field_options').upsert(rows, { onConflict: 'id' })
+
+  if (error) fail(`Failed to reorder options for field "${fieldId}"`, error)
+}
+
+/**
+ * Calls `ship.seed_default_form()` -- the ADDITIVE operation described in
+ * migration 0012's header. Adds every default field (and every default
+ * option those fields don't already have) that this project is missing;
+ * never updates or deletes anything a firm has customised. Safe to call
+ * repeatedly, including from `createProject` above.
+ */
+export async function seedDefaultForm(projectId: string): Promise<void> {
+  const supabase = getSupabaseBrowserClient()
+
+  const { error } = await supabase.rpc('seed_default_form', { p_project_id: projectId })
+
+  if (error) fail(`Failed to seed default form for "${projectId}"`, error)
 }

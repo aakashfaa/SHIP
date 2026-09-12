@@ -2,10 +2,10 @@
 
 import { useMemo, useState } from 'react'
 import { CONSULTANT_TYPES } from '@/lib/constants'
-import { getTaxonomyForProject, updateProject } from '@/lib/store'
+import { getFormFieldsForProject, updateProject } from '@/lib/store'
 import { useAsyncData } from '@/lib/useAsyncData'
-import { ConsultantType, Project, ProjectTaxonomyValue } from '@/lib/types'
-import TaxonomyEditor from './TaxonomyEditor'
+import { ConsultantType, FormField, Project } from '@/lib/types'
+import FormBuilder from './FormBuilder'
 
 type Props = {
   project: Project
@@ -27,14 +27,10 @@ export default function SettingsTab({ project, onProjectUpdated }: Props) {
   const [isEditing, setIsEditing] = useState(false)
 
   const {
-    data: taxonomy,
-    error: taxonomyError,
-    reload: reloadTaxonomy,
-  } = useAsyncData<ProjectTaxonomyValue[]>(
-    () => getTaxonomyForProject(project.id),
-    [project.id],
-    []
-  )
+    data: formFields,
+    error: formFieldsError,
+    reload: reloadFormFields,
+  } = useAsyncData<FormField[]>(() => getFormFieldsForProject(project.id), [project.id], [])
   const [message, setMessage] = useState('')
   const [error, setError] = useState('')
   const [isSaving, setIsSaving] = useState(false)
@@ -418,20 +414,17 @@ export default function SettingsTab({ project, onProjectUpdated }: Props) {
         })}
       </div>
 
-      {/* The vocabularies behind the Add Data dropdowns. Lives here rather
-          than on its own tab because it is configuration a project admin sets
-          once and then forgets, which is exactly what Settings is for. */}
+      {/* The questions asked when someone on this project adds a line item.
+          Lives here rather than on its own tab because it is configuration a
+          project admin sets once and then forgets, which is exactly what
+          Settings is for. */}
       <div className="rounded-[2rem] bg-gray-50 p-6">
-        {taxonomyError ? (
+        {formFieldsError ? (
           <div className="mb-4 rounded-2xl bg-rose-50 px-4 py-3 text-sm text-rose-700">
-            {taxonomyError.message}
+            {formFieldsError.message}
           </div>
         ) : null}
-        <TaxonomyEditor
-          projectId={project.id}
-          values={taxonomy}
-          onChanged={reloadTaxonomy}
-        />
+        <FormBuilder projectId={project.id} fields={formFields} onChanged={reloadFormFields} />
       </div>
     </div>
   )

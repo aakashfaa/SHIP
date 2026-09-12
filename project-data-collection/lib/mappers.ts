@@ -25,6 +25,10 @@ import {
   EscalationBasis,
   EscalationMode,
   FiscalYearLabelsBy,
+  FormField,
+  FormFieldInputType,
+  FormFieldOption,
+  FormFieldStorage,
   LineItem,
   PhaseDependency,
   PhaseKind,
@@ -104,6 +108,10 @@ export type LineItemRow = {
   annual_energy_savings: number | string
   annual_cost_savings: number | string
   energy_notes: string | null
+  // v2 (0012). `not null default '{}'` at the column, but read defensively
+  // anyway (see toPlainObject below) the same way every other jsonb column
+  // in this file is.
+  custom_fields: unknown
 }
 
 export type ChunkProjectItemRow = {
@@ -157,6 +165,16 @@ function consultantTypeOrder(type: string): number {
 
 function distinct(values: string[]): string[] {
   return [...new Set(values.map((v) => v.trim().toLowerCase()).filter(Boolean))]
+}
+
+/** Defensive narrowing for a jsonb column typed as an object at the
+ *  database (a `jsonb_typeof(...) = 'object'` CHECK) but untyped on the way
+ *  out through PostgREST. Used for `custom_fields` and `form_fields.config`. */
+function toPlainObject(value: unknown): Record<string, unknown> {
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    return value as Record<string, unknown>
+  }
+  return {}
 }
 
 /* -------------------------------------------------------------- projects -- */
@@ -233,6 +251,7 @@ export function rowToLineItem(row: LineItemRow): LineItem {
     annualEnergySavings: toNumber(row.annual_energy_savings) ?? 0,
     annualCostSavings: toNumber(row.annual_cost_savings) ?? 0,
     energyNotes: row.energy_notes ?? '',
+    customFields: toPlainObject(row.custom_fields),
   }
 }
 
@@ -269,6 +288,7 @@ const LINE_ITEM_COLUMNS: Array<[keyof LineItem, keyof LineItemRow]> = [
   ['annualEnergySavings', 'annual_energy_savings'],
   ['annualCostSavings', 'annual_cost_savings'],
   ['energyNotes', 'energy_notes'],
+  ['customFields', 'custom_fields'],
   // `eccAmount` is DELIBERATELY ABSENT from this list, not merely unused.
   // ship.sync_line_item_ecc() (0006) recomputes it from estimated_first_cost
   // on every insert/update, so a write from here is at best a no-op and at
@@ -834,4 +854,100 @@ export function scenarioPayloadToRow(payload: ScenarioPayload): Record<string, u
       lag_slots: d.lagSlots,
     })),
   }
+}
+
+/* -------------------------------------------------------------- form fields -- */
+// supabase/migrations/0012_ship_form_builder.sql
+
+export type FormFieldOptionRow = {
+  id: string
+  field_id: string
+  value: string
+  label: string | null
+  sort_order: number | string | null
+  is_archived: boolean | null
+}
+
+export type FormFieldRow = {
+  id: string
+  project_id: string
+  key: string
+  label: string
+  help_text: string | null
+  input_type: string
+  storage: string
+  group_label: string | null
+  sort_order: number | string | null
+  is_required: boolean | null
+  is_hidden: boolean | null
+  is_builtin: boolean | null
+  config: unknown
+  created_at: string
+  // Present when the query embeds the relationship (see
+  // lib/store.ts FORM_FIELD_SELECT); absent for a bare row.
+  form_field_options?: FormFieldOptionRow[] | null
+}
+
+export function rowToFormFieldOption(row: FormFieldOptionRow): FormFieldOption {
+  return {
+    id: row.id,
+    fieldId: row.field_id,
+    value: row.value,
+    // Falls back to the value itself: the seeder writes label = value for
+    // every option it creates (see ship.seed_default_form), so an empty
+    // label here means "never customised", not "blank on purpose".
+    label: row.label && row.label.trim() !== '' ? row.label : row.value,
+    sortOrder: toNumber(row.sort_order) ?? 0,
+    isArchived: row.is_archived === true,
+  }
+}
+
+export function rowToFormField(row: FormFieldRow): FormField {
+  const options = (row.form_field_options ?? [])
+    .slice()
+    .sort((a, b) => (toNumber(a.sort_order) ?? 0) - (toNumber(b.sort_order) ?? 0))
+    .map(rowToFormFieldOption)
+
+  return {
+    id: row.id,
+    projectId: row.project_id,
+    key: row.key,
+    label: row.label,
+    helpText: row.help_text ?? '',
+    inputType: row.input_type as FormFieldInputType,
+    storage: row.storage as FormFieldStorage,
+    groupLabel: row.group_label ?? '',
+    sortOrder: toNumber(row.sort_order) ?? 0,
+    isRequired: row.is_required === true,
+    isHidden: row.is_hidden === true,
+    isBuiltin: row.is_builtin === true,
+    config: toPlainObject(row.config),
+    options,
+    createdAt: row.created_at,
+  }
+}
+
+/**
+ * Domain -> row for a field write. Deliberately has no case for `key`,
+ * `storage` or `isBuiltin`: the key is derived once at creation
+ * (lib/store.ts createFormField) and never sent again, and storage/isBuiltin
+ * never change after a row exists -- ship.guard_form_field enforces that
+ * server-side, but there is no reason for the client to even offer it.
+ * `inputType` IS included: it is a legal update for a custom field and the
+ * same trigger refuses it for a built-in, with a message worth surfacing
+ * rather than pre-empting here.
+ */
+export function formFieldToRow(patch: Partial<FormField>): Partial<FormFieldRow> {
+  const row: Record<string, unknown> = {}
+
+  if (patch.label !== undefined) row.label = patch.label
+  if (patch.helpText !== undefined) row.help_text = patch.helpText
+  if (patch.inputType !== undefined) row.input_type = patch.inputType
+  if (patch.groupLabel !== undefined) row.group_label = patch.groupLabel
+  if (patch.sortOrder !== undefined) row.sort_order = patch.sortOrder
+  if (patch.isRequired !== undefined) row.is_required = patch.isRequired
+  if (patch.isHidden !== undefined) row.is_hidden = patch.isHidden
+  if (patch.config !== undefined) row.config = patch.config
+
+  return row as Partial<FormFieldRow>
 }

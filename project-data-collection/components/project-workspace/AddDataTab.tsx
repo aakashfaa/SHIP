@@ -6,26 +6,20 @@ import { createPortal } from 'react-dom'
 import {
   createLineItem,
   deleteLineItem,
+  fieldOptions,
+  getFormFieldsForProject,
   getLineItemsForProjectUser,
   updateLineItem,
+  visibleFormFields,
 } from '@/lib/store'
 import { useAsyncData } from '@/lib/useAsyncData'
-import { getTaxonomyForProject, taxonomyOptions } from '@/lib/store'
 import type { ProjectPermissions } from '@/lib/project-role'
-import type { ProjectTaxonomyValue } from '@/lib/types'
 import {
-  BuildingAreaImpacted,
-  BuildingLevelImpacted,
   ConsultantType,
+  FormField,
   LineItem,
-  LineItemCategory,
   Project,
-  RelativeFirstCost,
-  RelativeImpact,
-  RelativeOperationCostImpact,
-  RelativeOperationalEnergyUsage,
   SafeUser,
-  TimelinePriority,
 } from '@/lib/types'
 
 type Props = {
@@ -37,106 +31,173 @@ type Props = {
 }
 
 /*
- * The four vocabularies below are FALLBACKS, used only while the project's own
- * taxonomy is still loading or if it comes back empty. The live values come
- * from `ship.project_taxonomy_values` (migration 0008) and are edited in
- * Settings -- these literals are one building's vocabulary and must not be
- * what anybody actually sees.
+ * migration 0012 turned the line-item form into data: `form_fields` /
+ * `form_field_options`, read here via `getFormFieldsForProject`. There is no
+ * hardcoded field list left in this file on purpose -- a firm that wants an
+ * eighth wizard step, or a third fewer, gets it by editing Settings, not by
+ * someone editing this component. See lib/store.ts and the header of
+ * supabase/migrations/0012_ship_form_builder.sql for the full model.
  */
-const FALLBACK_CATEGORY_OPTIONS: LineItemCategory[] = [
-  'END OF LIFE',
-  'DEFERRED MAINTENANCE',
-  'UPGRADES / IMPROVEMENTS',
-  'RESTORATION *',
-  'STUDY / DOCUMENTATION',
-]
 
-const FALLBACK_PRIORITY_OPTIONS: TimelinePriority[] = [
-  '0_PRIORITY *',
-  '1_HIGH <5 years',
-  '2_MID 5-10 years',
-  '3_LOW 10-20 years',
-  '4_FUTURE >20 years',
-  '5_250th ANNIVERSARY',
-]
+/**
+ * `key` on a `storage: 'column'` field IS the line_items column name
+ * (snake_case); `lib/mappers.ts` already maps every one of those onto a
+ * camelCase LineItem property, and this is the client-side mirror of that
+ * same mapping. Every built-in follows the mechanical rule except one:
+ * `electrification_eo594` -> `electrificationEO594` keeps its capital "EO"
+ * (see the comment at the top of lib/mappers.ts), so it is special-cased
+ * rather than making the mechanical rule guess acronyms.
+ */
+const CAMEL_CASE_OVERRIDES: Record<string, string> = {
+  electrification_eo594: 'electrificationEO594',
+}
 
-const FALLBACK_BUILDING_AREA_OPTIONS: BuildingAreaImpacted[] = [
-  'WHOLE BUILDING',
-  'ANNEX',
-  'WEST WING',
-  'EAST WING',
-  'BULFINCH',
-  'SITE',
-  'OTHER *',
-]
+function toCamelCase(key: string): string {
+  return CAMEL_CASE_OVERRIDES[key] ?? key.replace(/_([a-z0-9])/g, (_, c: string) => c.toUpperCase())
+}
 
-const FALLBACK_BUILDING_LEVEL_OPTIONS: BuildingLevelImpacted[] = [
-  'WHOLE BUILDING',
-  'ROOF',
-  'ENVELOPE (EXT. WALLS)',
-  'LEVELS ABOVE GRADE',
-  'LEVELS BELOW GRADE',
-  'L5',
-  'L4',
-  'L3',
-  'L2',
-  'L1',
-  'BASEMENT',
-  'SUB BASEMENT',
-  'OTHER *',
-]
+/**
+ * The one pair of helpers that hides `storage: 'column'` vs `'custom'` from
+ * every place that renders or edits a field. A `'column'` field reads/writes
+ * `draft[camelCase(field.key)]`; a `'custom'` field reads/writes
+ * `draft.customFields[field.key]`. Nothing else in this file should reach
+ * into either shape directly.
+ */
+function getFieldValue(draft: DraftLineItem, field: FormField): unknown {
+  if (field.storage === 'custom') return draft.customFields?.[field.key]
+  return (draft as unknown as Record<string, unknown>)[toCamelCase(field.key)]
+}
 
-const RELATIVE_IMPACT_OPTIONS: RelativeImpact[] = [
-  'NONE',
-  'LOW',
-  'MODERATE',
-  'HIGH',
-]
+function setFieldValue(draft: DraftLineItem, field: FormField, value: unknown): DraftLineItem {
+  if (field.storage === 'custom') {
+    return { ...draft, customFields: { ...(draft.customFields ?? {}), [field.key]: value } }
+  }
+  return { ...draft, [toCamelCase(field.key)]: value } as DraftLineItem
+}
 
-const FIRST_COST_OPTIONS: RelativeFirstCost[] = [
-  '$LOW',
-  '$$Moderate',
-  '$$$High',
-]
-
-const OPERATION_COST_OPTIONS: RelativeOperationCostImpact[] = [
-  'MINIMAL IMPACT',
-  'MODERATE REDUCTION',
-  'HIGH REDUCTION',
-  'INCREASE',
-  'N/A',
-]
-
-const ENERGY_USAGE_OPTIONS: RelativeOperationalEnergyUsage[] = [
-  'MINIMAL IMPACT',
-  'MODERATE REDUCTION',
-  'HIGH REDUCTION',
-  'N/A',
-]
-
-// `eccAmount` is omitted alongside the server-assigned fields because it is
-// derived, not entered: a trigger recomputes it from `estimatedFirstCost` on
-// every write (migration 0006). Putting it in an editable draft would offer the
-// user a field whose value is silently discarded.
+/**
+ * `eccAmount` is omitted alongside the server-assigned fields because it is
+ * derived, not entered: a trigger recomputes it from `estimatedFirstCost` on
+ * every write (migration 0006). Putting it in an editable draft would offer the
+ * user a field whose value is silently discarded.
+ *
+ * The dozen fields below are widened from LineItem's literal unions
+ * (RelativeImpact, BooleanChoice, ...) to plain `string` / `string[]`.
+ * Those unions describe the DEFAULT vocabulary that migration 0012 seeded
+ * into `form_field_options` -- the database still enforces them via the
+ * same CHECK constraints that seeded the options (see
+ * default_form_field_options() in 0012) -- but the value flowing through
+ * this component at runtime is just a string picked out of
+ * `fieldOptions(field)`, and TypeScript has no way to know it happens to be
+ * one of four or five literals. Widening here is what lets one get/set pair
+ * serve every field without a switch on which property it touches; the
+ * server-side constraint is still the thing actually guaranteeing validity.
+ */
 type DraftLineItem = Omit<
   LineItem,
-  'id' | 'createdAt' | 'companyName' | 'discipline' | 'itemNumber' | 'eccAmount'
->
-
-type EditableFlagField =
+  | 'id'
+  | 'createdAt'
+  | 'companyName'
+  | 'discipline'
+  | 'itemNumber'
+  | 'eccAmount'
+  | 'operationalImpact'
+  | 'benefitToUsers'
+  | 'benefitToPublic'
+  | 'relativeFirstCost'
+  | 'relativeOperationCostImpact'
+  | 'relativeOperationalEnergyUsage'
+  | 'electrificationEO594'
   | 'addressingResiliencySustainability'
   | 'addressingDeferredMaintenance'
   | 'codeLifeSafetyImprovement'
   | 'accessibilityImprovement'
   | 'historicImpact'
+  | 'potentialSynergies'
+> & {
+  operationalImpact: string
+  benefitToUsers: string
+  benefitToPublic: string
+  relativeFirstCost: string
+  relativeOperationCostImpact: string
+  relativeOperationalEnergyUsage: string
+  electrificationEO594: string
+  addressingResiliencySustainability: string
+  addressingDeferredMaintenance: string
+  codeLifeSafetyImprovement: string
+  accessibilityImprovement: string
+  historicImpact: string
+  potentialSynergies: string[]
+}
 
-const FLAG_FIELDS: Array<{ key: EditableFlagField; label: string }> = [
-  { key: 'addressingResiliencySustainability', label: 'Resiliency / Sustainability' },
-  { key: 'addressingDeferredMaintenance', label: 'Deferred Maintenance' },
-  { key: 'codeLifeSafetyImprovement', label: 'Code / Life Safety' },
-  { key: 'accessibilityImprovement', label: 'Accessibility' },
-  { key: 'historicImpact', label: 'Historic Impact' },
-]
+/** Narrows the widened draft back to LineItem's exact shape at the API
+ *  boundary -- the DB's CHECK constraints and the 0012 validation trigger
+ *  are what actually enforce these values are legal, same as they always
+ *  were; this cast only tells TypeScript what the server already checks. */
+function draftForCreate(
+  draft: DraftLineItem
+): Omit<LineItem, 'id' | 'createdAt' | 'companyName' | 'discipline' | 'itemNumber' | 'eccAmount'> {
+  return draft as unknown as Omit<
+    LineItem,
+    'id' | 'createdAt' | 'companyName' | 'discipline' | 'itemNumber' | 'eccAmount'
+  >
+}
+
+function draftForUpdate(draft: DraftLineItem): Partial<LineItem> {
+  return draft as unknown as Partial<LineItem>
+}
+
+/** Every DraftLineItem property a FormField might set, defaulted to a value
+ *  that is always legal even before the project's own field list has
+ *  loaded -- see `makeInitialDraft`, which overlays the real per-field
+ *  defaults on top of this the moment `fields` is available. */
+const BASE_FIELD_DEFAULTS: Omit<DraftLineItem, 'projectId' | 'userEmail' | 'consultantType'> = {
+  name: '',
+  shortDescription: '',
+  category: '',
+  timelinePriority: '',
+  buildingAreaImpacted: '',
+  buildingLevelImpacted: '',
+  operationalImpact: '',
+  benefitToUsers: '',
+  benefitToPublic: '',
+  relativeFirstCost: '',
+  estimatedFirstCost: '',
+  relativeOperationCostImpact: '',
+  relativeOperationalEnergyUsage: '',
+  electrificationEO594: '',
+  addressingResiliencySustainability: 'No',
+  addressingDeferredMaintenance: 'No',
+  codeLifeSafetyImprovement: 'No',
+  accessibilityImprovement: 'No',
+  historicImpact: 'No',
+  potentialSynergies: [],
+  supportingNotes: '',
+  annualEnergySavings: 0,
+  annualCostSavings: 0,
+  energyNotes: '',
+  customFields: {},
+}
+
+/** The value a field starts a brand-new line item with. For a `select` this
+ *  is its first live option (so a taxonomy-backed field like `category`
+ *  defaults to whatever this project's own vocabulary puts first, not a
+ *  literal this component would have to know) rather than a hardcoded
+ *  literal. */
+function defaultValueForField(field: FormField): unknown {
+  switch (field.inputType) {
+    case 'boolean':
+      return field.storage === 'column' ? 'No' : false
+    case 'multiselect':
+      return []
+    case 'number':
+      return 0
+    case 'select':
+      return fieldOptions(field)[0] ?? ''
+    default:
+      return ''
+  }
+}
 
 /**
  * Migration 0009 moved authority from the global `profiles.role` boolean to
@@ -168,37 +229,23 @@ function getUserConsultantType(
 function makeInitialDraft(
   project: Project,
   user: SafeUser,
-  permissions: ProjectPermissions
+  permissions: ProjectPermissions,
+  fields: FormField[]
 ): DraftLineItem {
-  return {
+  const base: DraftLineItem = {
     projectId: project.id,
     userEmail: user.email,
     consultantType: getUserConsultantType(project, user, permissions),
-    name: '',
-    shortDescription: '',
-    category: 'END OF LIFE',
-    timelinePriority: '0_PRIORITY *',
-    buildingAreaImpacted: 'WHOLE BUILDING',
-    buildingLevelImpacted: 'WHOLE BUILDING',
-    operationalImpact: 'NONE',
-    benefitToUsers: 'NONE',
-    benefitToPublic: 'NONE',
-    relativeFirstCost: '$LOW',
-    estimatedFirstCost: '',
-    relativeOperationCostImpact: 'MINIMAL IMPACT',
-    relativeOperationalEnergyUsage: 'MINIMAL IMPACT',
-    electrificationEO594: 'NONE',
-    addressingResiliencySustainability: 'No',
-    addressingDeferredMaintenance: 'No',
-    codeLifeSafetyImprovement: 'No',
-    accessibilityImprovement: 'No',
-    historicImpact: 'No',
-    potentialSynergies: [],
-    supportingNotes: '',
-    annualEnergySavings: 0,
-    annualCostSavings: 0,
-    energyNotes: '',
+    ...BASE_FIELD_DEFAULTS,
   }
+
+  // Every field, not just the visible ones: a hidden built-in (e.g. a firm
+  // that hides `electrification_eo594`) still backs a real, NOT NULL /
+  // CHECK-constrained column that this draft has to carry a legal value for.
+  return fields.reduce(
+    (draft, field) => setFieldValue(draft, field, defaultValueForField(field)),
+    base
+  )
 }
 
 function makeEditableDraft(item: LineItem): DraftLineItem {
@@ -230,7 +277,51 @@ function makeEditableDraft(item: LineItem): DraftLineItem {
     annualEnergySavings: item.annualEnergySavings,
     annualCostSavings: item.annualCostSavings,
     energyNotes: item.energyNotes,
+    customFields: item.customFields ?? {},
   }
+}
+
+/** A wizard step / inline-edit section: one `groupLabel`'s fields, in
+ *  sort order. Built by grouping `visibleFormFields(fields)` on first
+ *  appearance, so the step order always matches field sort order and a firm
+ *  gets exactly as many steps as it has distinct group labels. */
+type FormStep = { label: string; fields: FormField[] }
+
+function groupIntoSteps(fields: FormField[]): FormStep[] {
+  const steps: FormStep[] = []
+  const indexByLabel = new Map<string, number>()
+
+  for (const field of fields) {
+    const label = field.groupLabel.trim() || 'Other'
+    let index = indexByLabel.get(label)
+    if (index === undefined) {
+      index = steps.length
+      indexByLabel.set(label, index)
+      steps.push({ label, fields: [] })
+    }
+    steps[index].fields.push(field)
+  }
+
+  return steps
+}
+
+function isFieldValueEmpty(field: FormField, value: unknown): boolean {
+  if (field.inputType === 'multiselect') return !Array.isArray(value) || value.length === 0
+  if (field.inputType === 'boolean') return value === undefined || value === null || value === ''
+  if (field.inputType === 'number') return value === undefined || value === null || value === ''
+  return typeof value !== 'string' || value.trim() === ''
+}
+
+function findMissingRequired(
+  fields: FormField[],
+  getValue: (field: FormField) => unknown
+): FormField[] {
+  return fields.filter((field) => field.isRequired && isFieldValueEmpty(field, getValue(field)))
+}
+
+function requiredMessage(missing: FormField[]): string {
+  const names = missing.map((field) => field.label).join(', ')
+  return missing.length === 1 ? `"${names}" is required.` : `${names} are required.`
 }
 
 function ChoicePills<T extends string>({
@@ -266,31 +357,238 @@ function ChoicePills<T extends string>({
   )
 }
 
+/**
+ * Renders one field by `inputType`, for either surface (`variant`). Handles
+ * every input type except `boolean` and `multiselect` -- those two need a
+ * set of choices rendered together (all the flags in one grid, all the
+ * synergy checkboxes in one grid), which `LineItemFields` below does at the
+ * group level instead of per-field.
+ */
+function FormFieldControl({
+  field,
+  value,
+  onChange,
+  variant,
+}: {
+  field: FormField
+  value: unknown
+  onChange: (value: unknown) => void
+  variant: 'wizard' | 'inline'
+}) {
+  const stringValue = typeof value === 'string' ? value : value == null ? '' : String(value)
+
+  switch (field.inputType) {
+    case 'text':
+      return (
+        <InputField label={field.label} value={stringValue} onChange={onChange} helpText={field.helpText} />
+      )
+
+    case 'textarea':
+      return (
+        <TextAreaField
+          label={field.label}
+          value={stringValue}
+          onChange={onChange}
+          rows={variant === 'wizard' ? 6 : 4}
+          helpText={field.helpText}
+        />
+      )
+
+    case 'currency':
+      // Free text on purpose: estimated_first_cost's "1.2m" / "850k"
+      // shorthand is parsed downstream (lib/cost-model.ts), never here.
+      return (
+        <InputField
+          label={field.label}
+          value={stringValue}
+          onChange={onChange}
+          placeholder="1.2m, 850k, $2,400,000"
+          helpText={field.helpText}
+        />
+      )
+
+    case 'number': {
+      const numeric = typeof value === 'number' ? value : Number(value) || 0
+      return (
+        <InputField
+          label={field.label}
+          value={numeric === 0 ? '' : String(numeric)}
+          onChange={(next) => onChange(Number(next) || 0)}
+          helpText={field.helpText}
+        />
+      )
+    }
+
+    case 'date':
+      return (
+        <div>
+          <label className="mb-2 block text-sm font-medium text-gray-700">{field.label}</label>
+          <input
+            type="date"
+            value={stringValue}
+            onChange={(e) => onChange(e.target.value)}
+            className="w-full rounded-2xl border border-gray-200 bg-white px-4 py-3 text-sm outline-none transition focus:border-black"
+          />
+          {field.helpText ? <p className="mt-1 text-xs text-gray-500">{field.helpText}</p> : null}
+        </div>
+      )
+
+    case 'select': {
+      // `current` deliberately included: an already-archived value the
+      // record holds must still show up as a choice. See fieldOptions.
+      const options = fieldOptions(field, stringValue)
+
+      if (variant === 'wizard') {
+        return (
+          <div>
+            <p className="mb-3 text-sm font-medium text-gray-700">{field.label}</p>
+            <ChoicePills options={options} value={stringValue} onChange={onChange} />
+            {field.helpText ? <p className="mt-2 text-xs text-gray-500">{field.helpText}</p> : null}
+          </div>
+        )
+      }
+
+      return (
+        <div>
+          <SelectField label={field.label} value={stringValue} options={options} onChange={onChange} />
+          {field.helpText ? <p className="mt-1 text-xs text-gray-500">{field.helpText}</p> : null}
+        </div>
+      )
+    }
+
+    default:
+      return null
+  }
+}
+
+/**
+ * Renders one group's worth of fields for either surface: the non-choice
+ * fields in a layout that differs by variant (stacked for the wizard,
+ * a compact grid for inline edit), then every `boolean` field together in
+ * one checkbox grid, then every `multiselect` field in its own checkbox
+ * grid. `potential_synergies` is special-cased to the project's actual
+ * consultants (minus the current user's own discipline) rather than
+ * `fieldOptions`, matching the behaviour this replaces -- that set has never
+ * come from the field's seeded option list, which is every consultant type
+ * unconditionally; it comes from who is actually on this project.
+ */
+function LineItemFields({
+  fields,
+  getValue,
+  onChange,
+  variant,
+  synergyOptions,
+}: {
+  fields: FormField[]
+  getValue: (field: FormField) => unknown
+  onChange: (field: FormField, value: unknown) => void
+  variant: 'wizard' | 'inline'
+  synergyOptions: string[]
+}) {
+  const gridFields = fields.filter((f) => f.inputType !== 'boolean' && f.inputType !== 'multiselect')
+  const booleanFields = fields.filter((f) => f.inputType === 'boolean')
+  const multiselectFields = fields.filter((f) => f.inputType === 'multiselect')
+
+  return (
+    <>
+      {gridFields.length > 0 ? (
+        <div className={variant === 'inline' ? 'grid gap-4 md:grid-cols-2 xl:grid-cols-3' : 'space-y-8'}>
+          {gridFields.map((field) => (
+            <FormFieldControl
+              key={field.id}
+              field={field}
+              value={getValue(field)}
+              onChange={(value) => onChange(field, value)}
+              variant={variant}
+            />
+          ))}
+        </div>
+      ) : null}
+
+      {booleanFields.length > 0 ? (
+        <div className="rounded-[1.75rem] bg-gray-50 p-5">
+          <p className="text-sm font-medium text-gray-700">{booleanFields[0].groupLabel || 'Flags'}</p>
+          <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+            {booleanFields.map((field) => {
+              const checked = getValue(field) === true || getValue(field) === 'Yes'
+              return (
+                <div key={field.id}>
+                  <CheckboxCard
+                    label={field.label}
+                    checked={checked}
+                    onChange={(next) =>
+                      onChange(field, field.storage === 'column' ? (next ? 'Yes' : 'No') : next)
+                    }
+                  />
+                  {field.helpText ? (
+                    <p className="mt-1 px-1 text-xs text-gray-500">{field.helpText}</p>
+                  ) : null}
+                </div>
+              )
+            })}
+          </div>
+        </div>
+      ) : null}
+
+      {multiselectFields.map((field) => {
+        const options = field.key === 'potential_synergies' ? synergyOptions : fieldOptions(field)
+        const selected = Array.isArray(getValue(field)) ? (getValue(field) as string[]) : []
+
+        return (
+          <div key={field.id} className="rounded-[1.75rem] bg-gray-50 p-5">
+            <p className="text-sm font-medium text-gray-700">{field.label}</p>
+            <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+              {options.length > 0 ? (
+                options.map((option) => (
+                  <CheckboxCard
+                    key={option}
+                    label={option}
+                    checked={selected.includes(option)}
+                    onChange={() =>
+                      onChange(
+                        field,
+                        selected.includes(option)
+                          ? selected.filter((v) => v !== option)
+                          : [...selected, option]
+                      )
+                    }
+                  />
+                ))
+              ) : (
+                <span className="text-sm text-gray-400">
+                  No other disciplines available on this project.
+                </span>
+              )}
+            </div>
+            {field.helpText ? <p className="mt-2 text-xs text-gray-500">{field.helpText}</p> : null}
+          </div>
+        )
+      })}
+    </>
+  )
+}
+
 export default function AddDataTab({ project, user, permissions }: Props) {
   /**
-   * The project's own dropdown vocabularies (migration 0008). Loaded here
-   * rather than passed in because this is the only tab that writes line
-   * items, so it is the only tab that needs them.
-   *
-   * A failure falls through to the fallback literals rather than leaving the
-   * form with empty selects -- a consultant halfway through adding an item
-   * should not lose the ability to finish because a settings table was
-   * briefly unreachable.
+   * The project's own line-item form (migration 0012). Loaded here rather
+   * than passed in because this is the only tab that writes line items, so
+   * it is the only tab that needs it. Hidden fields ARE included -- see
+   * `makeInitialDraft`, which needs them to seed a legal value into every
+   * column-backed field regardless of whether it is shown.
    */
-  const { data: taxonomy } = useAsyncData<ProjectTaxonomyValue[]>(
-    () => getTaxonomyForProject(project.id),
+  const { data: fields, loading: fieldsLoading } = useAsyncData<FormField[]>(
+    () => getFormFieldsForProject(project.id),
     [project.id],
     []
   )
 
-  function optionsFor(
-    kind: Parameters<typeof taxonomyOptions>[1],
-    fallback: readonly string[],
-    current?: string
-  ): string[] {
-    const live = taxonomyOptions(taxonomy, kind, current)
-    return live.length > 0 ? live : [...fallback]
-  }
+  const visibleFields = useMemo(() => visibleFormFields(fields), [fields])
+  const steps = useMemo(() => groupIntoSteps(visibleFields), [visibleFields])
+
+  // Empty rather than crashing: an unseeded project (getFormFieldsForProject
+  // returned nothing) has no questions to ask, and the right response is
+  // pointing at Settings, not falling back to some other firm's vocabulary.
+  const formNotSeeded = !fieldsLoading && visibleFields.length === 0
 
   const {
     data: lineItems,
@@ -306,7 +604,7 @@ export default function AddDataTab({ project, user, permissions }: Props) {
   const [step, setStep] = useState(0)
   const [expandedId, setExpandedId] = useState<string | null>(null)
   const [draft, setDraft] = useState<DraftLineItem>(() =>
-    makeInitialDraft(project, user, permissions)
+    makeInitialDraft(project, user, permissions, [])
   )
   const [editingDrafts, setEditingDrafts] = useState<Record<string, DraftLineItem>>({})
   const [isSavingNew, setIsSavingNew] = useState(false)
@@ -330,12 +628,13 @@ export default function AddDataTab({ project, user, permissions }: Props) {
       .filter((type) => type !== consultantType)
   }, [consultantType, project.consultants])
 
-  const totalSteps = 7
+  const totalSteps = Math.max(steps.length, 1)
   const progress = ((step + 1) / totalSteps) * 100
 
   function openCreateFlow() {
-    setDraft(makeInitialDraft(project, user, permissions))
+    setDraft(makeInitialDraft(project, user, permissions, fields))
     setStep(0)
+    setActionError(null)
     setIsCreating(true)
   }
 
@@ -344,20 +643,19 @@ export default function AddDataTab({ project, user, permissions }: Props) {
   }
 
   function goNext() {
-    if (step < totalSteps - 1) setStep((prev) => prev + 1)
+    const missing = findMissingRequired(steps[step]?.fields ?? [], (field) =>
+      getFieldValue(draft, field)
+    )
+    if (missing.length > 0) {
+      setActionError(requiredMessage(missing))
+      return
+    }
+    setActionError(null)
+    if (step < steps.length - 1) setStep((prev) => prev + 1)
   }
 
   function goBack() {
     if (step > 0) setStep((prev) => prev - 1)
-  }
-
-  function toggleSynergy(type: ConsultantType) {
-    setDraft((prev) => ({
-      ...prev,
-      potentialSynergies: prev.potentialSynergies.includes(type)
-        ? prev.potentialSynergies.filter((item) => item !== type)
-        : [...prev.potentialSynergies, type],
-    }))
   }
 
   async function handleDelete(id: string) {
@@ -382,10 +680,16 @@ export default function AddDataTab({ project, user, permissions }: Props) {
   }
 
   async function saveLineItem() {
+    const missing = findMissingRequired(visibleFields, (field) => getFieldValue(draft, field))
+    if (missing.length > 0) {
+      setActionError(requiredMessage(missing))
+      return
+    }
+
     setActionError(null)
     setIsSavingNew(true)
     try {
-      const created = await createLineItem(draft)
+      const created = await createLineItem(draftForCreate(draft))
       if (!isMountedRef.current) return
       reloadLineItems()
       setExpandedId(created.id)
@@ -423,22 +727,16 @@ export default function AddDataTab({ project, user, permissions }: Props) {
     setExpandedId(item.id)
   }
 
-  function updateEditingDraft<K extends keyof DraftLineItem>(
-    lineItemId: string,
-    field: K,
-    value: DraftLineItem[K]
-  ) {
-    setEditingDrafts((prev) => ({
-      ...prev,
-      [lineItemId]: {
-        ...prev[lineItemId],
-        [field]: value,
-      },
-    }))
-  }
+  function updateEditingField(lineItemId: string, field: FormField, value: unknown) {
+    setEditingDrafts((prev) => {
+      const current = prev[lineItemId]
+      if (!current) return prev
 
-  function updateEditingFlag(lineItemId: string, field: EditableFlagField, checked: boolean) {
-    updateEditingDraft(lineItemId, field, checked ? 'Yes' : 'No')
+      return {
+        ...prev,
+        [lineItemId]: setFieldValue(current, field, value),
+      }
+    })
   }
 
   function resetEditingDraft(item: LineItem) {
@@ -448,27 +746,20 @@ export default function AddDataTab({ project, user, permissions }: Props) {
     }))
   }
 
-  function toggleEditSynergy(lineItemId: string, type: ConsultantType) {
-    const current = editingDrafts[lineItemId]
-    if (!current) return
-
-    updateEditingDraft(
-      lineItemId,
-      'potentialSynergies',
-      current.potentialSynergies.includes(type)
-        ? current.potentialSynergies.filter((item) => item !== type)
-        : [...current.potentialSynergies, type]
-    )
-  }
-
   async function saveEditedLineItem(lineItemId: string) {
     const currentDraft = editingDrafts[lineItemId]
     if (!currentDraft) return
 
+    const missing = findMissingRequired(visibleFields, (field) => getFieldValue(currentDraft, field))
+    if (missing.length > 0) {
+      setActionError(requiredMessage(missing))
+      return
+    }
+
     setActionError(null)
     setSavingEditId(lineItemId)
     try {
-      const updated = await updateLineItem(lineItemId, currentDraft)
+      const updated = await updateLineItem(lineItemId, draftForUpdate(currentDraft))
       if (!updated) return
       if (!isMountedRef.current) return
 
@@ -485,6 +776,8 @@ export default function AddDataTab({ project, user, permissions }: Props) {
     }
   }
 
+  const currentStep = steps[step]
+
   return (
     <>
       <div className="space-y-6">
@@ -499,11 +792,19 @@ export default function AddDataTab({ project, user, permissions }: Props) {
           <button
             type="button"
             onClick={openCreateFlow}
-            className="rounded-2xl bg-black px-5 py-3 text-sm font-medium text-white shadow-lg transition hover:-translate-y-[1px]"
+            disabled={formNotSeeded}
+            className="rounded-2xl bg-black px-5 py-3 text-sm font-medium text-white shadow-lg transition hover:-translate-y-[1px] disabled:cursor-not-allowed disabled:opacity-50"
           >
             Add Line Item
           </button>
         </div>
+
+        {formNotSeeded ? (
+          <div className="rounded-[1.5rem] border border-amber-200 bg-amber-50 px-5 py-4 text-sm text-amber-800">
+            This project has no line-item form yet. Add fields in Settings &rarr; Line item form
+            before entering data.
+          </div>
+        ) : null}
 
         {lineItemsError || actionError ? (
           <div className="rounded-[1.5rem] border border-red-200 bg-red-50 px-5 py-4 text-sm text-red-700">
@@ -580,196 +881,17 @@ export default function AddDataTab({ project, user, permissions }: Props) {
                         className="border-t border-gray-100"
                       >
                         <div className="space-y-6 px-6 py-6">
-                          <div className="grid gap-4 lg:grid-cols-[1.2fr_0.8fr]">
-                            <InputField
-                              label="Line Item Name"
-                              value={editDraft.name}
-                              onChange={(value) => updateEditingDraft(item.id, 'name', value)}
+                          {visibleFields.length > 0 ? (
+                            <LineItemFields
+                              fields={visibleFields}
+                              getValue={(field) => getFieldValue(editDraft, field)}
+                              onChange={(field, value) => updateEditingField(item.id, field, value)}
+                              variant="inline"
+                              synergyOptions={synergyOptions}
                             />
-                            <InputField
-                              label="Pricing Input"
-                              value={editDraft.estimatedFirstCost}
-                              onChange={(value) =>
-                                updateEditingDraft(item.id, 'estimatedFirstCost', value)
-                              }
-                              placeholder="$250,000"
-                            />
-                          </div>
-
-                          <TextAreaField
-                            label="Short Description"
-                            value={editDraft.shortDescription}
-                            onChange={(value) =>
-                              updateEditingDraft(item.id, 'shortDescription', value)
-                            }
-                            rows={4}
-                          />
-
-                          <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-                            <SelectField
-                              label="Category"
-                              value={editDraft.category}
-                              options={optionsFor('category', FALLBACK_CATEGORY_OPTIONS, editDraft.category)}
-                              onChange={(value) => updateEditingDraft(item.id, 'category', value)}
-                            />
-                            <SelectField
-                              label="Timeline"
-                              value={editDraft.timelinePriority}
-                              options={optionsFor('timeline_priority', FALLBACK_PRIORITY_OPTIONS, editDraft.timelinePriority)}
-                              onChange={(value) =>
-                                updateEditingDraft(item.id, 'timelinePriority', value)
-                              }
-                            />
-                            <SelectField
-                              label="Area"
-                              value={editDraft.buildingAreaImpacted}
-                              options={optionsFor('building_area', FALLBACK_BUILDING_AREA_OPTIONS, editDraft.buildingAreaImpacted)}
-                              onChange={(value) =>
-                                updateEditingDraft(item.id, 'buildingAreaImpacted', value)
-                              }
-                            />
-                            <SelectField
-                              label="Level"
-                              value={editDraft.buildingLevelImpacted}
-                              options={optionsFor('building_level', FALLBACK_BUILDING_LEVEL_OPTIONS, editDraft.buildingLevelImpacted)}
-                              onChange={(value) =>
-                                updateEditingDraft(item.id, 'buildingLevelImpacted', value)
-                              }
-                            />
-                            <SelectField
-                              label="Operational Impact"
-                              value={editDraft.operationalImpact}
-                              options={RELATIVE_IMPACT_OPTIONS}
-                              onChange={(value) =>
-                                updateEditingDraft(item.id, 'operationalImpact', value)
-                              }
-                            />
-                            <SelectField
-                              label="Benefit to Users"
-                              value={editDraft.benefitToUsers}
-                              options={RELATIVE_IMPACT_OPTIONS}
-                              onChange={(value) =>
-                                updateEditingDraft(item.id, 'benefitToUsers', value)
-                              }
-                            />
-                            <SelectField
-                              label="Benefit to Public"
-                              value={editDraft.benefitToPublic}
-                              options={RELATIVE_IMPACT_OPTIONS}
-                              onChange={(value) =>
-                                updateEditingDraft(item.id, 'benefitToPublic', value)
-                              }
-                            />
-                            <SelectField
-                              label="Relative First Cost"
-                              value={editDraft.relativeFirstCost}
-                              options={FIRST_COST_OPTIONS}
-                              onChange={(value) =>
-                                updateEditingDraft(item.id, 'relativeFirstCost', value)
-                              }
-                            />
-                            <SelectField
-                              label="Op Cost Impact"
-                              value={editDraft.relativeOperationCostImpact}
-                              options={OPERATION_COST_OPTIONS}
-                              onChange={(value) =>
-                                updateEditingDraft(item.id, 'relativeOperationCostImpact', value)
-                              }
-                            />
-                            <SelectField
-                              label="Energy / Emissions"
-                              value={editDraft.relativeOperationalEnergyUsage}
-                              options={ENERGY_USAGE_OPTIONS}
-                              onChange={(value) =>
-                                updateEditingDraft(item.id, 'relativeOperationalEnergyUsage', value)
-                              }
-                            />
-                            <InputField
-                              label="Energy saved / year"
-                              value={
-                                editDraft.annualEnergySavings === 0
-                                  ? ''
-                                  : String(editDraft.annualEnergySavings)
-                              }
-                              onChange={(value) =>
-                                updateEditingDraft(
-                                  item.id,
-                                  'annualEnergySavings',
-                                  Number(value) || 0
-                                )
-                              }
-                            />
-                            <InputField
-                              label="Utility $ saved / year"
-                              value={
-                                editDraft.annualCostSavings === 0
-                                  ? ''
-                                  : String(editDraft.annualCostSavings)
-                              }
-                              onChange={(value) =>
-                                updateEditingDraft(
-                                  item.id,
-                                  'annualCostSavings',
-                                  Number(value) || 0
-                                )
-                              }
-                            />
-                            <SelectField
-                              label="Electrification / EO 594"
-                              value={editDraft.electrificationEO594}
-                              options={RELATIVE_IMPACT_OPTIONS}
-                              onChange={(value) =>
-                                updateEditingDraft(item.id, 'electrificationEO594', value)
-                              }
-                            />
-                          </div>
-
-                          <div className="rounded-[1.75rem] bg-gray-50 p-5">
-                            <p className="text-sm font-medium text-gray-700">Strategic Flags</p>
-                            <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-3">
-                              {FLAG_FIELDS.map((field) => (
-                                <CheckboxCard
-                                  key={field.key}
-                                  label={field.label}
-                                  checked={editDraft[field.key] === 'Yes'}
-                                  onChange={(checked) =>
-                                    updateEditingFlag(item.id, field.key, checked)
-                                  }
-                                />
-                              ))}
-                            </div>
-                          </div>
-
-                          <div className="rounded-[1.75rem] bg-gray-50 p-5">
-                            <p className="text-sm font-medium text-gray-700">
-                              Potential Synergies
-                            </p>
-                            <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-3">
-                              {synergyOptions.length > 0 ? (
-                                synergyOptions.map((type) => (
-                                  <CheckboxCard
-                                    key={type}
-                                    label={type}
-                                    checked={editDraft.potentialSynergies.includes(type)}
-                                    onChange={() => toggleEditSynergy(item.id, type)}
-                                  />
-                                ))
-                              ) : (
-                                <span className="text-sm text-gray-400">
-                                  No other disciplines available on this project.
-                                </span>
-                              )}
-                            </div>
-                          </div>
-
-                          <TextAreaField
-                            label="Supporting Notes"
-                            value={editDraft.supportingNotes}
-                            onChange={(value) =>
-                              updateEditingDraft(item.id, 'supportingNotes', value)
-                            }
-                            rows={6}
-                          />
+                          ) : (
+                            <p className="text-sm text-gray-400">No form fields configured.</p>
+                          )}
 
                           <div className="flex flex-wrap justify-between gap-3">
                             <button
@@ -813,7 +935,7 @@ export default function AddDataTab({ project, user, permissions }: Props) {
       {typeof document !== 'undefined'
         ? createPortal(
             <AnimatePresence>
-              {isCreating ? (
+              {isCreating && currentStep ? (
                 <motion.div
                   initial={{ opacity: 0 }}
                   animate={{ opacity: 1 }}
@@ -837,461 +959,88 @@ export default function AddDataTab({ project, user, permissions }: Props) {
                       </div>
 
                       <div className="flex max-h-[calc(88vh-8px)] flex-col">
-                  <div className="flex items-center justify-between px-8 py-6">
-                    <div>
-                      <p className="text-sm text-gray-500">New Line Item</p>
-                      <h3 className="text-xl font-semibold text-gray-900">
-                        Step {step + 1} of {totalSteps}
-                      </h3>
-                    </div>
+                        <div className="flex items-center justify-between px-8 py-6">
+                          <div>
+                            <p className="text-sm text-gray-500">New Line Item</p>
+                            <h3 className="text-xl font-semibold text-gray-900">
+                              Step {step + 1} of {totalSteps}
+                            </h3>
+                          </div>
 
-                    <button
-                      type="button"
-                      onClick={closeCreateFlow}
-                      className="rounded-full border border-gray-300 px-4 py-2 text-sm text-gray-700 transition hover:bg-gray-50"
-                    >
-                      Cancel
-                    </button>
-                  </div>
+                          <button
+                            type="button"
+                            onClick={closeCreateFlow}
+                            className="rounded-full border border-gray-300 px-4 py-2 text-sm text-gray-700 transition hover:bg-gray-50"
+                          >
+                            Cancel
+                          </button>
+                        </div>
 
-                  <div className="flex-1 overflow-y-auto px-8 py-4">
-                    <AnimatePresence mode="wait">
-                      <motion.div
-                        key={step}
-                        initial={{ opacity: 0, x: 18 }}
-                        animate={{ opacity: 1, x: 0 }}
-                        exit={{ opacity: 0, x: -18 }}
-                        transition={{ duration: 0.22 }}
-                        className="mx-auto flex h-full max-w-3xl flex-col justify-center"
-                      >
-                        {step === 0 && (
-                          <>
-                            <h4 className="text-4xl font-semibold text-gray-900">
-                              What is this item?
-                            </h4>
-                            <p className="mt-3 text-base text-gray-500">
-                              Start with a clear title and short description.
-                            </p>
+                        <div className="flex-1 overflow-y-auto px-8 py-4">
+                          <AnimatePresence mode="wait">
+                            <motion.div
+                              key={step}
+                              initial={{ opacity: 0, x: 18 }}
+                              animate={{ opacity: 1, x: 0 }}
+                              exit={{ opacity: 0, x: -18 }}
+                              transition={{ duration: 0.22 }}
+                              className="mx-auto flex h-full max-w-3xl flex-col justify-center"
+                            >
+                              <h4 className="text-4xl font-semibold text-gray-900">
+                                {currentStep.label}
+                              </h4>
 
-                            <div className="mt-8 space-y-5">
-                              <div>
-                                <label
-                                  htmlFor="line-item-name"
-                                  className="mb-2 block text-sm font-medium text-gray-700"
-                                >
-                                  Name
-                                </label>
-                                <input
-                                  id="line-item-name"
-                                  value={draft.name}
-                                  onChange={(e) =>
-                                    setDraft((prev) => ({ ...prev, name: e.target.value }))
+                              <div className="mt-8 space-y-8">
+                                <LineItemFields
+                                  fields={currentStep.fields}
+                                  getValue={(field) => getFieldValue(draft, field)}
+                                  onChange={(field, value) =>
+                                    setDraft((prev) => setFieldValue(prev, field, value))
                                   }
-                                  placeholder="Enter line item name"
-                                  className="w-full rounded-3xl border border-gray-200 px-5 py-5 text-lg outline-none transition focus:border-black"
+                                  variant="wizard"
+                                  synergyOptions={synergyOptions}
                                 />
                               </div>
+                            </motion.div>
+                          </AnimatePresence>
+                        </div>
 
-                              <div>
-                                <label
-                                  htmlFor="line-item-description"
-                                  className="mb-2 block text-sm font-medium text-gray-700"
-                                >
-                                  Short Description
-                                </label>
-                                <textarea
-                                  id="line-item-description"
-                                  value={draft.shortDescription}
-                                  onChange={(e) =>
-                                    setDraft((prev) => ({
-                                      ...prev,
-                                      shortDescription: e.target.value,
-                                    }))
-                                  }
-                                  placeholder="Briefly describe the item"
-                                  rows={5}
-                                  className="w-full rounded-3xl border border-gray-200 px-5 py-5 text-base outline-none transition focus:border-black"
-                                />
-                              </div>
-                            </div>
-                          </>
-                        )}
+                        {actionError && isCreating ? (
+                          <div className="mx-8 mb-4 rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+                            {actionError}
+                          </div>
+                        ) : null}
 
-                        {step === 1 && (
-                          <>
-                            <h4 className="text-4xl font-semibold text-gray-900">
-                              Category and timeline
-                            </h4>
-                            <div className="mt-8 space-y-8">
-                              <div>
-                                <p className="mb-3 text-sm font-medium text-gray-700">Category</p>
-                                <ChoicePills
-                                  options={optionsFor('category', FALLBACK_CATEGORY_OPTIONS, draft.category)}
-                                  value={draft.category}
-                                  onChange={(value) =>
-                                    setDraft((prev) => ({ ...prev, category: value }))
-                                  }
-                                />
-                              </div>
+                        <div className="flex items-center justify-between border-t border-gray-100 px-8 py-6">
+                          <button
+                            type="button"
+                            onClick={goBack}
+                            disabled={step === 0}
+                            className="rounded-2xl border border-gray-300 bg-white px-5 py-3 text-sm font-medium text-gray-700 disabled:opacity-40"
+                          >
+                            Back
+                          </button>
 
-                              <div>
-                                <p className="mb-3 text-sm font-medium text-gray-700">
-                                  Timeline Priority
-                                </p>
-                                <ChoicePills
-                                  options={optionsFor('timeline_priority', FALLBACK_PRIORITY_OPTIONS, draft.timelinePriority)}
-                                  value={draft.timelinePriority}
-                                  onChange={(value) =>
-                                    setDraft((prev) => ({ ...prev, timelinePriority: value }))
-                                  }
-                                />
-                              </div>
-                            </div>
-                          </>
-                        )}
-
-                        {step === 2 && (
-                          <>
-                            <h4 className="text-4xl font-semibold text-gray-900">
-                              Where is it impacted?
-                            </h4>
-                            <div className="mt-8 space-y-8">
-                              <div>
-                                <p className="mb-3 text-sm font-medium text-gray-700">
-                                  Building Area Impacted
-                                </p>
-                                <ChoicePills
-                                  options={optionsFor('building_area', FALLBACK_BUILDING_AREA_OPTIONS, draft.buildingAreaImpacted)}
-                                  value={draft.buildingAreaImpacted}
-                                  onChange={(value) =>
-                                    setDraft((prev) => ({
-                                      ...prev,
-                                      buildingAreaImpacted: value,
-                                    }))
-                                  }
-                                />
-                              </div>
-
-                              <div>
-                                <p className="mb-3 text-sm font-medium text-gray-700">
-                                  Building Level Impacted
-                                </p>
-                                <ChoicePills
-                                  options={optionsFor('building_level', FALLBACK_BUILDING_LEVEL_OPTIONS, draft.buildingLevelImpacted)}
-                                  value={draft.buildingLevelImpacted}
-                                  onChange={(value) =>
-                                    setDraft((prev) => ({
-                                      ...prev,
-                                      buildingLevelImpacted: value,
-                                    }))
-                                  }
-                                />
-                              </div>
-                            </div>
-                          </>
-                        )}
-
-                        {step === 3 && (
-                          <>
-                            <h4 className="text-4xl font-semibold text-gray-900">
-                              Operational and user impact
-                            </h4>
-                            <div className="mt-8 space-y-8">
-                              <div>
-                                <p className="mb-3 text-sm font-medium text-gray-700">
-                                  Relative Operational Impact on Building
-                                </p>
-                                <ChoicePills
-                                  options={RELATIVE_IMPACT_OPTIONS}
-                                  value={draft.operationalImpact}
-                                  onChange={(value) =>
-                                    setDraft((prev) => ({ ...prev, operationalImpact: value }))
-                                  }
-                                />
-                              </div>
-
-                              <div>
-                                <p className="mb-3 text-sm font-medium text-gray-700">
-                                  Relative Benefit to Users
-                                </p>
-                                <ChoicePills
-                                  options={RELATIVE_IMPACT_OPTIONS}
-                                  value={draft.benefitToUsers}
-                                  onChange={(value) =>
-                                    setDraft((prev) => ({ ...prev, benefitToUsers: value }))
-                                  }
-                                />
-                              </div>
-
-                              <div>
-                                <p className="mb-3 text-sm font-medium text-gray-700">
-                                  Relative Benefit to Public
-                                </p>
-                                <ChoicePills
-                                  options={RELATIVE_IMPACT_OPTIONS}
-                                  value={draft.benefitToPublic}
-                                  onChange={(value) =>
-                                    setDraft((prev) => ({ ...prev, benefitToPublic: value }))
-                                  }
-                                />
-                              </div>
-                            </div>
-                          </>
-                        )}
-
-                        {step === 4 && (
-                          <>
-                            <h4 className="text-4xl font-semibold text-gray-900">
-                              Cost and energy
-                            </h4>
-                            <div className="mt-8 space-y-8">
-                              <div>
-                                <p className="mb-3 text-sm font-medium text-gray-700">
-                                  Relative First Cost
-                                </p>
-                                <ChoicePills
-                                  options={FIRST_COST_OPTIONS}
-                                  value={draft.relativeFirstCost}
-                                  onChange={(value) =>
-                                    setDraft((prev) => ({ ...prev, relativeFirstCost: value }))
-                                  }
-                                />
-                              </div>
-
-                              <InputField
-                                label="Pricing Input"
-                                value={draft.estimatedFirstCost}
-                                onChange={(value) =>
-                                  setDraft((prev) => ({ ...prev, estimatedFirstCost: value }))
-                                }
-                                placeholder="$250,000"
-                              />
-
-                              <div>
-                                <p className="mb-3 text-sm font-medium text-gray-700">
-                                  Relative Operation Cost Impact
-                                </p>
-                                <ChoicePills
-                                  options={OPERATION_COST_OPTIONS}
-                                  value={draft.relativeOperationCostImpact}
-                                  onChange={(value) =>
-                                    setDraft((prev) => ({
-                                      ...prev,
-                                      relativeOperationCostImpact: value,
-                                    }))
-                                  }
-                                />
-                              </div>
-
-                              <div>
-                                <p className="mb-3 text-sm font-medium text-gray-700">
-                                  Relative Operational Energy Usage / Emissions
-                                </p>
-                                <ChoicePills
-                                  options={ENERGY_USAGE_OPTIONS}
-                                  value={draft.relativeOperationalEnergyUsage}
-                                  onChange={(value) =>
-                                    setDraft((prev) => ({
-                                      ...prev,
-                                      relativeOperationalEnergyUsage: value,
-                                    }))
-                                  }
-                                />
-                              </div>
-
-                              {/* The qualitative pills above stay — they are
-                                  what a consultant can answer on day one. These
-                                  are what the energy engineers deliver later,
-                                  and what the Timeline's reduction chart is
-                                  actually built from. Blank is a legitimate
-                                  answer and means "not quantified yet", which
-                                  is why nothing here is required. */}
-                              <div className="rounded-2xl border border-gray-200 bg-gray-50/70 p-4">
-                                <p className="text-sm font-medium text-gray-700">
-                                  Quantified annual savings
-                                </p>
-                                <p className="mt-1 text-xs text-gray-500">
-                                  Leave blank until an engineer supplies a figure. Units are
-                                  set per project on the Cost Model tab.
-                                </p>
-
-                                <div className="mt-3 grid gap-4 md:grid-cols-2">
-                                  <InputField
-                                    label="Energy saved / year"
-                                    value={
-                                      draft.annualEnergySavings === 0
-                                        ? ''
-                                        : String(draft.annualEnergySavings)
-                                    }
-                                    onChange={(value) =>
-                                      setDraft((prev) => ({
-                                        ...prev,
-                                        annualEnergySavings: Number(value) || 0,
-                                      }))
-                                    }
-                                    placeholder="e.g. 430000"
-                                  />
-                                  <InputField
-                                    label="Utility cost saved / year ($)"
-                                    value={
-                                      draft.annualCostSavings === 0
-                                        ? ''
-                                        : String(draft.annualCostSavings)
-                                    }
-                                    onChange={(value) =>
-                                      setDraft((prev) => ({
-                                        ...prev,
-                                        annualCostSavings: Number(value) || 0,
-                                      }))
-                                    }
-                                    placeholder="e.g. 61000"
-                                  />
-                                </div>
-
-                                <div className="mt-4">
-                                  <TextAreaField
-                                    label="Where did this number come from?"
-                                    rows={3}
-                                    value={draft.energyNotes}
-                                    onChange={(value) =>
-                                      setDraft((prev) => ({ ...prev, energyNotes: value }))
-                                    }
-                                    placeholder="Model, audit level, assumptions — an energy figure with no provenance is not usable in a deliverable six months later."
-                                  />
-                                </div>
-                              </div>
-
-                              <div>
-                                <p className="mb-3 text-sm font-medium text-gray-700">
-                                  Electrification / EO 594
-                                </p>
-                                <ChoicePills
-                                  options={RELATIVE_IMPACT_OPTIONS}
-                                  value={draft.electrificationEO594}
-                                  onChange={(value) =>
-                                    setDraft((prev) => ({
-                                      ...prev,
-                                      electrificationEO594: value,
-                                    }))
-                                  }
-                                />
-                              </div>
-                            </div>
-                          </>
-                        )}
-
-                        {step === 5 && (
-                          <>
-                            <h4 className="text-4xl font-semibold text-gray-900">
-                              Strategic flags
-                            </h4>
-                            <div className="mt-8 grid gap-4 md:grid-cols-2">
-                              {FLAG_FIELDS.map((field) => (
-                                <CheckboxCard
-                                  key={field.key}
-                                  label={field.label}
-                                  checked={draft[field.key] === 'Yes'}
-                                  onChange={(checked) =>
-                                    setDraft((prev) => ({
-                                      ...prev,
-                                      [field.key]: checked ? 'Yes' : 'No',
-                                    }))
-                                  }
-                                />
-                              ))}
-                            </div>
-                          </>
-                        )}
-
-                        {step === 6 && (
-                          <>
-                            <h4 className="text-4xl font-semibold text-gray-900">
-                              Synergies and notes
-                            </h4>
-
-                            <div className="mt-8 space-y-8">
-                              <div>
-                                <p className="mb-3 text-sm font-medium text-gray-700">
-                                  Potential Synergies
-                                </p>
-                                <div className="grid gap-3 md:grid-cols-2">
-                                  {synergyOptions.map((type) => {
-                                    return (
-                                      <CheckboxCard
-                                        key={type}
-                                        label={type}
-                                        checked={draft.potentialSynergies.includes(type)}
-                                        onChange={() => toggleSynergy(type)}
-                                      />
-                                    )
-                                  })}
-                                </div>
-                              </div>
-
-                              <div>
-                                <label
-                                  htmlFor="supporting-notes"
-                                  className="mb-3 block text-sm font-medium text-gray-700"
-                                >
-                                  Supporting Notes / Additional Info
-                                </label>
-                                <textarea
-                                  id="supporting-notes"
-                                  value={draft.supportingNotes}
-                                  onChange={(e) =>
-                                    setDraft((prev) => ({
-                                      ...prev,
-                                      supportingNotes: e.target.value,
-                                    }))
-                                  }
-                                  placeholder="Add assumptions, scope notes, dependencies, or any extra context"
-                                  rows={8}
-                                  className="w-full rounded-3xl border border-gray-200 px-5 py-5 text-base outline-none transition focus:border-black"
-                                />
-                              </div>
-                            </div>
-                          </>
-                        )}
-                      </motion.div>
-                    </AnimatePresence>
-                  </div>
-
-                  {actionError && isCreating ? (
-                    <div className="mx-8 mb-4 rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
-                      {actionError}
-                    </div>
-                  ) : null}
-
-                  <div className="flex items-center justify-between border-t border-gray-100 px-8 py-6">
-                    <button
-                      type="button"
-                      onClick={goBack}
-                      disabled={step === 0}
-                      className="rounded-2xl border border-gray-300 bg-white px-5 py-3 text-sm font-medium text-gray-700 disabled:opacity-40"
-                    >
-                      Back
-                    </button>
-
-                    {step < totalSteps - 1 ? (
-                      <button
-                        type="button"
-                        onClick={goNext}
-                        className="rounded-2xl bg-black px-5 py-3 text-sm font-medium text-white shadow-lg"
-                      >
-                        Next
-                      </button>
-                    ) : (
-                      <button
-                        type="button"
-                        onClick={saveLineItem}
-                        disabled={isSavingNew}
-                        className="rounded-2xl bg-black px-5 py-3 text-sm font-medium text-white shadow-lg disabled:cursor-not-allowed disabled:opacity-50"
-                      >
-                        {isSavingNew ? 'Saving…' : 'Save Line Item'}
-                      </button>
-                    )}
-                  </div>
-                </div>
+                          {step < steps.length - 1 ? (
+                            <button
+                              type="button"
+                              onClick={goNext}
+                              className="rounded-2xl bg-black px-5 py-3 text-sm font-medium text-white shadow-lg"
+                            >
+                              Next
+                            </button>
+                          ) : (
+                            <button
+                              type="button"
+                              onClick={saveLineItem}
+                              disabled={isSavingNew}
+                              className="rounded-2xl bg-black px-5 py-3 text-sm font-medium text-white shadow-lg disabled:cursor-not-allowed disabled:opacity-50"
+                            >
+                              {isSavingNew ? 'Saving…' : 'Save Line Item'}
+                            </button>
+                          )}
+                        </div>
+                      </div>
                     </motion.div>
                   </div>
                 </motion.div>
@@ -1310,12 +1059,14 @@ function InputField({
   onChange,
   id,
   placeholder,
+  helpText,
 }: {
   label: string
   value: string
   onChange: (value: string) => void
   id?: string
   placeholder?: string
+  helpText?: string
 }) {
   return (
     <div>
@@ -1329,6 +1080,7 @@ function InputField({
         placeholder={placeholder}
         className="w-full rounded-2xl border border-gray-200 bg-white px-4 py-3 text-sm outline-none transition focus:border-black"
       />
+      {helpText ? <p className="mt-1 text-xs text-gray-500">{helpText}</p> : null}
     </div>
   )
 }
@@ -1340,6 +1092,7 @@ function TextAreaField({
   rows,
   id,
   placeholder,
+  helpText,
 }: {
   label: string
   value: string
@@ -1347,6 +1100,7 @@ function TextAreaField({
   rows: number
   id?: string
   placeholder?: string
+  helpText?: string
 }) {
   return (
     <div>
@@ -1361,6 +1115,7 @@ function TextAreaField({
         placeholder={placeholder}
         className="w-full rounded-2xl border border-gray-200 bg-white px-4 py-3 text-sm outline-none transition focus:border-black"
       />
+      {helpText ? <p className="mt-1 text-xs text-gray-500">{helpText}</p> : null}
     </div>
   )
 }

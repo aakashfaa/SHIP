@@ -1,4 +1,5 @@
 import { test, expect, type Page } from '@playwright/test'
+import { settle } from '../helpers/settle'
 
 /**
  * Visual and behavioural checks for the v2 Timeline.
@@ -12,13 +13,6 @@ import { test, expect, type Page } from '@playwright/test'
 
 const SEED_PROJECT = 'Federal Campus Master Plan'
 
-async function settle(page: Page) {
-  await page.waitForLoadState('networkidle')
-  await page.evaluate(() => document.fonts.ready)
-  await page.evaluate(
-    () => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)))
-  )
-}
 
 async function openTimeline(page: Page) {
   await page.goto('/projects')
