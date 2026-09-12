@@ -11,6 +11,7 @@ import {
 } from '@/lib/store'
 import { useAsyncData } from '@/lib/useAsyncData'
 import { getTaxonomyForProject, taxonomyOptions } from '@/lib/store'
+import type { ProjectPermissions } from '@/lib/project-role'
 import type { ProjectTaxonomyValue } from '@/lib/types'
 import {
   BuildingAreaImpacted,
@@ -30,6 +31,9 @@ import {
 type Props = {
   project: Project
   user: SafeUser
+  /** Resolved once by the shell (ProjectDashboardShell) so this tab does not
+   *  re-issue the role RPC just to pick a default discipline. */
+  permissions: ProjectPermissions
 }
 
 /*
@@ -134,8 +138,25 @@ const FLAG_FIELDS: Array<{ key: EditableFlagField; label: string }> = [
   { key: 'historicImpact', label: 'Historic Impact' },
 ]
 
-function getUserConsultantType(project: Project, user: SafeUser): ConsultantType {
-  if (user.role === 'admin') return 'Architecture'
+/**
+ * Migration 0009 moved authority from the global `profiles.role` boolean to
+ * a per-project role, and this default is exactly the case that migration
+ * exists to fix: reading `user.role === 'admin'` gets it backwards for two
+ * real people on this project -- a PLATFORM admin with no consultant
+ * assignment here used to be forced into 'Architecture' regardless of what
+ * they actually do on this job, while a PROJECT admin who happens not to be
+ * a platform admin used to fall through to the email lookup and get
+ * whatever discipline they were hired under, or 'Architecture' if none
+ * matched. `permissions.isAdmin` is this project's own answer to "is this
+ * person in charge here", which is the question a default on THIS project's
+ * form should be asking.
+ */
+function getUserConsultantType(
+  project: Project,
+  user: SafeUser,
+  permissions: ProjectPermissions
+): ConsultantType {
+  if (permissions.isAdmin) return 'Architecture'
 
   const matchedConsultant = project.consultants.find((consultant) =>
     consultant.emails.includes(user.email)
@@ -144,11 +165,15 @@ function getUserConsultantType(project: Project, user: SafeUser): ConsultantType
   return matchedConsultant?.type ?? 'Architecture'
 }
 
-function makeInitialDraft(project: Project, user: SafeUser): DraftLineItem {
+function makeInitialDraft(
+  project: Project,
+  user: SafeUser,
+  permissions: ProjectPermissions
+): DraftLineItem {
   return {
     projectId: project.id,
     userEmail: user.email,
-    consultantType: getUserConsultantType(project, user),
+    consultantType: getUserConsultantType(project, user, permissions),
     name: '',
     shortDescription: '',
     category: 'END OF LIFE',
@@ -241,7 +266,7 @@ function ChoicePills<T extends string>({
   )
 }
 
-export default function AddDataTab({ project, user }: Props) {
+export default function AddDataTab({ project, user, permissions }: Props) {
   /**
    * The project's own dropdown vocabularies (migration 0008). Loaded here
    * rather than passed in because this is the only tab that writes line
@@ -280,7 +305,9 @@ export default function AddDataTab({ project, user }: Props) {
   const [isCreating, setIsCreating] = useState(false)
   const [step, setStep] = useState(0)
   const [expandedId, setExpandedId] = useState<string | null>(null)
-  const [draft, setDraft] = useState<DraftLineItem>(() => makeInitialDraft(project, user))
+  const [draft, setDraft] = useState<DraftLineItem>(() =>
+    makeInitialDraft(project, user, permissions)
+  )
   const [editingDrafts, setEditingDrafts] = useState<Record<string, DraftLineItem>>({})
   const [isSavingNew, setIsSavingNew] = useState(false)
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null)
@@ -295,7 +322,7 @@ export default function AddDataTab({ project, user }: Props) {
     }
   }, [])
 
-  const consultantType = getUserConsultantType(project, user)
+  const consultantType = getUserConsultantType(project, user, permissions)
 
   const synergyOptions = useMemo(() => {
     return project.consultants
@@ -307,7 +334,7 @@ export default function AddDataTab({ project, user }: Props) {
   const progress = ((step + 1) / totalSteps) * 100
 
   function openCreateFlow() {
-    setDraft(makeInitialDraft(project, user))
+    setDraft(makeInitialDraft(project, user, permissions))
     setStep(0)
     setIsCreating(true)
   }

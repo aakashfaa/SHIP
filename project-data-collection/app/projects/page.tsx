@@ -39,13 +39,21 @@ export default function ProjectsPage() {
     )
   }
 
-  // The client-side filter below keeps the UI honest, but RLS is the real
-  // security boundary now — a consultant's fetch never returns projects they
-  // are not assigned to.
-  const projects =
-    user.role === 'admin'
-      ? allProjects
-      : allProjects.filter((project) => project.assignedUsers.includes(user.email))
+  // No client-side filter here. `getStoredProjects()` already ran through
+  // RLS (`projects_select`, which is driven by `my_project_ids()`) as this
+  // user, so `allProjects` IS their access list — not a superset of it.
+  //
+  // That used to not be true. The old filter re-derived access from
+  // `assignedUsers`, which is sourced from `project_members`
+  // (`project_members_select` is restricted to contributors). But migration
+  // 0009 lets someone hold a project role — viewer included — via
+  // `project_roles` with no `project_members` row at all. For that person
+  // `assignedUsers` is `[]`: the filter above zeroed their list even though
+  // RLS had already handed them the project, so a viewer's only way into
+  // their own project was a direct URL. RLS is strictly WIDER than any
+  // client-side reconstruction of it now, so filtering here can only ever
+  // subtract real access, never add safety.
+  const projects = allProjects
 
   if (projectsLoading) {
     return (

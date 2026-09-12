@@ -57,12 +57,30 @@ export function permissionsForRole(
 }
 
 export function useProjectRole(projectId: string): ProjectPermissions {
-  const [role, setRole] = useState<ProjectRole | null>(null)
-  const [loading, setLoading] = useState(true)
+  /*
+   * One piece of state holding BOTH the answer and the question it answers,
+   * rather than separate `role` and `loading` values.
+   *
+   * The obvious shape -- `setLoading(true)` at the top of the effect -- is a
+   * synchronous setState inside an effect body, which React flags as a
+   * cascading render (react-hooks/set-state-in-effect) and which has a real
+   * bug in it besides: between `projectId` changing and the effect running,
+   * the hook would return the PREVIOUS project's role as though it were
+   * settled. On a workspace whose entire job is deciding who may edit what,
+   * briefly reporting your authority on a different project is not a
+   * cosmetic race.
+   *
+   * Storing the project id alongside the role makes "is this answer about the
+   * project I am currently asking about?" a derivation rather than a
+   * synchronisation problem, so a stale answer can never be read as a fresh
+   * one.
+   */
+  const [answer, setAnswer] = useState<{ projectId: string; role: ProjectRole | null } | null>(
+    null
+  )
 
   useEffect(() => {
     let cancelled = false
-    setLoading(true)
 
     getSupabaseBrowserClient()
       .rpc('project_role', { p_project_id: projectId })
@@ -72,8 +90,10 @@ export function useProjectRole(projectId: string): ProjectPermissions {
         // most permissive state on an error is how a read-only user gets shown
         // controls that then fail; null renders the narrowest UI, which is the
         // safe direction to be wrong in.
-        setRole(error || typeof data !== 'string' ? null : (data as ProjectRole))
-        setLoading(false)
+        setAnswer({
+          projectId,
+          role: error || typeof data !== 'string' ? null : (data as ProjectRole),
+        })
       })
 
     return () => {
@@ -81,5 +101,6 @@ export function useProjectRole(projectId: string): ProjectPermissions {
     }
   }, [projectId])
 
-  return permissionsForRole(role, loading)
+  const settled = answer?.projectId === projectId
+  return permissionsForRole(settled ? answer.role : null, !settled)
 }

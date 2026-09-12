@@ -63,6 +63,25 @@ export async function GET(_request: NextRequest, { params }: RouteParams) {
     )
   }
 
+  // R8.4: a viewer cannot export, full stop — not "cannot export unless they
+  // know the URL". The button that calls this route is already hidden for
+  // viewers (MasterViewTab, TimelineTab), but hiding a control is a UI
+  // courtesy, not authorization: a viewer who types this URL, or replays a
+  // captured request, is READABLE per RLS (that's what let them past the
+  // 404 above) and would otherwise walk straight out with the workbook.
+  // `project_role` is the same RPC the client reads its own role from
+  // (lib/project-role.ts), run here on the request-scoped server client so
+  // it resolves against this actual caller rather than anything client-sent.
+  const { data: role, error: roleError } = await supabase.rpc('project_role', {
+    p_project_id: projectId,
+  })
+  if (roleError || role === 'viewer' || role === null) {
+    return NextResponse.json(
+      { error: 'Viewers cannot export this project.' },
+      { status: 403 }
+    )
+  }
+
   let buffer: Buffer
   try {
     const reportData = await buildProjectReportData(supabase, project)

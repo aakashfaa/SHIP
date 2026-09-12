@@ -27,12 +27,21 @@ const SERVICE_ROLE =
 
 const PASSWORD = 'localdev123'
 
-/** Emails must exist in `ship.pending_invites` (see supabase/seeds/001_seed.sql)
- *  or the user signs in successfully and then lands on /no-access. */
+/**
+ * Emails must exist in `ship.pending_invites` (see supabase/seeds/001_seed.sql)
+ * or the user signs in successfully and then lands on /no-access.
+ *
+ * One account per PROJECT ROLE (migration 0009), because the four roles are
+ * the thing most worth exercising by hand and they are indistinguishable
+ * without signing in as each. The role each of these resolves to comes from
+ * `ship.project_roles`, seeded in 001_seed.sql -- check there before assuming
+ * the notes below are still accurate.
+ */
 const USERS = [
-  { email: 'admin@gmail.com', note: 'platform admin — sees every project' },
-  { email: 'consultant1@gmail.com', note: 'consultant on the seeded projects' },
-  { email: 'planning@atlasmech.com', note: 'consultant, Mechanical discipline' },
+  { email: 'admin@gmail.com', note: 'PROJECT ADMIN + platform admin' },
+  { email: 'planning@atlasmech.com', note: 'EDITOR on federal-campus-master-plan' },
+  { email: 'consultant1@gmail.com', note: 'CONSULTANT on federal-campus-master-plan' },
+  { email: 'electrical@voltworks.com', note: 'VIEWER on federal-campus-master-plan' },
 ]
 
 function assertLocal(url) {

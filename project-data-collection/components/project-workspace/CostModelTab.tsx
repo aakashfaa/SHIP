@@ -225,6 +225,15 @@ export default function CostModelTab({ project, permissions }: Props) {
 
   const selectedTemplate = templates.find((t) => t.id === costRow.defaultPhaseTemplateId)
 
+  // `canEdit` is false for everyone, including admins, until the role RPC in
+  // useProjectRole answers -- that is the safe direction to be wrong in, so
+  // the fieldset below stays disabled through the whole loading window with
+  // no special-casing needed. The banner is a different kind of thing: it is
+  // an assertion ("only an editor or admin can change this"), and asserting
+  // it before the role is known means asserting something that might be
+  // false for the very admin reading it. So the banner additionally waits
+  // for `permissions.loading` to clear -- same reasoning as the shell's
+  // `!permissions.loading && !canEdit` gate on its own banner.
   const readOnly = !permissions.canEdit
 
   return (
@@ -239,7 +248,7 @@ export default function CostModelTab({ project, permissions }: Props) {
      * that would otherwise stop the grids inside it from shrinking.
      */
     <fieldset disabled={readOnly} className="m-0 min-w-0 border-0 p-0 space-y-5">
-      {readOnly ? (
+      {!permissions.loading && readOnly ? (
         <div className="rounded-[1.25rem] border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
           <span className="font-medium">Read-only.</span> You can see every
           assumption behind the figures on the Timeline, but only a project

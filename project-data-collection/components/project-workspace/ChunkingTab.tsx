@@ -112,6 +112,13 @@ function getLineItemTotal(item: LineItem, quantity: string) {
 
 export default function ChunkingTab({ project, permissions }: Props) {
   const canEdit = permissions.canEdit
+  // `canEdit` is false for everyone until the role RPC answers, so gating a
+  // control's very presence on `canEdit` alone hides it from an editor for
+  // that first beat and then pops it in once the role lands. Below, the
+  // three write controls this bit affects render throughout the loading
+  // window -- just disabled -- so an editor sees a control go from disabled
+  // to enabled rather than from absent to present.
+  const permissionsLoading = permissions.loading
 
   const {
     data: chunkProjects,
@@ -428,11 +435,12 @@ export default function ChunkingTab({ project, permissions }: Props) {
           <div className="rounded-full bg-slate-100 px-3 py-2 text-xs font-medium text-slate-600">
             {chunkProjects.length} Packages
           </div>
-          {canEdit ? (
+          {canEdit || permissionsLoading ? (
             <button
               type="button"
               onClick={handleOpenCreateDialog}
-              className="rounded-[1rem] bg-[linear-gradient(135deg,#0f172a_0%,#1e293b_48%,#0f766e_100%)] px-5 py-3 text-sm font-medium text-white shadow-lg transition hover:-translate-y-[1px]"
+              disabled={!canEdit}
+              className="rounded-[1rem] bg-[linear-gradient(135deg,#0f172a_0%,#1e293b_48%,#0f766e_100%)] px-5 py-3 text-sm font-medium text-white shadow-lg transition hover:-translate-y-[1px] disabled:cursor-not-allowed disabled:opacity-50"
             >
               Create Package
             </button>
@@ -554,11 +562,12 @@ export default function ChunkingTab({ project, permissions }: Props) {
                     </div>
 
                     <div className="flex flex-wrap items-center gap-2">
-                      {canEdit && editingChunkId !== chunk.id ? (
+                      {(canEdit || permissionsLoading) && editingChunkId !== chunk.id ? (
                         <button
                           type="button"
                           onClick={() => handleStartEdit(chunk)}
-                          className="rounded-[1rem] border border-slate-200 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 transition hover:border-slate-300"
+                          disabled={!canEdit}
+                          className="rounded-[1rem] border border-slate-200 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 transition hover:border-slate-300 disabled:cursor-not-allowed disabled:opacity-50"
                         >
                           Rename
                         </button>
@@ -568,22 +577,25 @@ export default function ChunkingTab({ project, permissions }: Props) {
                           carries the package number. Five cards in a row each
                           offering a button called "Edit" tells a screen-reader
                           user nothing about which package they are about to
-                          open. */}
+                          open. `permissionsLoading` keeps this from claiming
+                          "View" for an editor and then relabeling the button
+                          right as the pointer is on it -- a neutral "Open"
+                          until the role is actually known. */}
                       <button
                         type="button"
                         aria-expanded={expanded}
-                        aria-label={`${expanded ? 'Hide' : canEdit ? 'Edit' : 'View'} package ${chunk.chunkNumber}`}
+                        aria-label={`${expanded ? 'Hide' : permissionsLoading ? 'Open' : canEdit ? 'Edit' : 'View'} package ${chunk.chunkNumber}`}
                         onClick={() => setExpandedChunkId(expanded ? null : chunk.id)}
                         className="rounded-[1rem] border border-slate-200 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 transition hover:border-slate-300"
                       >
-                        {expanded ? 'Hide' : canEdit ? 'Edit' : 'View'}
+                        {expanded ? 'Hide' : permissionsLoading ? 'Open' : canEdit ? 'Edit' : 'View'}
                       </button>
 
-                      {canEdit ? (
+                      {canEdit || permissionsLoading ? (
                         <button
                           type="button"
                           onClick={() => handleDeleteChunk(chunk.id)}
-                          disabled={deletingChunkId === chunk.id}
+                          disabled={!canEdit || deletingChunkId === chunk.id}
                           className="rounded-[1rem] border border-rose-200 bg-rose-50 px-4 py-2.5 text-sm font-medium text-rose-700 disabled:cursor-not-allowed disabled:opacity-50"
                         >
                           {deletingChunkId === chunk.id ? 'Deleting…' : 'Delete'}

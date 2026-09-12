@@ -37,3 +37,18 @@ nextjs-portal,
   animation: none !important;
   opacity: 1 !important;
 }
+
+/*
+ * The workspace tab bar is position:fixed. A Playwright `fullPage` screenshot
+ * stitches the page while scrolling, and a fixed element lands wherever the
+ * scroll offset was at capture time -- so the bar appeared at a different
+ * height on consecutive runs of an unchanged page, producing a ~1% pixel diff
+ * that reads as a layout regression and is not one.
+ *
+ * Hiding it is safe for these tests: every spec navigates by clicking it
+ * BEFORE the screenshot, so it is exercised either way, and it is chrome
+ * rather than any of the content under test.
+ */
+[data-workspace-nav] {
+  display: none !important;
+}

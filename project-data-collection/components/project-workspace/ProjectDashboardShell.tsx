@@ -143,15 +143,41 @@ export default function ProjectDashboardShell({
   }
 
   function renderTabContent() {
+    /**
+     * Wait for the role before mounting ANY tab panel.
+     *
+     * `tabs` above widens the instant `permissions.loading` flips to false --
+     * Settings and/or Add Data can appear ahead of Master View in that same
+     * render, which moves `fallbackTab` out from under `activeTab`. Computing
+     * `activeTab` first and rendering it while still loading means mounting
+     * whatever panel the NARROW list picked (typically Master View), firing
+     * its data fetch, and then unmounting it a moment later for the panel the
+     * resolved role actually lands on -- a real network request nobody asked
+     * for, and an admin watching Master View appear before being replaced by
+     * Settings. Because `activeTab` is derived fresh from `tabs` on every
+     * render, the render where `loading` becomes false already reflects the
+     * final tab list, so holding off until then means the first panel ever
+     * mounted is the right one -- never a two-panel sequence.
+     */
+    if (permissions.loading) {
+      return (
+        <div className="rounded-[2rem] border border-dashed border-slate-300 bg-white/70 px-6 py-16 text-center text-sm font-medium text-slate-400">
+          Loading…
+        </div>
+      )
+    }
+
     switch (activeTab) {
       case 'settings':
         return isAdmin ? (
           <SettingsTab project={project} onProjectUpdated={setProject} />
         ) : null
       case 'add-data':
-        return canContribute ? <AddDataTab project={project} user={user} /> : null
+        return canContribute ? (
+          <AddDataTab project={project} user={user} permissions={permissions} />
+        ) : null
       case 'master-view':
-        return <MasterViewTab project={project} />
+        return <MasterViewTab project={project} permissions={permissions} />
       case 'chunking':
         return <ChunkingTab project={project} permissions={permissions} />
       case 'timeline':
@@ -237,7 +263,16 @@ export default function ProjectDashboardShell({
         </div>
       </div>
 
-      <div className="fixed bottom-6 left-1/2 z-50 w-[94%] max-w-3xl -translate-x-1/2">
+      {/* `data-workspace-nav` exists for the screenshot harness, not for
+          styling. This bar is position:fixed, so in a Playwright fullPage
+          capture it renders at whatever the scroll offset happened to be when
+          the shot was taken -- which varies run to run and produced a diff
+          that looked exactly like a layout regression. The visual tests hide
+          it by this attribute; see tests/helpers/screenshot.css. */}
+      <div
+        data-workspace-nav
+        className="fixed bottom-6 left-1/2 z-50 w-[94%] max-w-3xl -translate-x-1/2"
+      >
         <div className="flex items-center justify-between rounded-[2rem] border border-white/70 bg-white/74 p-2 shadow-[0_24px_70px_rgba(15,23,42,0.16)] backdrop-blur-2xl">
           {tabs.map((tab) => {
             const isActive = activeTab === tab.key

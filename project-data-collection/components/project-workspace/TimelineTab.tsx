@@ -255,6 +255,27 @@ export default function TimelineTab({ project, permissions }: Props) {
     reload: reloadScenarios,
   } = useAsyncData<Scenario[]>(() => getScenariosForProject(project.id), [project.id], [])
   const [activeScenarioId, setActiveScenarioId] = useState<string | null>(null)
+
+  /**
+   * Three different questions, deliberately not collapsed into one flag.
+   *
+   * `isEphemeral` -- a viewer. R5.3: "a viewer can move bars freely in an
+   *   ephemeral sandbox that is never persisted anywhere". Steve's version:
+   *   "they could even, to a certain degree, play with things a little bit,
+   *   but it won't save". So they DO get to drag; the drop just goes nowhere.
+   *
+   * `canEditBaseline` -- may change the live plan. Admin and editor.
+   *
+   * `canDrag` -- may move a bar at all, which is a different question from
+   *   both. A consultant cannot touch the baseline but CAN reschedule inside
+   *   their own what-if, because that writes the scenario row rather than
+   *   chunk_phases. Treating "cannot edit" as "cannot drag" would take the
+   *   sandbox away from the people most likely to want one.
+   */
+  const isEphemeral = permissions.isViewer
+  const canEditBaseline = permissions.canEdit
+  const canDrag =
+    canEditBaseline || isEphemeral || (activeScenarioId !== null && permissions.canContribute)
   const [overlay, setOverlay] = useState<Map<string, ScenarioPayload['phases'][number]> | null>(
     null
   )
@@ -577,6 +598,10 @@ export default function TimelineTab({ project, permissions }: Props) {
   }
 
   async function handleBranch(name: string) {
+    // Consultants may branch -- modelling an idea privately is the point of
+    // having them on the project. Viewers may not: migration 0011 refuses it,
+    // and their sandbox is the ephemeral one above.
+    if (!permissions.canContribute) return
     setSandboxBusy(true)
     setConflict(null)
     try {
@@ -609,8 +634,18 @@ export default function TimelineTab({ project, permissions }: Props) {
     setPhases(baselinePhasesRef.current)
   }
 
+  /** A viewer's "Reset". Nothing was persisted, so restoring the baseline
+   *  rows is the entire operation -- there is no server state to undo. */
+  function handleResetEphemeral() {
+    setPhases(baselinePhasesRef.current)
+  }
+
   async function handlePublish() {
     if (!activeScenarioId) return
+    // Publishing writes the shared baseline. This is the UI half of the fix
+    // in migration 0011, where publish_scenario() was checking read access
+    // while its own comment claimed it checked edit access.
+    if (!canEditBaseline) return
     setSandboxBusy(true)
     setConflict(null)
     try {
@@ -641,6 +676,7 @@ export default function TimelineTab({ project, permissions }: Props) {
 
   async function handleDiscard() {
     if (!activeScenarioId) return
+    if (!permissions.canContribute) return
     setSandboxBusy(true)
     try {
       await deleteScenario(activeScenarioId)
@@ -655,6 +691,7 @@ export default function TimelineTab({ project, permissions }: Props) {
 
   async function handleRebase() {
     if (!activeScenarioId) return
+    if (!permissions.canContribute) return
     setSandboxBusy(true)
     try {
       const rebased = await rebaseScenario(activeScenarioId)
@@ -697,10 +734,10 @@ export default function TimelineTab({ project, permissions }: Props) {
   ) {
     if (slotCount <= 0) return
 
-    // Belt and braces with the `readOnly` prop above: the grid stops
+    // Belt and braces with the `readOnly` prop below: the grid stops
     // rendering the handles, and this refuses the drag even if something
     // else dispatches one.
-    if (!permissions.canEdit) return
+    if (!canDrag) return
 
     // A locked phase is movable but not resizable. The handles are not
     // rendered at all, so reaching here with a resize mode means something
@@ -790,6 +827,12 @@ export default function TimelineTab({ project, permissions }: Props) {
       // in-memory overlay and is saved to the scenario row instead — that
       // separation is the whole feature, and getting it wrong means a
       // "what-if" silently rewrites the live plan in front of a client.
+      // A viewer's sandbox is local and stays local. Returning before either
+      // persist path is what makes "nothing is saved" true rather than
+      // aspirational -- migration 0011 refuses the writes as well, but the UI
+      // should never be the thing that gets refused.
+      if (isEphemeral) return
+
       if (activeScenarioIdRef.current) {
         const nextOverlay = new Map(overlayRef.current ?? [])
         for (const phaseRow of next) {
@@ -828,6 +871,14 @@ export default function TimelineTab({ project, permissions }: Props) {
   /* ----------------------------------------------------- settings writes -- */
 
   function scheduleSettingsPersist(updates: Partial<ProjectTimelineSettings>) {
+    // project_timeline_settings_update is my_editable_project_ids(), so for a
+    // consultant or viewer this write matches zero rows and then surfaces
+    // "Failed to save the timeline settings" a debounce later -- an error
+    // message for an action we told them elsewhere they could not take. The
+    // sliders are disabled for them instead; this guard is the backstop for
+    // anything that calls in another way.
+    if (!canEditBaseline) return
+
     pendingSettingsRef.current = { ...pendingSettingsRef.current, ...updates }
     if (settingsTimerRef.current) clearTimeout(settingsTimerRef.current)
     settingsTimerRef.current = setTimeout(() => {
@@ -920,13 +971,14 @@ export default function TimelineTab({ project, permissions }: Props) {
             looking at a local copy." The active state is a full-width amber
             bar for exactly that reason. */}
         <SandboxBar
+          ephemeral={isEphemeral}
           scenarios={scenarios}
           activeScenario={activeScenario}
           busy={sandboxBusy}
           conflict={conflict}
           onBranch={(name) => void handleBranch(name)}
           onEnter={handleEnterScenario}
-          onExit={handleExitScenario}
+          onExit={isEphemeral ? handleResetEphemeral : handleExitScenario}
           onPublish={() => void handlePublish()}
           onDiscard={() => void handleDiscard()}
           onRebase={() => void handleRebase()}
@@ -956,6 +1008,7 @@ export default function TimelineTab({ project, permissions }: Props) {
               step={1}
               value={timelineSettings.years}
               onChange={(e) => handleYearsChange(Number(e.target.value))}
+              disabled={!canEditBaseline}
               className="mt-4 w-full accent-slate-900"
             />
           </div>
@@ -977,6 +1030,7 @@ export default function TimelineTab({ project, permissions }: Props) {
               step={1}
               value={timelineSettings.zoomLevel}
               onChange={(e) => handleZoomChange(Number(e.target.value))}
+              disabled={!canEditBaseline}
               className="mt-4 w-full accent-slate-900"
             />
             <div className="mt-3 grid grid-cols-5 text-center text-[10px] font-medium text-slate-500">
@@ -1056,10 +1110,17 @@ export default function TimelineTab({ project, permissions }: Props) {
               bodyHeight={bodyHeight}
               slotCount={slotCount}
               hoveredSlot={hoveredSlot}
-              // Was hardcoded false. A consultant or viewer gets bars they
-              // can read but not drag -- rather than a grab cursor and a
+              // Was hardcoded false. `canDrag`, not `canEdit`: a viewer may
+              // drag inside their ephemeral sandbox and a consultant may drag
+              // inside their own what-if, neither of which touches the
+              // baseline. What none of them get is a grab cursor followed by a
               // silent RLS rejection on pointer-up.
-              readOnly={!permissions.canEdit}
+              readOnly={!canDrag}
+              // The grid needs to tell "not allowed" apart from "not known
+              // yet" -- both collapse to the same `readOnly` value while the
+              // role RPC is in flight -- so it can hold its caption instead
+              // of announcing a permission that has not resolved.
+              permissionsLoading={permissions.loading}
               onHoverSlot={setHoveredSlot}
               onToggleExpand={handleToggleExpand}
               onPhasePointerDown={handlePhasePointerDown}

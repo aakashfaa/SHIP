@@ -3,10 +3,14 @@
 import { useDeferredValue, useMemo, useRef, useState } from 'react'
 import { useAsyncData } from '@/lib/useAsyncData'
 import { getLineItemsForProject } from '@/lib/store'
+import type { ProjectPermissions } from '@/lib/project-role'
 import { LineItem, Project } from '@/lib/types'
 
 type Props = {
   project: Project
+  /** Resolved once by the shell (ProjectDashboardShell) so every tab agrees
+   *  on one answer without re-issuing the role RPC per tab. */
+  permissions: ProjectPermissions
 }
 
 type SortKey = 'itemNumber' | 'name' | 'discipline' | 'companyName' | 'relativeFirstCost'
@@ -71,7 +75,7 @@ function yn(value: string) {
   return value === 'Yes' ? 'Y' : ''
 }
 
-export default function MasterViewTab({ project }: Props) {
+export default function MasterViewTab({ project, permissions }: Props) {
   const exportRef = useRef<HTMLDivElement | null>(null)
   const [query, setQuery] = useState('')
   const [disciplineFilter, setDisciplineFilter] = useState('all')
@@ -187,13 +191,20 @@ export default function MasterViewTab({ project }: Props) {
             </p>
           </div>
 
-          <button
-            type="button"
-            onClick={exportMatrixOnly}
-            className="rounded-2xl bg-black px-5 py-3 text-sm font-medium text-white shadow-lg transition hover:-translate-y-[1px]"
-          >
-            Export PDF
-          </button>
+          {/* R8.4: a viewer does not get a copy of the plan to carry off, only
+              the on-screen read of it. Master View is open to every role
+              (unlike Add Data), so this button — not a route gate — is the
+              only thing standing between a viewer and the full matrix, and it
+              has to be hidden rather than merely disabled. */}
+          {permissions.isViewer ? null : (
+            <button
+              type="button"
+              onClick={exportMatrixOnly}
+              className="rounded-2xl bg-black px-5 py-3 text-sm font-medium text-white shadow-lg transition hover:-translate-y-[1px]"
+            >
+              Export PDF
+            </button>
+          )}
         </div>
 
         <div className="grid gap-3 lg:grid-cols-[2fr_1fr_1fr_1fr]">

@@ -143,12 +143,26 @@ Requirements:
 - **R5.1** Four **per-project** roles: `admin`, `editor`, `consultant`, `viewer`.
   Today's role is global and binary; this is the change.
 
-  | | line items (own) | line items (others') | packages & schedule | cost settings | members |
-  |---|---|---|---|---|---|
-  | `admin`      | CRUD | CRUD | CRUD | CRUD | CRUD |
-  | `editor`     | CRUD | CRUD | CRUD | read | read |
-  | `consultant` | CRUD | read + **suggest** | read | read | read |
-  | `viewer`     | read | read | read (sandbox only) | read | — |
+  | | line items (own) | line items (others') | packages & schedule | cost settings | members | what-if |
+  |---|---|---|---|---|---|---|
+  | `admin`      | CRUD | CRUD | CRUD | CRUD | CRUD | branch + publish |
+  | `editor`     | CRUD | CRUD | CRUD | CRUD | read | branch + publish |
+  | `consultant` | CRUD | read + **suggest** | read | read | read | branch only |
+  | `viewer`     | read | read | read | read | — | ephemeral only |
+
+  `editor` writes cost settings. An earlier draft of this table said `read`,
+  which contradicted both the schema (migration 0009's
+  `project_cost_settings_*` policies use `can_edit_project`) and 0006's own
+  forward-looking marker ("0009 widens this ... editor or admin"). The
+  implementation was self-consistent and the table was the outlier, so the
+  table moved. An editor who can reschedule the whole programme but cannot
+  change the escalation rate it is priced at would be an odd place to draw
+  the line.
+
+  The what-if column is the distinction migration 0011 exists to enforce:
+  publishing a scenario writes the shared baseline, so it is an edit, while
+  branching one is private and harmless. A viewer's sandbox is never
+  persisted at all — see R6.1 and R5.3.
 
 - **R5.2** A `consultant` editing another consultant's line item produces a **suggestion**, not
   a write. Admins/editors review, accept (which applies the patch) or reject.

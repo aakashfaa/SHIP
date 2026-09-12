@@ -46,6 +46,16 @@ type Props = {
   slotCount: number
   hoveredSlot: number | null
   readOnly: boolean
+  /**
+   * `readOnly` alone cannot say WHY dragging is off: it is
+   * `!permissions.canEdit`, which is also true while the role RPC has not
+   * answered yet (see project-role.ts). Without this, the caption below
+   * tells a soon-to-be editor "ask an editor for access" for a beat, which
+   * is wrong, and tells an actual viewer the same thing a moment early,
+   * which reads as flicker. This lets the caption say "still checking"
+   * instead of guessing.
+   */
+  permissionsLoading: boolean
   onHoverSlot: (slot: number | null) => void
   onToggleExpand: (chunkProjectId: string) => void
   onPhasePointerDown: (
@@ -71,6 +81,7 @@ export default function TimelineGrid({
   slotCount,
   hoveredSlot,
   readOnly,
+  permissionsLoading,
   onHoverSlot,
   onToggleExpand,
   onPhasePointerDown,
@@ -90,9 +101,11 @@ export default function TimelineGrid({
             Packages
           </div>
           <div className="mt-1 text-sm text-slate-600">
-            {readOnly
-              ? 'Read-only. Ask an editor for access to reschedule.'
-              : 'Expand a package to schedule its phases. Drag to move, drag an edge to resize.'}
+            {permissionsLoading
+              ? 'Checking your access…'
+              : readOnly
+                ? 'Read-only. Ask an editor for access to reschedule.'
+                : 'Expand a package to schedule its phases. Drag to move, drag an edge to resize.'}
           </div>
         </div>
 
