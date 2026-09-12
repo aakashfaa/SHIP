@@ -13,6 +13,7 @@ import {
   updateEnergySettingsForProject,
 } from '@/lib/store'
 import { useAsyncData } from '@/lib/useAsyncData'
+import type { ProjectPermissions } from '@/lib/project-role'
 import type {
   PhaseTemplate,
   Project,
@@ -37,7 +38,10 @@ import type {
 
 const PERSIST_DEBOUNCE_MS = 600
 
-type Props = { project: Project }
+type Props = {
+  project: Project
+  permissions: ProjectPermissions
+}
 
 function Field({
   label,
@@ -60,7 +64,7 @@ function Field({
 const INPUT_CLASS =
   'w-full rounded-[0.95rem] border border-slate-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-teal-500 focus:ring-2 focus:ring-teal-100'
 
-export default function CostModelTab({ project }: Props) {
+export default function CostModelTab({ project, permissions }: Props) {
   const {
     data: costRow,
     setData: setCostRow,
@@ -221,8 +225,27 @@ export default function CostModelTab({ project }: Props) {
 
   const selectedTemplate = templates.find((t) => t.id === costRow.defaultPhaseTemplateId)
 
+  const readOnly = !permissions.canEdit
+
   return (
-    <div className="space-y-5">
+    /*
+     * A native `fieldset disabled` rather than a `disabled` prop threaded
+     * through fifteen inputs. It disables every form control inside it,
+     * including ones added later, so a new field cannot accidentally ship
+     * writable to a consultant — which is exactly the kind of gap that opens
+     * up when the gate is per-control.
+     *
+     * `min-w-0` because a fieldset carries a default `min-width: min-content`
+     * that would otherwise stop the grids inside it from shrinking.
+     */
+    <fieldset disabled={readOnly} className="m-0 min-w-0 border-0 p-0 space-y-5">
+      {readOnly ? (
+        <div className="rounded-[1.25rem] border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+          <span className="font-medium">Read-only.</span> You can see every
+          assumption behind the figures on the Timeline, but only a project
+          editor or admin can change them.
+        </div>
+      ) : null}
       <div className="rounded-[1.75rem] border border-slate-200 bg-white/86 p-5 shadow-sm">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div>
@@ -610,6 +633,6 @@ export default function CostModelTab({ project }: Props) {
           </Field>
         </div>
       </section>
-    </div>
+    </fieldset>
   )
 }

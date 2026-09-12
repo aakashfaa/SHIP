@@ -10,6 +10,8 @@ import {
   updateLineItem,
 } from '@/lib/store'
 import { useAsyncData } from '@/lib/useAsyncData'
+import { getTaxonomyForProject, taxonomyOptions } from '@/lib/store'
+import type { ProjectTaxonomyValue } from '@/lib/types'
 import {
   BuildingAreaImpacted,
   BuildingLevelImpacted,
@@ -30,7 +32,14 @@ type Props = {
   user: SafeUser
 }
 
-const CATEGORY_OPTIONS: LineItemCategory[] = [
+/*
+ * The four vocabularies below are FALLBACKS, used only while the project's own
+ * taxonomy is still loading or if it comes back empty. The live values come
+ * from `ship.project_taxonomy_values` (migration 0008) and are edited in
+ * Settings -- these literals are one building's vocabulary and must not be
+ * what anybody actually sees.
+ */
+const FALLBACK_CATEGORY_OPTIONS: LineItemCategory[] = [
   'END OF LIFE',
   'DEFERRED MAINTENANCE',
   'UPGRADES / IMPROVEMENTS',
@@ -38,7 +47,7 @@ const CATEGORY_OPTIONS: LineItemCategory[] = [
   'STUDY / DOCUMENTATION',
 ]
 
-const PRIORITY_OPTIONS: TimelinePriority[] = [
+const FALLBACK_PRIORITY_OPTIONS: TimelinePriority[] = [
   '0_PRIORITY *',
   '1_HIGH <5 years',
   '2_MID 5-10 years',
@@ -47,7 +56,7 @@ const PRIORITY_OPTIONS: TimelinePriority[] = [
   '5_250th ANNIVERSARY',
 ]
 
-const BUILDING_AREA_OPTIONS: BuildingAreaImpacted[] = [
+const FALLBACK_BUILDING_AREA_OPTIONS: BuildingAreaImpacted[] = [
   'WHOLE BUILDING',
   'ANNEX',
   'WEST WING',
@@ -57,7 +66,7 @@ const BUILDING_AREA_OPTIONS: BuildingAreaImpacted[] = [
   'OTHER *',
 ]
 
-const BUILDING_LEVEL_OPTIONS: BuildingLevelImpacted[] = [
+const FALLBACK_BUILDING_LEVEL_OPTIONS: BuildingLevelImpacted[] = [
   'WHOLE BUILDING',
   'ROOF',
   'ENVELOPE (EXT. WALLS)',
@@ -233,6 +242,31 @@ function ChoicePills<T extends string>({
 }
 
 export default function AddDataTab({ project, user }: Props) {
+  /**
+   * The project's own dropdown vocabularies (migration 0008). Loaded here
+   * rather than passed in because this is the only tab that writes line
+   * items, so it is the only tab that needs them.
+   *
+   * A failure falls through to the fallback literals rather than leaving the
+   * form with empty selects -- a consultant halfway through adding an item
+   * should not lose the ability to finish because a settings table was
+   * briefly unreachable.
+   */
+  const { data: taxonomy } = useAsyncData<ProjectTaxonomyValue[]>(
+    () => getTaxonomyForProject(project.id),
+    [project.id],
+    []
+  )
+
+  function optionsFor(
+    kind: Parameters<typeof taxonomyOptions>[1],
+    fallback: readonly string[],
+    current?: string
+  ): string[] {
+    const live = taxonomyOptions(taxonomy, kind, current)
+    return live.length > 0 ? live : [...fallback]
+  }
+
   const {
     data: lineItems,
     loading: lineItemsLoading,
@@ -548,13 +582,13 @@ export default function AddDataTab({ project, user }: Props) {
                             <SelectField
                               label="Category"
                               value={editDraft.category}
-                              options={CATEGORY_OPTIONS}
+                              options={optionsFor('category', FALLBACK_CATEGORY_OPTIONS, editDraft.category)}
                               onChange={(value) => updateEditingDraft(item.id, 'category', value)}
                             />
                             <SelectField
                               label="Timeline"
                               value={editDraft.timelinePriority}
-                              options={PRIORITY_OPTIONS}
+                              options={optionsFor('timeline_priority', FALLBACK_PRIORITY_OPTIONS, editDraft.timelinePriority)}
                               onChange={(value) =>
                                 updateEditingDraft(item.id, 'timelinePriority', value)
                               }
@@ -562,7 +596,7 @@ export default function AddDataTab({ project, user }: Props) {
                             <SelectField
                               label="Area"
                               value={editDraft.buildingAreaImpacted}
-                              options={BUILDING_AREA_OPTIONS}
+                              options={optionsFor('building_area', FALLBACK_BUILDING_AREA_OPTIONS, editDraft.buildingAreaImpacted)}
                               onChange={(value) =>
                                 updateEditingDraft(item.id, 'buildingAreaImpacted', value)
                               }
@@ -570,7 +604,7 @@ export default function AddDataTab({ project, user }: Props) {
                             <SelectField
                               label="Level"
                               value={editDraft.buildingLevelImpacted}
-                              options={BUILDING_LEVEL_OPTIONS}
+                              options={optionsFor('building_level', FALLBACK_BUILDING_LEVEL_OPTIONS, editDraft.buildingLevelImpacted)}
                               onChange={(value) =>
                                 updateEditingDraft(item.id, 'buildingLevelImpacted', value)
                               }
@@ -865,7 +899,7 @@ export default function AddDataTab({ project, user }: Props) {
                               <div>
                                 <p className="mb-3 text-sm font-medium text-gray-700">Category</p>
                                 <ChoicePills
-                                  options={CATEGORY_OPTIONS}
+                                  options={optionsFor('category', FALLBACK_CATEGORY_OPTIONS, draft.category)}
                                   value={draft.category}
                                   onChange={(value) =>
                                     setDraft((prev) => ({ ...prev, category: value }))
@@ -878,7 +912,7 @@ export default function AddDataTab({ project, user }: Props) {
                                   Timeline Priority
                                 </p>
                                 <ChoicePills
-                                  options={PRIORITY_OPTIONS}
+                                  options={optionsFor('timeline_priority', FALLBACK_PRIORITY_OPTIONS, draft.timelinePriority)}
                                   value={draft.timelinePriority}
                                   onChange={(value) =>
                                     setDraft((prev) => ({ ...prev, timelinePriority: value }))
@@ -900,7 +934,7 @@ export default function AddDataTab({ project, user }: Props) {
                                   Building Area Impacted
                                 </p>
                                 <ChoicePills
-                                  options={BUILDING_AREA_OPTIONS}
+                                  options={optionsFor('building_area', FALLBACK_BUILDING_AREA_OPTIONS, draft.buildingAreaImpacted)}
                                   value={draft.buildingAreaImpacted}
                                   onChange={(value) =>
                                     setDraft((prev) => ({
@@ -916,7 +950,7 @@ export default function AddDataTab({ project, user }: Props) {
                                   Building Level Impacted
                                 </p>
                                 <ChoicePills
-                                  options={BUILDING_LEVEL_OPTIONS}
+                                  options={optionsFor('building_level', FALLBACK_BUILDING_LEVEL_OPTIONS, draft.buildingLevelImpacted)}
                                   value={draft.buildingLevelImpacted}
                                   onChange={(value) =>
                                     setDraft((prev) => ({

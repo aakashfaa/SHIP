@@ -104,10 +104,25 @@ export type LineItem = {
   itemNumber: string
   name: string
   shortDescription: string
-  category: LineItemCategory
-  timelinePriority: TimelinePriority
-  buildingAreaImpacted: BuildingAreaImpacted
-  buildingLevelImpacted: BuildingLevelImpacted
+  /*
+   * These four are `string`, not the union types below them, and that is not
+   * laziness.
+   *
+   * Migration 0008 dropped the CHECK constraints that made them closed sets
+   * and replaced them with a trigger validating against
+   * `ship.project_taxonomy_values` -- a PER-PROJECT vocabulary. The database
+   * now accepts whatever this project's taxonomy says, so a union listing one
+   * building's wings would be a type that claims more than it can deliver: it
+   * would reject a legal value from any other firm's campus.
+   *
+   * The unions are kept as the DEFAULT vocabulary (lib/constants.ts seeds new
+   * projects from them, and migration 0008 does the same server-side), which
+   * is a genuinely different thing from "the set of legal values".
+   */
+  category: string
+  timelinePriority: string
+  buildingAreaImpacted: string
+  buildingLevelImpacted: string
   operationalImpact: RelativeImpact
   benefitToUsers: RelativeImpact
   benefitToPublic: RelativeImpact
@@ -278,6 +293,33 @@ export type ProjectCostSettings = {
   // cannot express "the next year or two are forecastable, the rest isn't" -
   // see lib/cost-model.ts escalationFactor, which consumes this as a Map.
   rateOverrides: Array<{ yearOffset: number; ratePercent: number }>
+}
+
+/**
+ * Which line-item dropdown a taxonomy value belongs to.
+ *
+ * These four fields were `CHECK (col in (...))` constraints full of one
+ * building's vocabulary -- 'ANNEX', 'WEST WING', 'BULFINCH',
+ * '5_250th ANNIVERSARY'. Migration 0008 moved them to per-project rows so a
+ * different firm on a different campus is not stuck naming their wings after
+ * someone else's. See R9 in the v2 spec.
+ */
+export type TaxonomyKind =
+  | 'building_area'
+  | 'building_level'
+  | 'category'
+  | 'timeline_priority'
+
+export type ProjectTaxonomyValue = {
+  projectId: string
+  kind: TaxonomyKind
+  value: string
+  sortOrder: number
+  /** Soft delete. A value already written onto line items cannot just be
+   *  removed -- those rows would still carry it and would stop validating on
+   *  the next edit. Archiving stops it being OFFERED in new dropdowns while
+   *  every historical record keeps working. */
+  isArchived: boolean
 }
 
 export type ProjectEnergySettings = {

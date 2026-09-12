@@ -21,9 +21,11 @@ import { useAsyncData } from '@/lib/useAsyncData'
 import { formatCurrency, parseCostInput, parseQuantityInput } from '@/lib/costs'
 import { ChunkPhase, ChunkProject, LineItem, PhaseTemplate, Project, ProjectCostSettings } from '@/lib/types'
 import PhaseEditor from '@/components/project-workspace/PhaseEditor'
+import type { ProjectPermissions } from '@/lib/project-role'
 
 type Props = {
   project: Project
+  permissions: ProjectPermissions
 }
 
 const DISCIPLINE_STYLES: Record<
@@ -108,7 +110,9 @@ function getLineItemTotal(item: LineItem, quantity: string) {
   return parseCostInput(item.estimatedFirstCost) * parseQuantityInput(quantity)
 }
 
-export default function ChunkingTab({ project }: Props) {
+export default function ChunkingTab({ project, permissions }: Props) {
+  const canEdit = permissions.canEdit
+
   const {
     data: chunkProjects,
     loading: chunkProjectsLoading,
@@ -424,13 +428,15 @@ export default function ChunkingTab({ project }: Props) {
           <div className="rounded-full bg-slate-100 px-3 py-2 text-xs font-medium text-slate-600">
             {chunkProjects.length} Packages
           </div>
-          <button
-            type="button"
-            onClick={handleOpenCreateDialog}
-            className="rounded-[1rem] bg-[linear-gradient(135deg,#0f172a_0%,#1e293b_48%,#0f766e_100%)] px-5 py-3 text-sm font-medium text-white shadow-lg transition hover:-translate-y-[1px]"
-          >
-            Create Package
-          </button>
+          {canEdit ? (
+            <button
+              type="button"
+              onClick={handleOpenCreateDialog}
+              className="rounded-[1rem] bg-[linear-gradient(135deg,#0f172a_0%,#1e293b_48%,#0f766e_100%)] px-5 py-3 text-sm font-medium text-white shadow-lg transition hover:-translate-y-[1px]"
+            >
+              Create Package
+            </button>
+          ) : null}
         </div>
       </div>
 
@@ -548,7 +554,7 @@ export default function ChunkingTab({ project }: Props) {
                     </div>
 
                     <div className="flex flex-wrap items-center gap-2">
-                      {editingChunkId !== chunk.id ? (
+                      {canEdit && editingChunkId !== chunk.id ? (
                         <button
                           type="button"
                           onClick={() => handleStartEdit(chunk)}
@@ -566,21 +572,23 @@ export default function ChunkingTab({ project }: Props) {
                       <button
                         type="button"
                         aria-expanded={expanded}
-                        aria-label={`${expanded ? 'Hide' : 'Edit'} package ${chunk.chunkNumber}`}
+                        aria-label={`${expanded ? 'Hide' : canEdit ? 'Edit' : 'View'} package ${chunk.chunkNumber}`}
                         onClick={() => setExpandedChunkId(expanded ? null : chunk.id)}
                         className="rounded-[1rem] border border-slate-200 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 transition hover:border-slate-300"
                       >
-                        {expanded ? 'Hide' : 'Edit'}
+                        {expanded ? 'Hide' : canEdit ? 'Edit' : 'View'}
                       </button>
 
-                      <button
-                        type="button"
-                        onClick={() => handleDeleteChunk(chunk.id)}
-                        disabled={deletingChunkId === chunk.id}
-                        className="rounded-[1rem] border border-rose-200 bg-rose-50 px-4 py-2.5 text-sm font-medium text-rose-700 disabled:cursor-not-allowed disabled:opacity-50"
-                      >
-                        {deletingChunkId === chunk.id ? 'Deleting…' : 'Delete'}
-                      </button>
+                      {canEdit ? (
+                        <button
+                          type="button"
+                          onClick={() => handleDeleteChunk(chunk.id)}
+                          disabled={deletingChunkId === chunk.id}
+                          className="rounded-[1rem] border border-rose-200 bg-rose-50 px-4 py-2.5 text-sm font-medium text-rose-700 disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                          {deletingChunkId === chunk.id ? 'Deleting…' : 'Delete'}
+                        </button>
+                      ) : null}
                     </div>
                   </div>
                 </div>
@@ -684,6 +692,10 @@ export default function ChunkingTab({ project }: Props) {
                                       onChange={(e) =>
                                         handleQuantityChange(chunk.id, item.id, e.target.value)
                                       }
+                                      // Quantity multiplies straight into the
+                                      // package ECC, so it is a cost edit even
+                                      // though it looks like a table cell.
+                                      readOnly={!canEdit}
                                       placeholder="Qty"
                                       title={quantityError}
                                       className={`w-28 rounded-[0.95rem] border bg-white px-3 py-2 text-sm outline-none transition focus:border-teal-500 focus:ring-2 focus:ring-teal-100 ${
@@ -703,7 +715,11 @@ export default function ChunkingTab({ project }: Props) {
 
                 {expanded ? (
                   <div className="border-t border-slate-100 bg-[linear-gradient(180deg,rgba(248,250,252,0.88)_0%,rgba(255,255,255,0.80)_100%)] px-6 py-6">
-                    <div className="grid gap-6 xl:grid-cols-2">
+                    {/* The Add/Remove picker is nothing but a write surface --
+                        there is no reading value in a list of items you cannot
+                        attach. A reader drops straight to the phase editor,
+                        which is worth seeing either way. */}
+                    <div className={canEdit ? 'grid gap-6 xl:grid-cols-2' : 'hidden'}>
                       <div className="rounded-[1.7rem] border border-slate-200 bg-white/90 p-5 shadow-sm">
                         <div className="mb-4 flex items-center justify-between">
                           <div className="text-sm font-semibold text-slate-950">Add</div>
@@ -823,6 +839,7 @@ export default function ChunkingTab({ project }: Props) {
                         defaultTemplateId={costSettings?.defaultPhaseTemplateId ?? null}
                         eccBase={chunkEccBase}
                         tpcFactor={costSettings?.tpcFactor ?? 1}
+                        readOnly={!canEdit}
                         onChanged={reloadPhases}
                       />
                     </div>

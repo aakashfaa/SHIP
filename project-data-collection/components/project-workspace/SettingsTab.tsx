@@ -2,8 +2,10 @@
 
 import { useMemo, useState } from 'react'
 import { CONSULTANT_TYPES } from '@/lib/constants'
-import { updateProject } from '@/lib/store'
-import { ConsultantType, Project } from '@/lib/types'
+import { getTaxonomyForProject, updateProject } from '@/lib/store'
+import { useAsyncData } from '@/lib/useAsyncData'
+import { ConsultantType, Project, ProjectTaxonomyValue } from '@/lib/types'
+import TaxonomyEditor from './TaxonomyEditor'
 
 type Props = {
   project: Project
@@ -23,6 +25,16 @@ function sanitizeTypeId(type: string) {
 
 export default function SettingsTab({ project, onProjectUpdated }: Props) {
   const [isEditing, setIsEditing] = useState(false)
+
+  const {
+    data: taxonomy,
+    error: taxonomyError,
+    reload: reloadTaxonomy,
+  } = useAsyncData<ProjectTaxonomyValue[]>(
+    () => getTaxonomyForProject(project.id),
+    [project.id],
+    []
+  )
   const [message, setMessage] = useState('')
   const [error, setError] = useState('')
   const [isSaving, setIsSaving] = useState(false)
@@ -404,6 +416,22 @@ export default function SettingsTab({ project, onProjectUpdated }: Props) {
             </div>
           )
         })}
+      </div>
+
+      {/* The vocabularies behind the Add Data dropdowns. Lives here rather
+          than on its own tab because it is configuration a project admin sets
+          once and then forgets, which is exactly what Settings is for. */}
+      <div className="rounded-[2rem] bg-gray-50 p-6">
+        {taxonomyError ? (
+          <div className="mb-4 rounded-2xl bg-rose-50 px-4 py-3 text-sm text-rose-700">
+            {taxonomyError.message}
+          </div>
+        ) : null}
+        <TaxonomyEditor
+          projectId={project.id}
+          values={taxonomy}
+          onChanged={reloadTaxonomy}
+        />
       </div>
     </div>
   )

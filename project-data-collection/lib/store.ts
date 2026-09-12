@@ -57,9 +57,11 @@ import {
   ProjectConsultant,
   ProjectCostSettings,
   ProjectEnergySettings,
+  ProjectTaxonomyValue,
   ProjectTimelineSettings,
   Scenario,
   ScenarioPayload,
+  TaxonomyKind,
 } from './types'
 
 const PROJECT_SELECT = '*, project_consultants(*), project_members(*)'
@@ -149,6 +151,24 @@ export async function createProject(input: {
 
   const result = readMutationResult('Failed to create project', data)
   const projectId = result.project_id
+
+  // Seed the building-agnostic taxonomy defaults (building_area, building_level,
+  // category, timeline_priority) -- see migration 0008. This is deliberately
+  // NOT allowed to fail project creation: the project row already exists by
+  // this point, so throwing here would hand the user an error screen for a
+  // project that in fact was created. Per 0008's `taxonomy_value_allowed`,
+  // validation fails OPEN when a project has zero rows for a kind, so a
+  // project that never gets seeded still works end to end -- its dropdowns are
+  // just empty until an admin adds values in Settings. That degraded-but-not-
+  // broken outcome is exactly why this is worth swallowing rather than
+  // surfacing as a fatal error, while still logging it so a real, persistent
+  // failure (as opposed to one flaky RPC call) doesn't go unnoticed.
+  const { error: taxonomyError } = await supabase.rpc('seed_default_taxonomy', {
+    p_project_id: projectId,
+  })
+  if (taxonomyError) {
+    console.error(`Failed to seed default taxonomy for "${projectId}":`, taxonomyError)
+  }
 
   const project = await getProjectById(projectId)
   if (!project) fail('Failed to create project', { message: `project "${projectId}" not readable after creation` })
@@ -980,4 +1000,157 @@ export async function deleteScenario(scenarioId: string): Promise<void> {
   const { error } = await supabase.from('scenarios').delete().eq('id', scenarioId)
 
   if (error) fail('Failed to discard the scenario', error)
+}
+
+/* ------------------------------------------------------------ taxonomies -- */
+
+type TaxonomyRow = {
+  project_id: string
+  kind: string
+  value: string
+  sort_order: number | string | null
+  is_archived: boolean | null
+}
+
+function rowToTaxonomyValue(row: TaxonomyRow): ProjectTaxonomyValue {
+  return {
+    projectId: row.project_id,
+    kind: row.kind as TaxonomyKind,
+    value: row.value,
+    sortOrder: Number(row.sort_order ?? 0),
+    isArchived: row.is_archived === true,
+  }
+}
+
+/**
+ * Every taxonomy value for a project, archived ones included.
+ *
+ * Archived rows come back deliberately. The Settings editor has to show them
+ * (you cannot un-archive what you cannot see), and a line item written before
+ * a value was archived still displays it. Callers building a *new* dropdown
+ * filter them out -- see `taxonomyOptions`.
+ */
+export async function getTaxonomyForProject(
+  projectId: string
+): Promise<ProjectTaxonomyValue[]> {
+  const supabase = getSupabaseBrowserClient()
+
+  const { data, error } = await supabase
+    .from('project_taxonomy_values')
+    .select('*')
+    .eq('project_id', projectId)
+    .order('kind', { ascending: true })
+    .order('sort_order', { ascending: true })
+
+  if (error) fail(`Failed to load taxonomies for "${projectId}"`, error)
+
+  return ((data ?? []) as unknown as TaxonomyRow[]).map(rowToTaxonomyValue)
+}
+
+/**
+ * The live options for one dropdown, in order.
+ *
+ * `current` is the value the record being edited already holds. If that value
+ * has since been archived it is still included, because dropping it would
+ * silently rewrite the record to something else the moment someone opened the
+ * form -- a data change nobody asked for, caused by rendering.
+ */
+export function taxonomyOptions(
+  values: readonly ProjectTaxonomyValue[],
+  kind: TaxonomyKind,
+  current?: string
+): string[] {
+  const options = values
+    .filter((v) => v.kind === kind && !v.isArchived)
+    .sort((a, b) => a.sortOrder - b.sortOrder)
+    .map((v) => v.value)
+
+  if (current && !options.includes(current)) return [current, ...options]
+  return options
+}
+
+export async function addTaxonomyValue(
+  projectId: string,
+  kind: TaxonomyKind,
+  value: string
+): Promise<ProjectTaxonomyValue> {
+  const supabase = getSupabaseBrowserClient()
+  const trimmed = value.trim()
+
+  if (trimmed === '') throw new Error('A taxonomy value cannot be blank.')
+
+  // Append. Working out the next sort order client-side races another editor,
+  // but the consequence is two values sharing a position and sorting by
+  // whatever Postgres returns -- cosmetic, and cheaper than a round trip or a
+  // sequence per (project, kind).
+  const existing = await getTaxonomyForProject(projectId)
+  const nextOrder =
+    existing.filter((v) => v.kind === kind).reduce((max, v) => Math.max(max, v.sortOrder), -1) + 1
+
+  const { data, error } = await supabase
+    .from('project_taxonomy_values')
+    .upsert(
+      {
+        project_id: projectId,
+        kind,
+        value: trimmed,
+        sort_order: nextOrder,
+        is_archived: false,
+      },
+      { onConflict: 'project_id,kind,value' }
+    )
+    .select('*')
+    .single()
+
+  if (error) fail(`Failed to add "${trimmed}"`, error)
+
+  return rowToTaxonomyValue(data as unknown as TaxonomyRow)
+}
+
+/**
+ * Archive or restore a value.
+ *
+ * There is deliberately no delete. A value already written onto line items
+ * cannot be removed from the vocabulary without those rows failing validation
+ * on their next edit -- see the column comment in migration 0008.
+ */
+export async function setTaxonomyValueArchived(
+  projectId: string,
+  kind: TaxonomyKind,
+  value: string,
+  isArchived: boolean
+): Promise<void> {
+  const supabase = getSupabaseBrowserClient()
+
+  const { error } = await supabase
+    .from('project_taxonomy_values')
+    .update({ is_archived: isArchived })
+    .eq('project_id', projectId)
+    .eq('kind', kind)
+    .eq('value', value)
+
+  if (error) fail(`Failed to update "${value}"`, error)
+}
+
+/** Persist a reordering. One upsert per row; the lists are a dozen entries
+ *  long, so a bulk RPC would be machinery for no gain. */
+export async function reorderTaxonomyValues(
+  projectId: string,
+  kind: TaxonomyKind,
+  orderedValues: readonly string[]
+): Promise<void> {
+  const supabase = getSupabaseBrowserClient()
+
+  const rows = orderedValues.map((value, index) => ({
+    project_id: projectId,
+    kind,
+    value,
+    sort_order: index,
+  }))
+
+  const { error } = await supabase
+    .from('project_taxonomy_values')
+    .upsert(rows, { onConflict: 'project_id,kind,value' })
+
+  if (error) fail('Failed to reorder values', error)
 }

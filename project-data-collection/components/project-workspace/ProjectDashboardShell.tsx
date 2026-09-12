@@ -5,6 +5,7 @@ import Link from 'next/link'
 import { useRouter, useSearchParams } from 'next/navigation'
 import { AnimatePresence, motion } from 'framer-motion'
 import { useAuth } from '@/lib/auth-context'
+import { useProjectRole } from '@/lib/project-role'
 import { Project, SafeUser } from '@/lib/types'
 import SettingsTab from './SettingsTab'
 import AddDataTab from './AddDataTab'
@@ -32,30 +33,63 @@ type Tab = {
   icon?: string
 }
 
+/**
+ * What the header eyebrow says. Naming the role is not decoration — a
+ * consultant who cannot work out why the timeline will not drag needs to be
+ * able to see, without asking anyone, that they are a consultant on this
+ * project rather than an editor.
+ *
+ * `none` is the role-still-loading and the not-a-member case. It says
+ * "Workspace" rather than guessing, because claiming "Viewer" at a moment
+ * when the answer is actually "admin" is worse than saying nothing.
+ */
+const ROLE_LABEL: Record<string, string> = {
+  admin: 'Admin Workspace',
+  editor: 'Editor Workspace',
+  consultant: 'Consultant Workspace',
+  viewer: 'Read-only Workspace',
+  none: 'Workspace',
+}
+
 export default function ProjectDashboardShell({
   user,
   project: initialProject,
 }: ProjectDashboardShellProps) {
   const router = useRouter()
   const { signOut } = useAuth()
-  const isAdmin = user.role === 'admin'
   const [project, setProject] = useState(initialProject)
 
-  const tabs: Tab[] = isAdmin
-    ? [
-        { key: 'settings', label: 'Settings', icon: 'S' },
-        { key: 'add-data', label: 'Add Data' },
-        { key: 'master-view', label: 'Master View' },
-        { key: 'chunking', label: 'Chunking' },
-        { key: 'timeline', label: 'Timeline' },
-        { key: 'cost-model', label: 'Cost Model' },
-      ]
-    : [
-        { key: 'add-data', label: 'Add Data' },
-        { key: 'master-view', label: 'Master View' },
-        { key: 'chunking', label: 'Chunking' },
-        { key: 'timeline', label: 'Timeline' },
-      ]
+  /**
+   * Authority is PER PROJECT (migration 0009), not the global
+   * `profiles.role` boolean this used to read. The same person can be an
+   * editor on one project and a viewer on another, which a single
+   * `user.role === 'admin'` check cannot express.
+   *
+   * This decides what to RENDER. RLS decides what is allowed. Every gate
+   * below is re-made in the database on the way to the data, so being
+   * wrong here is a presentation bug, not a security one — but it is
+   * still worth getting right, because a button whose every save is
+   * silently filtered to zero rows reads as the app being broken.
+   */
+  const permissions = useProjectRole(project.id)
+  const { isAdmin, canEdit, canContribute, isViewer } = permissions
+
+  const tabs: Tab[] = [
+    // Members and roles. Project admins only.
+    ...(isAdmin ? [{ key: 'settings' as const, label: 'Settings', icon: 'S' }] : []),
+    // Creating and editing your own line items. A viewer has no write path
+    // at all, so the form would only ever fail for them.
+    ...(canContribute ? [{ key: 'add-data' as const, label: 'Add Data' }] : []),
+    // Read-only surfaces: everyone who can open the project at all.
+    { key: 'master-view', label: 'Master View' },
+    { key: 'chunking', label: 'Chunking' },
+    { key: 'timeline', label: 'Timeline' },
+    // Cost parameters drive every number in the plan. Editors and admins
+    // write them; consultants and viewers read them, because hiding the
+    // factors behind the figures would make the tool feel like it was
+    // lying about where its numbers come from.
+    { key: 'cost-model', label: 'Cost Model' },
+  ]
 
   /**
    * The active tab lives in the URL.
@@ -75,7 +109,11 @@ export default function ProjectDashboardShell({
   const searchParams = useSearchParams()
   const requestedTab = searchParams.get('tab') as TabKey | null
   const isKnownTab = tabs.some((tab) => tab.key === requestedTab)
-  const activeTab: TabKey = isKnownTab ? (requestedTab as TabKey) : 'add-data'
+
+  // Not a hardcoded 'add-data': a viewer has no Add Data tab, and falling
+  // back to a tab that is not in their list would render an empty panel.
+  const fallbackTab: TabKey = tabs[0]?.key ?? 'master-view'
+  const activeTab: TabKey = isKnownTab ? (requestedTab as TabKey) : fallbackTab
 
   const setActiveTab = useCallback(
     (key: TabKey) => {
@@ -92,8 +130,12 @@ export default function ProjectDashboardShell({
   // Normalise a stale or unauthorised ?tab= back into the URL, so the address
   // bar never disagrees with what is on screen.
   useEffect(() => {
-    if (requestedTab && !isKnownTab) setActiveTab('add-data')
-  }, [requestedTab, isKnownTab, setActiveTab])
+    // Wait for the role to resolve. Normalising while `permissions.loading`
+    // is true would rewrite a perfectly good ?tab=cost-model link into the
+    // fallback on every page load, because the tab list is still narrow.
+    if (permissions.loading) return
+    if (requestedTab && !isKnownTab) setActiveTab(fallbackTab)
+  }, [requestedTab, isKnownTab, setActiveTab, fallbackTab, permissions.loading])
 
   async function handleLogout() {
     await signOut()
@@ -107,19 +149,15 @@ export default function ProjectDashboardShell({
           <SettingsTab project={project} onProjectUpdated={setProject} />
         ) : null
       case 'add-data':
-        return <AddDataTab project={project} user={user} />
+        return canContribute ? <AddDataTab project={project} user={user} /> : null
       case 'master-view':
         return <MasterViewTab project={project} />
       case 'chunking':
-        return <ChunkingTab project={project} />
+        return <ChunkingTab project={project} permissions={permissions} />
       case 'timeline':
-        return <TimelineTab project={project} />
-      // Admin-only for now, matching migration 0006's write policy. A
-      // consultant would otherwise get a form whose every save is silently
-      // filtered to zero rows, which reads as the app being broken. 0009
-      // widens the policy and this gate together.
+        return <TimelineTab project={project} permissions={permissions} />
       case 'cost-model':
-        return isAdmin ? <CostModelTab project={project} /> : null
+        return <CostModelTab project={project} permissions={permissions} />
       default:
         return null
     }
@@ -140,7 +178,7 @@ export default function ProjectDashboardShell({
           <div className="flex flex-col gap-5 lg:flex-row lg:items-start lg:justify-between">
             <div>
               <p className="text-xs font-semibold uppercase tracking-[0.25em] text-amber-700/70">
-                {isAdmin ? 'Admin Workspace' : 'Consultant Workspace'}
+                {ROLE_LABEL[permissions.role ?? 'none']}
               </p>
               <h1 className="mt-2 text-3xl font-semibold tracking-tight text-slate-950 md:text-4xl">
                 {project.name}
@@ -152,6 +190,14 @@ export default function ProjectDashboardShell({
                 <div className="rounded-full border border-sky-200 bg-sky-50 px-3 py-1.5 text-xs font-medium text-sky-900">
                   {user.name}
                 </div>
+                {/* Stated once, up front, rather than left to be inferred from
+                    which controls are missing. Someone who cannot edit should
+                    find out by reading, not by trying. */}
+                {!permissions.loading && !canEdit ? (
+                  <div className="rounded-full border border-amber-200 bg-amber-50 px-3 py-1.5 text-xs font-medium text-amber-900">
+                    {isViewer ? 'Read-only access' : 'Cannot edit the plan'}
+                  </div>
+                ) : null}
               </div>
             </div>
 

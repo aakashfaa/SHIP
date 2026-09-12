@@ -45,6 +45,7 @@ import {
   updateTimelineSettingsForProject,
 } from '@/lib/store'
 import { useAsyncData } from '@/lib/useAsyncData'
+import type { ProjectPermissions } from '@/lib/project-role'
 import type {
   ChunkPhase,
   ChunkProject,
@@ -161,7 +162,12 @@ function toEnergySettings(row: ProjectEnergySettings | null): EnergySettings {
   }
 }
 
-type Props = { project: Project }
+type Props = {
+  project: Project
+  /** Resolved by the shell so the whole workspace agrees on one answer and
+   *  the role RPC is not re-issued on every tab switch. */
+  permissions: ProjectPermissions
+}
 
 type ActiveDrag = {
   phaseId: string
@@ -181,7 +187,7 @@ const DEFAULT_TIMELINE_SETTINGS: Omit<ProjectTimelineSettings, 'projectId'> = {
   fiscalYearLabelsBy: 'end_year',
 }
 
-export default function TimelineTab({ project }: Props) {
+export default function TimelineTab({ project, permissions }: Props) {
   const { data: chunkProjects, loading: chunksLoading, error: chunksError } = useAsyncData<
     ChunkProject[]
   >(() => getChunkProjectsForProject(project.id), [project.id], [])
@@ -691,6 +697,11 @@ export default function TimelineTab({ project }: Props) {
   ) {
     if (slotCount <= 0) return
 
+    // Belt and braces with the `readOnly` prop above: the grid stops
+    // rendering the handles, and this refuses the drag even if something
+    // else dispatches one.
+    if (!permissions.canEdit) return
+
     // A locked phase is movable but not resizable. The handles are not
     // rendered at all, so reaching here with a resize mode means something
     // else dispatched it — refuse rather than silently stretching the bar.
@@ -884,7 +895,11 @@ export default function TimelineTab({ project }: Props) {
                 that an Excel spreadsheet pretty easily that we could give to the
                 client. And then we would want a PDF view of the whole phasing
                 schedule." Neither carries the cost model — see lib/export. */}
-            <ExportBar project={project} className="no-print" />
+            {/* R8.4: a viewer does not get the deliverables. They are being
+                shown the plan, not handed a copy of it to pass on. */}
+            {permissions.isViewer ? null : (
+              <ExportBar project={project} className="no-print" />
+            )}
             <div className="rounded-[1rem] border border-slate-200 bg-slate-50 px-4 py-2">
               <div className="text-[10px] font-semibold uppercase tracking-[0.18em] text-slate-500">
                 Total (escalated)
@@ -1041,7 +1056,10 @@ export default function TimelineTab({ project }: Props) {
               bodyHeight={bodyHeight}
               slotCount={slotCount}
               hoveredSlot={hoveredSlot}
-              readOnly={false}
+              // Was hardcoded false. A consultant or viewer gets bars they
+              // can read but not drag -- rather than a grab cursor and a
+              // silent RLS rejection on pointer-up.
+              readOnly={!permissions.canEdit}
               onHoverSlot={setHoveredSlot}
               onToggleExpand={handleToggleExpand}
               onPhasePointerDown={handlePhasePointerDown}

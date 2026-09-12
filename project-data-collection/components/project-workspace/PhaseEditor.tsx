@@ -32,6 +32,11 @@ type Props = {
    *  mutation here reloads the same shared list every other package's editor
    *  reads from. */
   onChanged: () => void
+  /** Render the allocation and timing for reading, with no way to change it.
+   *  Consultants and viewers need to SEE how a package's cost is split across
+   *  design and construction -- that is the substance of the plan -- they just
+   *  do not get to move it. */
+  readOnly?: boolean
 }
 
 const KIND_OPTIONS: PhaseKind[] = ['study', 'design', 'construction', 'closeout']
@@ -51,6 +56,7 @@ export default function PhaseEditor({
   eccBase,
   tpcFactor,
   onChanged,
+  readOnly = false,
 }: Props) {
   const [selectedTemplateId, setSelectedTemplateId] = useState<string | null>(
     defaultTemplateId ?? templates[0]?.id ?? null
@@ -236,7 +242,12 @@ export default function PhaseEditor({
   }
 
   return (
-    <div className="rounded-[2rem] border border-slate-200 bg-white/90 p-5 shadow-sm">
+    /* Same `fieldset disabled` approach as the Cost Model tab: one gate that
+       covers every control inside, including ones added later. */
+    <fieldset
+      disabled={readOnly}
+      className="m-0 min-w-0 rounded-[2rem] border border-slate-200 bg-white/90 p-5 shadow-sm"
+    >
       <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
         <div>
           <div className="text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-500">
@@ -539,6 +550,6 @@ export default function PhaseEditor({
           </div>
         </div>
       )}
-    </div>
+    </fieldset>
   )
 }
