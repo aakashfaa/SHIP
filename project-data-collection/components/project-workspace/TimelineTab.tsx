@@ -1,6 +1,7 @@
 'use client'
 
 import {
+  useCallback,
   useEffect,
   useMemo,
   useRef,
@@ -9,39 +10,63 @@ import {
 } from 'react'
 import { formatCurrency, parseCostInput, parseQuantityInput } from '@/lib/costs'
 import {
+  DEFAULT_COST_SETTINGS,
+  DEFAULT_ENERGY_SETTINGS,
+  computeEnergySeries,
+  computeFiscalYearTotals,
+  computeSlotCosts,
+  fiscalYearLabel,
+  findDependencyViolations,
+  propagateDependencies,
+  slotCount as computeSlotCount,
+  summarisePackage,
+  type CostSettings,
+  type EnergySettings,
+  type PackageInput,
+  type Phase,
+  type PhaseDependency as EnginePhaseDependency,
+  type TimelineGeometry,
+} from '@/lib/cost-model'
+import {
+  getChunkPhasesForProject,
   getChunkProjectsForProject,
+  getCostSettingsForProject,
+  getEnergySettingsForProject,
   getLineItemsForProject,
+  getPhaseDependenciesForProject,
   getTimelineSettingsForProject,
-  updateChunkProject,
+  updateChunkPhase,
   updateTimelineSettingsForProject,
 } from '@/lib/store'
 import { useAsyncData } from '@/lib/useAsyncData'
-import {
+import type {
+  ChunkPhase,
   ChunkProject,
-  ChunkTimelineSegment,
   LineItem,
+  PhaseDependency,
   Project,
+  ProjectCostSettings,
+  ProjectEnergySettings,
   ProjectTimelineSettings,
   TimelineInterval,
 } from '@/lib/types'
+import TimelineGrid, {
+  phaseRowTop,
+  type DragMode,
+  type RowLayout,
+} from './timeline/TimelineGrid'
+import EnergyChart from './timeline/EnergyChart'
+import type { ArrowLink } from './timeline/DependencyArrows'
+import ExportBar from './ExportBar'
+import {
+  BAR_HEIGHT,
+  CELL_WIDTH,
+  PACKAGE_ROW_HEIGHT,
+  PHASE_ROW_HEIGHT,
+  barRect,
+} from './timeline/layout'
 
 const SETTINGS_PERSIST_DEBOUNCE_MS = 400
-
-type Props = {
-  project: Project
-}
-
-type ActiveInteraction = {
-  chunkId: string
-  segmentId: string
-  mode: 'move' | 'resize-start' | 'resize-end'
-  startX: number
-  initialStart: number
-  initialDuration: number
-}
-
-const CELL_WIDTH = 92
-const LABEL_COLUMN_WIDTH = 300
 
 const ZOOM_LEVELS: Array<{ level: number; interval: TimelineInterval; label: string }> = [
   { level: 1, interval: '5-yearly', label: '5 year' },
@@ -51,152 +76,89 @@ const ZOOM_LEVELS: Array<{ level: number; interval: TimelineInterval; label: str
   { level: 5, interval: 'monthly', label: 'Month' },
 ]
 
-function getIntervalForZoom(zoomLevel: number) {
-  return (
-    ZOOM_LEVELS.find((option) => option.level === zoomLevel)?.interval ||
-    ZOOM_LEVELS[2].interval
-  )
+function intervalForZoom(zoomLevel: number): TimelineInterval {
+  return ZOOM_LEVELS.find((z) => z.level === zoomLevel)?.interval ?? 'yearly'
 }
 
-function getZoomLabel(zoomLevel: number) {
-  return ZOOM_LEVELS.find((option) => option.level === zoomLevel)?.label || ZOOM_LEVELS[2].label
+function zoomLabel(zoomLevel: number): string {
+  return ZOOM_LEVELS.find((z) => z.level === zoomLevel)?.label ?? 'Year'
 }
 
-function getSlotCount(years: number, interval: TimelineInterval) {
+function slotLabel(index: number, interval: TimelineInterval): string {
   switch (interval) {
     case 'monthly':
-      return years * 12
+      return `Y${Math.floor(index / 12) + 1} M${(index % 12) + 1}`
     case 'quarterly':
-      return years * 4
-    case 'yearly':
-      return years
-    case 'bi-yearly':
-      return Math.ceil(years / 2)
-    case '3-yearly':
-      return Math.ceil(years / 3)
-    case '5-yearly':
-      return Math.ceil(years / 5)
-    default:
-      return years
-  }
-}
-
-function getSlotStartYear(index: number, interval: TimelineInterval) {
-  switch (interval) {
-    case 'monthly':
-      return index / 12
-    case 'quarterly':
-      return index / 4
-    case 'yearly':
-      return index
-    case 'bi-yearly':
-      return index * 2
-    case '3-yearly':
-      return index * 3
-    case '5-yearly':
-      return index * 5
-    default:
-      return index
-  }
-}
-
-function getSlotLabel(index: number, interval: TimelineInterval, years: number) {
-  switch (interval) {
-    case 'monthly': {
-      const year = Math.floor(index / 12) + 1
-      const month = (index % 12) + 1
-      return `Y${year} M${month}`
-    }
-    case 'quarterly': {
-      const year = Math.floor(index / 4) + 1
-      const quarter = (index % 4) + 1
-      return `Y${year} Q${quarter}`
-    }
+      return `Y${Math.floor(index / 4) + 1} Q${(index % 4) + 1}`
     case 'yearly':
       return `Year ${index + 1}`
-    case 'bi-yearly': {
-      const start = index * 2 + 1
-      const end = Math.min(start + 1, years)
-      return `Y${start}-${end}`
-    }
-    case '3-yearly': {
-      const start = index * 3 + 1
-      const end = Math.min(start + 2, years)
-      return `Y${start}-${end}`
-    }
-    case '5-yearly': {
-      const start = index * 5 + 1
-      const end = Math.min(start + 4, years)
-      return `Y${start}-${end}`
-    }
+    case 'bi-yearly':
+      return `Y${index * 2 + 1}-${index * 2 + 2}`
+    case '3-yearly':
+      return `Y${index * 3 + 1}-${index * 3 + 3}`
+    case '5-yearly':
+      return `Y${index * 5 + 1}-${index * 5 + 5}`
     default:
       return `${index + 1}`
   }
 }
 
-function getEscalationFactor(slotStartYear: number, percent: number, everyYears: number) {
-  if (percent <= 0 || everyYears <= 0) return 1
-
-  const escalationSteps = Math.floor(slotStartYear / everyYears)
-  return (1 + percent / 100) ** escalationSteps
-}
-
-function normalizeSegment(segment: ChunkTimelineSegment) {
+/** Domain row → engine row. The engine deliberately knows nothing about
+ *  Supabase or the wire format, so this is the one place the two meet. */
+function toEnginePhase(phase: ChunkPhase): Phase {
   return {
-    ...segment,
-    start: Math.max(0, Math.round(segment.start)),
-    duration: Math.max(1, Math.round(segment.duration)),
+    id: phase.id,
+    chunkProjectId: phase.chunkProjectId,
+    name: phase.name,
+    kind: phase.kind,
+    sortOrder: phase.sortOrder,
+    pctOfTpc: phase.pctOfTpc,
+    startSlot: phase.startSlot,
+    durationSlots: phase.durationSlots,
+    durationLocked: phase.durationLocked,
   }
 }
 
-function clampSingleSegment(start: number, duration: number, totalSlots: number) {
-  if (totalSlots <= 0) {
-    return { start: 0, duration: 1 }
-  }
-
-  const safeDuration = Math.min(Math.max(Math.round(duration), 1), totalSlots)
-  const maxStart = Math.max(0, totalSlots - safeDuration)
-
+function toEngineDependency(dep: PhaseDependency): EnginePhaseDependency {
   return {
-    start: Math.min(Math.max(Math.round(start), 0), maxStart),
-    duration: safeDuration,
+    id: dep.id,
+    predecessorPhaseId: dep.predecessorPhaseId,
+    successorPhaseId: dep.successorPhaseId,
+    depType: dep.depType,
+    lagSlots: dep.lagSlots,
   }
 }
 
-function clampSegmentAgainstSibling(
-  start: number,
-  duration: number,
-  sibling: ChunkTimelineSegment | undefined,
-  initialStart: number,
-  totalSlots: number
-) {
-  const clamped = clampSingleSegment(start, duration, totalSlots)
-  if (!sibling) return clamped
-
-  const siblingEnd = sibling.start + sibling.duration
-  const beforeSibling = initialStart <= sibling.start
-
-  if (beforeSibling) {
-    const maxStart = Math.max(0, sibling.start - clamped.duration)
-    return {
-      start: Math.min(clamped.start, maxStart),
-      duration: clamped.duration,
-    }
-  }
-
-  const minStart = siblingEnd
+function toCostSettings(row: ProjectCostSettings | null): CostSettings {
+  if (!row) return DEFAULT_COST_SETTINGS
   return {
-    start: Math.max(clamped.start, minStart),
-    duration: clamped.duration,
+    tpcFactor: row.tpcFactor,
+    baseYear: row.baseYear,
+    escalationMode: row.escalationMode,
+    escalationAnnualPercent: row.escalationAnnualPercent,
+    escalationStepYears: row.escalationStepYears,
+    escalationBasis: row.escalationBasis,
+    escalationConfidenceYears: row.escalationConfidenceYears,
+    rateOverrides: new Map(row.rateOverrides.map((o) => [o.yearOffset, o.ratePercent])),
   }
 }
 
-function getChunkLineItemTotal(item: LineItem, quantity: string) {
-  return parseCostInput(item.estimatedFirstCost) * parseQuantityInput(quantity)
+function toEnergySettings(row: ProjectEnergySettings | null): EnergySettings {
+  if (!row) return DEFAULT_ENERGY_SETTINGS
+  return {
+    unitLabel: row.unitLabel,
+    baselineAnnual: row.baselineAnnual,
+    interactionFactor: row.interactionFactor,
+  }
 }
 
-function sortSegments(segments: ChunkTimelineSegment[]) {
-  return [...segments].map(normalizeSegment).sort((a, b) => a.start - b.start)
+type Props = { project: Project }
+
+type ActiveDrag = {
+  phaseId: string
+  mode: DragMode
+  startSlot: number
+  durationSlots: number
 }
 
 const DEFAULT_TIMELINE_SETTINGS: Omit<ProjectTimelineSettings, 'projectId'> = {
@@ -205,42 +167,70 @@ const DEFAULT_TIMELINE_SETTINGS: Omit<ProjectTimelineSettings, 'projectId'> = {
   zoomLevel: 3,
   escalationPercent: 0,
   escalationEveryYears: 1,
+  startCalendarYear: new Date().getUTCFullYear(),
+  fiscalYearStartMonth: 7,
+  fiscalYearLabelsBy: 'end_year',
 }
 
 export default function TimelineTab({ project }: Props) {
-  const {
-    data: chunkProjects,
-    setData: setChunkProjects,
-    loading: chunkProjectsLoading,
-    error: chunkProjectsError,
-  } = useAsyncData<ChunkProject[]>(
-    () => getChunkProjectsForProject(project.id),
+  const { data: chunkProjects, loading: chunksLoading, error: chunksError } = useAsyncData<
+    ChunkProject[]
+  >(() => getChunkProjectsForProject(project.id), [project.id], [])
+
+  const { data: lineItems, error: lineItemsError } = useAsyncData<LineItem[]>(
+    () => getLineItemsForProject(project.id),
     [project.id],
     []
   )
+
   const {
-    data: lineItems,
-    loading: lineItemsLoading,
-    error: lineItemsError,
-  } = useAsyncData<LineItem[]>(() => getLineItemsForProject(project.id), [project.id], [])
+    data: phases,
+    setData: setPhases,
+    error: phasesError,
+  } = useAsyncData<ChunkPhase[]>(() => getChunkPhasesForProject(project.id), [project.id], [])
+
+  const { data: dependencies, error: dependenciesError } = useAsyncData<PhaseDependency[]>(
+    () => getPhaseDependenciesForProject(project.id),
+    [project.id],
+    []
+  )
+
   const {
     data: timelineSettings,
     setData: setTimelineSettings,
-    loading: timelineSettingsLoading,
     error: timelineSettingsError,
   } = useAsyncData<ProjectTimelineSettings>(
     () => getTimelineSettingsForProject(project.id),
     [project.id],
     { projectId: project.id, ...DEFAULT_TIMELINE_SETTINGS }
   )
-  const [activeInteraction, setActiveInteraction] = useState<ActiveInteraction | null>(null)
-  const [segmentSaveError, setSegmentSaveError] = useState<string | null>(null)
-  const [settingsSaveError, setSettingsSaveError] = useState<string | null>(null)
-  const chunkProjectsRef = useRef(chunkProjects)
 
+  const { data: costSettingsRow, error: costSettingsError } =
+    useAsyncData<ProjectCostSettings | null>(
+      () => getCostSettingsForProject(project.id),
+      [project.id],
+      null
+    )
+
+  const { data: energySettingsRow, error: energySettingsError } =
+    useAsyncData<ProjectEnergySettings | null>(
+      () => getEnergySettingsForProject(project.id),
+      [project.id],
+      null
+    )
+
+  const [expanded, setExpanded] = useState<Set<string>>(new Set())
+  const [hoveredSlot, setHoveredSlot] = useState<number | null>(null)
+  const [saveError, setSaveError] = useState<string | null>(null)
+
+  const phasesRef = useRef(phases)
   const isMountedRef = useRef(true)
-  const pendingSettingsUpdateRef = useRef<Partial<ProjectTimelineSettings>>({})
+  const pendingSettingsRef = useRef<Partial<ProjectTimelineSettings>>({})
   const settingsTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  useEffect(() => {
+    phasesRef.current = phases
+  }, [phases])
 
   useEffect(() => {
     isMountedRef.current = true
@@ -250,385 +240,441 @@ export default function TimelineTab({ project }: Props) {
     }
   }, [])
 
-  useEffect(() => {
-    chunkProjectsRef.current = chunkProjects
-  }, [chunkProjects])
+  /* ------------------------------------------------------- derived state -- */
 
-  const timelineInterval = useMemo(
-    () => getIntervalForZoom(timelineSettings.zoomLevel),
-    [timelineSettings.zoomLevel]
+  const costSettings = useMemo(() => toCostSettings(costSettingsRow), [costSettingsRow])
+  const energySettings = useMemo(() => toEnergySettings(energySettingsRow), [energySettingsRow])
+
+  const geometry: TimelineGeometry = useMemo(
+    () => ({
+      interval: intervalForZoom(timelineSettings.zoomLevel),
+      years: timelineSettings.years,
+      startCalendarYear: timelineSettings.startCalendarYear,
+      fiscalYearStartMonth: timelineSettings.fiscalYearStartMonth,
+      fiscalYearLabelsBy: timelineSettings.fiscalYearLabelsBy,
+    }),
+    [timelineSettings]
   )
 
   const slotCount = useMemo(
-    () => getSlotCount(timelineSettings.years, timelineInterval),
-    [timelineInterval, timelineSettings.years]
+    () => computeSlotCount(geometry.years, geometry.interval),
+    [geometry]
   )
 
-  const lineItemMap = useMemo(
-    () => new Map(lineItems.map((item) => [item.id, item])),
-    [lineItems]
-  )
+  const lineItemMap = useMemo(() => new Map(lineItems.map((i) => [i.id, i])), [lineItems])
 
-  const chunkRows = useMemo(() => {
-    return chunkProjects
-      .map((chunk) => {
-        const linkedItems = chunk.itemLinks
-          .map((link) => ({
-            link,
-            item: lineItemMap.get(link.lineItemId),
-          }))
-          .filter(
-            (entry): entry is { link: ChunkProject['itemLinks'][number]; item: LineItem } =>
-              Boolean(entry.item)
-          )
+  /**
+   * Package-level inputs, summed from line items.
+   *
+   * `eccAmount` is the trigger-maintained numeric form of the free-text
+   * `estimatedFirstCost`. It is preferred, with a parse of the text as a
+   * fallback for any row written before migration 0006 backfilled the column —
+   * belt and braces, since a silently-zero cost is the worst failure this
+   * screen can have.
+   */
+  const packageInputs = useMemo<PackageInput[]>(
+    () =>
+      chunkProjects.map((chunk) => {
+        let eccBase = 0
+        let energySavingsAnnual = 0
+        let annualCostSavings = 0
 
-        const totalCost = linkedItems.reduce(
-          (sum, entry) => sum + getChunkLineItemTotal(entry.item, entry.link.quantity),
-          0
-        )
+        for (const link of chunk.itemLinks) {
+          const item = lineItemMap.get(link.lineItemId)
+          if (!item) continue
+          const quantity = parseQuantityInput(link.quantity)
+          const unitCost = item.eccAmount || parseCostInput(item.estimatedFirstCost)
 
-        const segments = sortSegments(chunk.timelineSegments)
+          eccBase += unitCost * quantity
+          energySavingsAnnual += item.annualEnergySavings * quantity
+          annualCostSavings += item.annualCostSavings * quantity
+        }
 
         return {
-          chunk,
-          linkedItems,
-          totalCost,
-          segments,
-          totalTimelineSlots: Math.max(
-            1,
-            segments.reduce((sum, segment) => sum + segment.duration, 0)
-          ),
+          chunkProjectId: chunk.id,
+          chunkNumber: chunk.chunkNumber,
+          name: chunk.name,
+          eccBase,
+          energySavingsAnnual,
+          annualCostSavings,
         }
-      })
+      }),
+    [chunkProjects, lineItemMap]
+  )
+
+  const phasesByChunk = useMemo(() => {
+    const map = new Map<string, ChunkPhase[]>()
+    for (const phase of phases) {
+      map.set(phase.chunkProjectId, [...(map.get(phase.chunkProjectId) ?? []), phase])
+    }
+    for (const list of map.values()) list.sort((a, b) => a.sortOrder - b.sortOrder)
+    return map
+  }, [phases])
+
+  const summaries = useMemo(
+    () =>
+      packageInputs.map((input) =>
+        summarisePackage(
+          input,
+          (phasesByChunk.get(input.chunkProjectId) ?? []).map(toEnginePhase),
+          costSettings,
+          geometry
+        )
+      ),
+    [packageInputs, phasesByChunk, costSettings, geometry]
+  )
+
+  const slotCosts = useMemo(() => computeSlotCosts(summaries, geometry), [summaries, geometry])
+
+  const energySeries = useMemo(
+    () => computeEnergySeries(summaries, energySettings, geometry),
+    [summaries, energySettings, geometry]
+  )
+
+  const fiscalTotals = useMemo(() => computeFiscalYearTotals(slotCosts), [slotCosts])
+
+  const enginePhases = useMemo(() => phases.map(toEnginePhase), [phases])
+  const engineDependencies = useMemo(
+    () => dependencies.map(toEngineDependency),
+    [dependencies]
+  )
+
+  const violations = useMemo(
+    () => findDependencyViolations(enginePhases, engineDependencies),
+    [enginePhases, engineDependencies]
+  )
+  const violatedLinkIds = useMemo(
+    () => new Set(violations.map((v) => v.dependency.id)),
+    [violations]
+  )
+
+  /* -------------------------------------------------------- row geometry -- */
+
+  const rows = useMemo<RowLayout[]>(() => {
+    let top = 0
+    return summaries
+      .slice()
       .sort((a, b) => {
-        if (a.segments[0]?.start !== b.segments[0]?.start) {
-          return (a.segments[0]?.start ?? 0) - (b.segments[0]?.start ?? 0)
-        }
-        return a.chunk.name.localeCompare(b.chunk.name)
+        const aStart = phasesByChunk.get(a.input.chunkProjectId)?.[0]?.startSlot ?? 0
+        const bStart = phasesByChunk.get(b.input.chunkProjectId)?.[0]?.startSlot ?? 0
+        if (aStart !== bStart) return aStart - bStart
+        return a.input.chunkNumber.localeCompare(b.input.chunkNumber)
       })
-  }, [chunkProjects, lineItemMap])
-
-  const slotTotals = useMemo(() => {
-    const totals = Array.from({ length: slotCount }, () => 0)
-
-    chunkRows.forEach((row) => {
-      if (row.totalCost <= 0 || slotCount <= 0) return
-
-      const costPerSlot = row.totalCost / row.totalTimelineSlots
-
-      row.segments.forEach((segment) => {
-        for (let slotIndex = segment.start; slotIndex < segment.start + segment.duration; slotIndex += 1) {
-          if (slotIndex >= 0 && slotIndex < slotCount) {
-            totals[slotIndex] += costPerSlot
-          }
+      .map((summary) => {
+        const chunkPhases = phasesByChunk.get(summary.input.chunkProjectId) ?? []
+        const isExpanded = expanded.has(summary.input.chunkProjectId)
+        const height =
+          PACKAGE_ROW_HEIGHT + (isExpanded ? chunkPhases.length * PHASE_ROW_HEIGHT : 0)
+        const row: RowLayout = {
+          summary,
+          phases: chunkPhases,
+          expanded: isExpanded,
+          top,
+          height,
         }
+        top += height
+        return row
       })
-    })
+  }, [summaries, phasesByChunk, expanded])
 
-    return totals
-  }, [chunkRows, slotCount])
+  const bodyHeight = rows.reduce((sum, row) => sum + row.height, 0)
 
-  const slotCostDetails = useMemo(() => {
-    return slotTotals.map((baseTotal, index) => {
-      const slotStartYear = getSlotStartYear(index, timelineInterval)
-      const escalationFactor = getEscalationFactor(
-        slotStartYear,
-        timelineSettings.escalationPercent,
-        timelineSettings.escalationEveryYears
-      )
-      const escalatedTotal = baseTotal * escalationFactor
+  /**
+   * Pixel rects for every phase, keyed by phase id.
+   *
+   * A phase inside a COLLAPSED package has no bar of its own, so it maps to
+   * its package's summary bar. Without that, every dependency touching a
+   * collapsed package would simply vanish — which reads as "the tool lost my
+   * link" rather than "that row is collapsed".
+   */
+  const phaseRects = useMemo(() => {
+    const rects = new Map<string, { x: number; y: number; width: number; height: number }>()
 
-      return {
-        baseTotal,
-        escalationAmount: escalatedTotal - baseTotal,
-        escalatedTotal,
+    for (const row of rows) {
+      if (row.expanded) {
+        row.phases.forEach((phase, index) => {
+          const rect = barRect(phase.startSlot, phase.durationSlots, PHASE_ROW_HEIGHT)
+          rects.set(phase.id, {
+            x: rect.left,
+            y: phaseRowTop(row, index) + rect.top,
+            width: rect.width,
+            height: BAR_HEIGHT,
+          })
+        })
+        continue
       }
-    })
-  }, [
-    slotTotals,
-    timelineInterval,
-    timelineSettings.escalationEveryYears,
-    timelineSettings.escalationPercent,
-  ])
 
-  const timelineWidth = Math.max(slotCount * CELL_WIDTH, CELL_WIDTH)
+      if (row.phases.length === 0) continue
+      const spanStart = Math.min(...row.phases.map((p) => p.startSlot))
+      const spanEnd = Math.max(...row.phases.map((p) => p.startSlot + p.durationSlots))
+      const rect = barRect(spanStart, spanEnd - spanStart, PACKAGE_ROW_HEIGHT)
 
-  // Persistence for the timeline settings sliders is debounced (trailing, ~400ms) so a drag
-  // doesn't fire a write per pointer event against the database. The local state update above
-  // each call site happens synchronously and immediately, so the UI stays responsive at 60fps —
-  // only the network write is delayed and coalesced.
-  async function flushTimelineSettingsPersist() {
-    const updates = pendingSettingsUpdateRef.current
-    pendingSettingsUpdateRef.current = {}
-    if (Object.keys(updates).length === 0) return
+      for (const phase of row.phases) {
+        rects.set(phase.id, {
+          x: rect.left,
+          y: row.top + rect.top,
+          width: rect.width,
+          height: BAR_HEIGHT,
+        })
+      }
+    }
 
+    return rects
+  }, [rows])
+
+  const links = useMemo<ArrowLink[]>(
+    () =>
+      dependencies.flatMap((dep) => {
+        const predecessor = phaseRects.get(dep.predecessorPhaseId)
+        const successor = phaseRects.get(dep.successorPhaseId)
+        if (!predecessor || !successor) return []
+        return [
+          {
+            id: dep.id,
+            depType: dep.depType,
+            lagSlots: dep.lagSlots,
+            predecessor,
+            successor,
+            violated: violatedLinkIds.has(dep.id),
+          },
+        ]
+      }),
+    [dependencies, phaseRects, violatedLinkIds]
+  )
+
+  /* ------------------------------------------------------------ mutation -- */
+
+  const persistPhases = useCallback(async (changed: ChunkPhase[]) => {
     try {
-      await updateTimelineSettingsForProject(project.id, updates)
-      if (!isMountedRef.current) return
-      setSettingsSaveError(null)
+      await Promise.all(
+        changed.map((phase) =>
+          updateChunkPhase(phase.id, {
+            startSlot: phase.startSlot,
+            durationSlots: phase.durationSlots,
+          })
+        )
+      )
+      if (isMountedRef.current) setSaveError(null)
     } catch (err) {
       if (!isMountedRef.current) return
-      setSettingsSaveError(
-        err instanceof Error ? err.message : 'Failed to save timeline settings.'
-      )
+      setSaveError(err instanceof Error ? err.message : 'Failed to save the schedule.')
     }
-  }
+  }, [])
 
-  function scheduleTimelineSettingsPersist(updates: Partial<ProjectTimelineSettings>) {
-    pendingSettingsUpdateRef.current = { ...pendingSettingsUpdateRef.current, ...updates }
-
-    if (settingsTimerRef.current) clearTimeout(settingsTimerRef.current)
-
-    settingsTimerRef.current = setTimeout(() => {
-      settingsTimerRef.current = null
-      void flushTimelineSettingsPersist()
-    }, SETTINGS_PERSIST_DEBOUNCE_MS)
-  }
-
-  function handleYearsChange(years: number) {
-    setTimelineSettings((prev) => ({ ...prev, years }))
-    scheduleTimelineSettingsPersist({ years })
-  }
-
-  function handleZoomChange(zoomLevel: number) {
-    const interval = getIntervalForZoom(zoomLevel)
-    setTimelineSettings((prev) => ({ ...prev, zoomLevel, interval }))
-    scheduleTimelineSettingsPersist({ zoomLevel, interval })
-  }
-
-  function handleEscalationPercentChange(escalationPercent: number) {
-    setTimelineSettings((prev) => ({ ...prev, escalationPercent }))
-    scheduleTimelineSettingsPersist({ escalationPercent })
-  }
-
-  function handleEscalationEveryYearsChange(escalationEveryYears: number) {
-    setTimelineSettings((prev) => ({ ...prev, escalationEveryYears }))
-    scheduleTimelineSettingsPersist({ escalationEveryYears })
-  }
-
-  function updateChunkSegments(
-    chunkId: string,
-    updater: (segments: ChunkTimelineSegment[]) => ChunkTimelineSegment[]
-  ) {
-    let updatedChunk: ChunkProject | undefined
-
-    setChunkProjects((prev) => {
-      const next = prev.map((chunk) => {
-        if (chunk.id !== chunkId) return chunk
-
-        const timelineSegments = sortSegments(updater(chunk.timelineSegments))
-        const first = timelineSegments[0] || { start: 0, duration: 1 }
-
-        return {
-          ...chunk,
-          timelineSegments,
-          timelineStart: first.start,
-          timelineDuration: first.duration,
-        }
-      })
-
-      updatedChunk = next.find((chunk) => chunk.id === chunkId)
+  const handleToggleExpand = useCallback((chunkProjectId: string) => {
+    setExpanded((prev) => {
+      const next = new Set(prev)
+      if (next.has(chunkProjectId)) next.delete(chunkProjectId)
+      else next.add(chunkProjectId)
       return next
     })
+  }, [])
 
-    if (updatedChunk) {
-      const { timelineSegments, timelineStart, timelineDuration } = updatedChunk
-
-      setSegmentSaveError(null)
-      updateChunkProject(chunkId, { timelineSegments, timelineStart, timelineDuration }).catch(
-        (err) => {
-          if (!isMountedRef.current) return
-          setSegmentSaveError(
-            err instanceof Error ? err.message : 'Failed to save package timeline.'
-          )
-        }
-      )
-    }
-  }
-
-  function handleSplitChunk(chunk: ChunkProject) {
-    if (chunk.timelineSegments.length >= 2 || slotCount <= 1) return
-
-    const source = normalizeSegment(chunk.timelineSegments[0] || {
-      id: `${chunk.id}-segment-1`,
-      start: 0,
-      duration: 1,
-    })
-
-    const firstDuration = Math.max(1, Math.ceil(source.duration / 2))
-    const secondDuration = Math.max(1, source.duration - firstDuration)
-    const secondStart = Math.min(source.start + firstDuration + 1, Math.max(slotCount - secondDuration, 0))
-
-    updateChunkSegments(chunk.id, () => [
-      {
-        id: source.id,
-        start: source.start,
-        duration: firstDuration,
-      },
-      {
-        id: `${chunk.id}-segment-2`,
-        start: secondStart,
-        duration: secondDuration,
-      },
-    ])
-  }
-
-  function handleMergeChunk(chunk: ChunkProject) {
-    if (chunk.timelineSegments.length <= 1) return
-
-    const sorted = sortSegments(chunk.timelineSegments)
-    const start = sorted[0].start
-    const end = Math.max(...sorted.map((segment) => segment.start + segment.duration))
-
-    updateChunkSegments(chunk.id, () => [
-      {
-        id: `${chunk.id}-segment-1`,
-        start,
-        duration: end - start,
-      },
-    ])
-  }
-
-  function startInteraction(
+  /**
+   * Drag / resize a phase bar.
+   *
+   * Local state updates on every pointermove so the bar tracks the cursor at
+   * 60fps; the network write happens exactly once, on pointerup. That is the
+   * pattern v1 established and it is the right one — a write per pointer event
+   * would put hundreds of round trips behind a single drag.
+   *
+   * Dependency propagation also runs once, on drop rather than during the
+   * drag. Cascading every frame makes downstream bars twitch while the user is
+   * still deciding where to put this one.
+   */
+  function handlePhasePointerDown(
     event: ReactPointerEvent<HTMLDivElement>,
-    chunkId: string,
-    segmentId: string,
-    mode: ActiveInteraction['mode'],
-    segment: ChunkTimelineSegment
+    phase: ChunkPhase,
+    mode: DragMode
   ) {
     if (slotCount <= 0) return
+
+    // A locked phase is movable but not resizable. The handles are not
+    // rendered at all, so reaching here with a resize mode means something
+    // else dispatched it — refuse rather than silently stretching the bar.
+    if (phase.durationLocked && mode !== 'move') return
 
     event.preventDefault()
     event.stopPropagation()
 
-    setActiveInteraction({
-      chunkId,
-      segmentId,
+    const origin: ActiveDrag = {
+      phaseId: phase.id,
       mode,
-      startX: event.clientX,
-      initialStart: segment.start,
-      initialDuration: segment.duration,
-    })
+      startSlot: phase.startSlot,
+      durationSlots: phase.durationSlots,
+    }
+    const originX = event.clientX
 
     const onMove = (moveEvent: PointerEvent) => {
-      const deltaSlots = Math.round((moveEvent.clientX - event.clientX) / CELL_WIDTH)
+      const deltaSlots = Math.round((moveEvent.clientX - originX) / CELL_WIDTH)
 
-      setChunkProjects((prev) =>
-        prev.map((chunk) => {
-          if (chunk.id !== chunkId) return chunk
+      setPhases((prev) =>
+        prev.map((candidate) => {
+          if (candidate.id !== origin.phaseId) return candidate
 
-          const currentSegments = sortSegments(chunk.timelineSegments)
-          const sibling = currentSegments.find((item) => item.id !== segmentId)
-
-          const timelineSegments = currentSegments.map((currentSegment) => {
-            if (currentSegment.id !== segmentId) return currentSegment
-
-            if (mode === 'move') {
-              const candidateStart = segment.start + deltaSlots
-              const next = clampSegmentAgainstSibling(
-                candidateStart,
-                segment.duration,
-                sibling,
-                segment.start,
-                slotCount
-              )
-              return { ...currentSegment, ...next }
+          if (origin.mode === 'move') {
+            const maxStart = Math.max(0, slotCount - origin.durationSlots)
+            return {
+              ...candidate,
+              startSlot: Math.min(Math.max(origin.startSlot + deltaSlots, 0), maxStart),
             }
-
-            if (mode === 'resize-start') {
-              const nextStart = segment.start + deltaSlots
-              const nextDuration = segment.duration - deltaSlots
-              const next = clampSegmentAgainstSibling(
-                nextStart,
-                nextDuration,
-                sibling,
-                segment.start,
-                slotCount
-              )
-              return { ...currentSegment, ...next }
-            }
-
-            const next = clampSegmentAgainstSibling(
-              segment.start,
-              segment.duration + deltaSlots,
-              sibling,
-              segment.start,
-              slotCount
-            )
-            return { ...currentSegment, ...next }
-          })
-
-          const sorted = sortSegments(timelineSegments)
-          const first = sorted[0] || { start: 0, duration: 1 }
-
-          return {
-            ...chunk,
-            timelineSegments: sorted,
-            timelineStart: first.start,
-            timelineDuration: first.duration,
           }
+
+          if (origin.mode === 'resize-start') {
+            const nextStart = Math.min(
+              Math.max(origin.startSlot + deltaSlots, 0),
+              origin.startSlot + origin.durationSlots - 1
+            )
+            return {
+              ...candidate,
+              startSlot: nextStart,
+              durationSlots: origin.startSlot + origin.durationSlots - nextStart,
+            }
+          }
+
+          const nextDuration = Math.min(
+            Math.max(origin.durationSlots + deltaSlots, 1),
+            slotCount - origin.startSlot
+          )
+          return { ...candidate, durationSlots: nextDuration }
         })
       )
     }
 
     const onUp = () => {
-      // The drag/resize itself only ever touches local state via onMove above (setChunkProjects,
-      // called on every pointermove). The network write happens exactly once here, on pointer-up.
-      const current = chunkProjectsRef.current.find((chunk) => chunk.id === chunkId)
-      if (current) {
-        setSegmentSaveError(null)
-        updateChunkProject(chunkId, {
-          timelineSegments: current.timelineSegments,
-          timelineStart: current.timelineStart,
-          timelineDuration: current.timelineDuration,
-        }).catch((err) => {
-          if (!isMountedRef.current) return
-          setSegmentSaveError(
-            err instanceof Error ? err.message : 'Failed to save package timeline.'
-          )
-        })
-      }
-
-      setActiveInteraction(null)
       window.removeEventListener('pointermove', onMove)
       window.removeEventListener('pointerup', onUp)
+
+      const current = phasesRef.current
+      const dragged = current.find((p) => p.id === origin.phaseId)
+      if (!dragged) return
+
+      // Push any successor the move has left in violation. Never pulls one
+      // earlier — slack is a decision the planner made.
+      const propagated = propagateDependencies(
+        current.map(toEnginePhase),
+        dependencies.map(toEngineDependency)
+      )
+
+      const next = current.map((phaseRow) => {
+        const moved = propagated.get(phaseRow.id)
+        if (!moved) return phaseRow
+        if (moved.startSlot === phaseRow.startSlot) return phaseRow
+        return { ...phaseRow, startSlot: moved.startSlot }
+      })
+
+      const changed = next.filter((phaseRow, index) => {
+        const before = current[index]
+        return (
+          phaseRow.startSlot !== before.startSlot ||
+          phaseRow.durationSlots !== before.durationSlots
+        )
+      })
+
+      setPhases(next)
+      // `dragged` is always persisted even when propagation moved nothing,
+      // because the drag itself is the change the user made.
+      const toPersist = changed.length > 0 ? changed : [dragged]
+      void persistPhases(toPersist)
     }
 
     window.addEventListener('pointermove', onMove)
     window.addEventListener('pointerup', onUp)
   }
 
+  /* ----------------------------------------------------- settings writes -- */
+
+  function scheduleSettingsPersist(updates: Partial<ProjectTimelineSettings>) {
+    pendingSettingsRef.current = { ...pendingSettingsRef.current, ...updates }
+    if (settingsTimerRef.current) clearTimeout(settingsTimerRef.current)
+    settingsTimerRef.current = setTimeout(() => {
+      settingsTimerRef.current = null
+      const payload = pendingSettingsRef.current
+      pendingSettingsRef.current = {}
+      if (Object.keys(payload).length === 0) return
+      updateTimelineSettingsForProject(project.id, payload).catch((err) => {
+        if (!isMountedRef.current) return
+        setSaveError(
+          err instanceof Error ? err.message : 'Failed to save the timeline settings.'
+        )
+      })
+    }, SETTINGS_PERSIST_DEBOUNCE_MS)
+  }
+
+  function handleYearsChange(years: number) {
+    setTimelineSettings((prev) => ({ ...prev, years }))
+    scheduleSettingsPersist({ years })
+  }
+
+  function handleZoomChange(zoomLevel: number) {
+    const interval = intervalForZoom(zoomLevel)
+    setTimelineSettings((prev) => ({ ...prev, zoomLevel, interval }))
+    scheduleSettingsPersist({ zoomLevel, interval })
+  }
+
+  /* -------------------------------------------------------------- render -- */
+
+  const slotLabels = useMemo(
+    () => Array.from({ length: slotCount }, (_, i) => slotLabel(i, geometry.interval)),
+    [slotCount, geometry.interval]
+  )
+  const fiscalLabels = useMemo(
+    () => Array.from({ length: slotCount }, (_, i) => fiscalYearLabel(i, geometry)),
+    [slotCount, geometry]
+  )
+
+  const loadError =
+    chunksError ??
+    lineItemsError ??
+    phasesError ??
+    dependenciesError ??
+    timelineSettingsError ??
+    costSettingsError ??
+    energySettingsError
+
+  const grandTotal = summaries.reduce((sum, s) => sum + s.totalEscalatedCost, 0)
+  const grandBase = summaries.reduce((sum, s) => sum + s.totalBaseCost, 0)
+
   return (
     <div className="space-y-5">
       <div className="flex flex-col gap-4 rounded-[1.75rem] border border-slate-200 bg-white/86 p-5 shadow-sm">
-        <div>
-          <h2 className="text-xl font-semibold tracking-tight text-slate-950">Timeline</h2>
-          <p className="mt-1 text-sm text-slate-500">
-            Map package chunks across a horizontal timeline, split them into two phases, and
-            see base and escalated cost rolled up by timeline bucket.
-          </p>
-          {(chunkProjectsLoading || lineItemsLoading || timelineSettingsLoading) &&
-          chunkProjects.length === 0 ? (
-            <p className="mt-2 text-xs font-medium text-slate-400">Loading timeline…</p>
-          ) : null}
+        <div className="flex flex-wrap items-start justify-between gap-4">
+          <div>
+            <h2 className="text-xl font-semibold tracking-tight text-slate-950">Timeline</h2>
+            <p className="mt-1 max-w-2xl text-sm text-slate-500">
+              Schedule each package&apos;s phases independently — design can sit years ahead
+              of the construction it belongs to. Costs escalate from where they land.
+            </p>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2">
+            {/* The two deliverables the client actually asked for: "we can make
+                that an Excel spreadsheet pretty easily that we could give to the
+                client. And then we would want a PDF view of the whole phasing
+                schedule." Neither carries the cost model — see lib/export. */}
+            <ExportBar project={project} className="no-print" />
+            <div className="rounded-[1rem] border border-slate-200 bg-slate-50 px-4 py-2">
+              <div className="text-[10px] font-semibold uppercase tracking-[0.18em] text-slate-500">
+                Total (escalated)
+              </div>
+              <div className="text-lg font-semibold text-slate-950">
+                {formatCurrency(grandTotal)}
+              </div>
+              <div className="text-[11px] text-slate-500">
+                base {formatCurrency(grandBase)} · escalation{' '}
+                {formatCurrency(grandTotal - grandBase)}
+              </div>
+            </div>
+          </div>
         </div>
 
-        {chunkProjectsError ||
-        lineItemsError ||
-        timelineSettingsError ||
-        segmentSaveError ||
-        settingsSaveError ? (
+        {loadError || saveError ? (
           <div className="rounded-[1.25rem] border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
-            {segmentSaveError ||
-              settingsSaveError ||
-              chunkProjectsError?.message ||
-              lineItemsError?.message ||
-              timelineSettingsError?.message ||
-              'Something went wrong.'}
+            {saveError ?? loadError?.message ?? 'Something went wrong.'}
           </div>
         ) : null}
 
-        <div className="grid gap-4 xl:grid-cols-[1fr_1fr_1.1fr]">
+        <div className="grid gap-4 xl:grid-cols-3">
           <div className="rounded-[1.25rem] border border-slate-200 bg-slate-50/80 p-4">
             <div className="flex items-center justify-between gap-4">
               <label htmlFor="timeline-years" className="text-sm font-medium text-slate-700">
@@ -638,15 +684,14 @@ export default function TimelineTab({ project }: Props) {
                 {timelineSettings.years} years
               </div>
             </div>
-
             <input
               id="timeline-years"
               type="range"
-              min={0}
+              min={1}
               max={50}
               step={1}
               value={timelineSettings.years}
-              onChange={(event) => handleYearsChange(Number(event.target.value))}
+              onChange={(e) => handleYearsChange(Number(e.target.value))}
               className="mt-4 w-full accent-slate-900"
             />
           </div>
@@ -657,10 +702,9 @@ export default function TimelineTab({ project }: Props) {
                 Zoom
               </label>
               <div className="rounded-full bg-white px-3 py-1 text-sm font-semibold text-slate-900">
-                {getZoomLabel(timelineSettings.zoomLevel)}
+                {zoomLabel(timelineSettings.zoomLevel)}
               </div>
             </div>
-
             <input
               id="timeline-zoom"
               type="range"
@@ -668,224 +712,125 @@ export default function TimelineTab({ project }: Props) {
               max={5}
               step={1}
               value={timelineSettings.zoomLevel}
-              onChange={(event) => handleZoomChange(Number(event.target.value))}
+              onChange={(e) => handleZoomChange(Number(e.target.value))}
               className="mt-4 w-full accent-slate-900"
             />
-
             <div className="mt-3 grid grid-cols-5 text-center text-[10px] font-medium text-slate-500">
-              {ZOOM_LEVELS.map((option) => (
-                <span key={option.level}>{option.label}</span>
+              {ZOOM_LEVELS.map((z) => (
+                <span key={z.level}>{z.label}</span>
               ))}
             </div>
           </div>
 
+          {/* Escalation is READ-ONLY here and edited on the Cost Model tab.
+              It is not a slider you nudge while presenting — changing it
+              re-prices the entire plan, which is a decision, not a gesture. */}
           <div className="rounded-[1.25rem] border border-slate-200 bg-slate-50/80 p-4">
             <div className="text-sm font-medium text-slate-700">Escalation</div>
-            <div className="mt-4 grid grid-cols-2 gap-3">
-              <label className="block">
-                <span className="text-xs font-medium text-slate-500">Increase</span>
-                <div className="mt-1 flex items-center rounded-2xl border border-slate-200 bg-white px-3 py-2 focus-within:border-slate-900">
-                  <input
-                    type="number"
-                    min={0}
-                    step={0.1}
-                    value={timelineSettings.escalationPercent}
-                    onChange={(event) =>
-                      handleEscalationPercentChange(Math.max(0, Number(event.target.value) || 0))
-                    }
-                    className="min-w-0 flex-1 bg-transparent text-sm outline-none"
-                  />
-                  <span className="text-sm font-semibold text-slate-500">%</span>
+            <div className="mt-3 space-y-1 text-sm text-slate-600">
+              <div>
+                <span className="font-semibold text-slate-900">
+                  {costSettings.escalationAnnualPercent}%
+                </span>{' '}
+                {costSettings.escalationMode === 'compound_annual'
+                  ? 'compounding annually'
+                  : `every ${costSettings.escalationStepYears} yrs`}
+              </div>
+              <div className="text-xs text-slate-500">
+                from base year {costSettings.baseYear}, measured to the{' '}
+                {costSettings.escalationBasis} of each phase
+              </div>
+              {costSettings.rateOverrides.size > 0 ? (
+                <div className="text-xs text-slate-500">
+                  {costSettings.rateOverrides.size} year
+                  {costSettings.rateOverrides.size === 1 ? '' : 's'} overridden
                 </div>
-              </label>
-
-              <label className="block">
-                <span className="text-xs font-medium text-slate-500">Every</span>
-                <div className="mt-1 flex items-center rounded-2xl border border-slate-200 bg-white px-3 py-2 focus-within:border-slate-900">
-                  <input
-                    type="number"
-                    min={1}
-                    step={1}
-                    value={timelineSettings.escalationEveryYears}
-                    onChange={(event) =>
-                      handleEscalationEveryYearsChange(
-                        Math.max(1, Math.round(Number(event.target.value) || 1))
-                      )
-                    }
-                    className="min-w-0 flex-1 bg-transparent text-sm outline-none"
-                  />
-                  <span className="text-sm font-semibold text-slate-500">yrs</span>
-                </div>
-              </label>
+              ) : null}
             </div>
+            <p className="mt-3 text-[11px] text-slate-400">Edit on the Cost Model tab.</p>
           </div>
         </div>
       </div>
 
-      {chunkRows.length === 0 ? (
-        <div className="rounded-[2rem] border border-dashed border-slate-300 bg-white/70 px-6 py-16 text-center text-sm font-medium text-slate-400">
-          Create packages in Chunking before scheduling them on the timeline.
+      {violations.length > 0 ? (
+        <div className="rounded-[1.25rem] border border-rose-200 bg-rose-50 px-5 py-4">
+          <div className="text-sm font-semibold text-rose-900">
+            {violations.length} dependenc{violations.length === 1 ? 'y is' : 'ies are'} not
+            satisfied
+          </div>
+          {/* Listed, not auto-repaired. A repair moves work the user placed,
+              and a settings change (shortening the timeline, say) can create
+              these without anyone dragging anything. */}
+          <ul className="mt-2 space-y-1 text-xs text-rose-800">
+            {violations.slice(0, 5).map((violation) => (
+              <li key={violation.dependency.id}>
+                <span className="font-medium">{violation.successor.name}</span> starts at slot{' '}
+                {violation.actualStart} but cannot start before{' '}
+                {violation.requiredStart.toFixed(0)} ({violation.dependency.depType} from{' '}
+                {violation.predecessor.name})
+              </li>
+            ))}
+          </ul>
         </div>
-      ) : slotCount === 0 ? (
-        <div className="rounded-[2rem] border border-dashed border-slate-300 bg-white/70 px-6 py-16 text-center text-sm font-medium text-slate-500">
-          Increase the timeline length above 0 years to place packages.
+      ) : null}
+
+      {rows.length === 0 ? (
+        <div className="rounded-[2rem] border border-dashed border-slate-300 bg-white/70 px-6 py-16 text-center text-sm font-medium text-slate-400">
+          {chunksLoading
+            ? 'Loading timeline…'
+            : 'Create packages in Chunking before scheduling them.'}
         </div>
       ) : (
         <div className="overflow-hidden rounded-[2rem] border border-slate-200 bg-white shadow-sm">
           <div className="overflow-x-auto">
-            <div style={{ minWidth: LABEL_COLUMN_WIDTH + timelineWidth }}>
-              <div
-                className="grid border-b border-slate-200 bg-slate-100"
-                style={{ gridTemplateColumns: `${LABEL_COLUMN_WIDTH}px ${timelineWidth}px` }}
-              >
-                <div className="border-r border-slate-200 px-5 py-4">
-                  <div className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">
-                    Packages
-                  </div>
-                  <div className="mt-1 text-sm text-slate-600">
-                    Drag a box to move it. Drag the left or right edge to resize it.
-                  </div>
-                </div>
-
-                <div>
-                  <div
-                    className="grid border-b border-slate-200"
-                    style={{ gridTemplateColumns: `repeat(${slotCount}, ${CELL_WIDTH}px)` }}
-                  >
-                    {Array.from({ length: slotCount }, (_, index) => (
-                      <div
-                        key={`label-${index}`}
-                        className="border-r border-slate-200 px-2 py-3 text-center text-[11px] font-semibold text-slate-700"
-                      >
-                        {getSlotLabel(index, timelineInterval, timelineSettings.years)}
-                      </div>
-                    ))}
-                  </div>
-
-                  <div
-                    className="grid"
-                    style={{ gridTemplateColumns: `repeat(${slotCount}, ${CELL_WIDTH}px)` }}
-                  >
-                    {slotCostDetails.map((detail, index) => {
-                      const tooltip = [
-                        `Base total: ${formatCurrency(detail.baseTotal)}`,
-                        `Escalation: ${formatCurrency(detail.escalationAmount)}`,
-                        `Total + escalation: ${formatCurrency(detail.escalatedTotal)}`,
-                      ].join('\n')
-
-                      return (
-                        <div
-                          key={`cost-${index}`}
-                          title={tooltip}
-                          className="border-r border-slate-200 px-2 py-3 text-center text-[11px] font-medium text-emerald-700"
-                        >
-                          {formatCurrency(detail.escalatedTotal)}
-                        </div>
-                      )
-                    })}
-                  </div>
-                </div>
-              </div>
-
-              {chunkRows.map((row) => (
-                <div
-                  key={row.chunk.id}
-                  className="grid border-b border-slate-200 last:border-b-0"
-                  style={{ gridTemplateColumns: `${LABEL_COLUMN_WIDTH}px ${timelineWidth}px` }}
-                >
-                  <div className="border-r border-slate-200 bg-white px-5 py-4">
-                    <div className="flex items-center gap-2">
-                      <span className="rounded-full bg-slate-950 px-2.5 py-1 text-[11px] font-semibold text-white">
-                        {row.chunk.chunkNumber}
-                      </span>
-                      <span className="rounded-full bg-emerald-50 px-2.5 py-1 text-[11px] font-semibold text-emerald-800">
-                        {formatCurrency(row.totalCost)}
-                      </span>
-                    </div>
-                    <div className="mt-3 text-sm font-semibold text-slate-950">
-                      {row.chunk.name}
-                    </div>
-                    <div className="mt-1 text-xs text-slate-500">
-                      {row.linkedItems.length} line items
-                    </div>
-                    <div className="mt-3 flex flex-wrap gap-2">
-                      {row.chunk.timelineSegments.length < 2 ? (
-                        <button
-                          type="button"
-                          onClick={() => handleSplitChunk(row.chunk)}
-                          className="rounded-full border border-slate-200 bg-white px-3 py-1.5 text-[11px] font-medium text-slate-700"
-                        >
-                          Split
-                        </button>
-                      ) : (
-                        <button
-                          type="button"
-                          onClick={() => handleMergeChunk(row.chunk)}
-                          className="rounded-full border border-slate-200 bg-white px-3 py-1.5 text-[11px] font-medium text-slate-700"
-                        >
-                          Merge
-                        </button>
-                      )}
-                    </div>
-                  </div>
-
-                  <div
-                    className="relative bg-white"
-                    style={{
-                      minHeight: 92,
-                      backgroundImage:
-                        'repeating-linear-gradient(to right, transparent 0, transparent 91px, rgba(148,163,184,0.24) 91px, rgba(148,163,184,0.24) 92px)',
-                    }}
-                  >
-                    {row.segments.map((segment) => {
-                      const boxLeft = segment.start * CELL_WIDTH + 4
-                      const boxWidth = segment.duration * CELL_WIDTH - 8
-                      const isActive =
-                        activeInteraction?.chunkId === row.chunk.id &&
-                        activeInteraction.segmentId === segment.id
-
-                      return (
-                        <div
-                          key={segment.id}
-                          className={`absolute top-1/2 flex h-12 -translate-y-1/2 items-center rounded-[1rem] border border-sky-300 bg-[linear-gradient(135deg,rgba(15,23,42,0.92)_0%,rgba(30,41,59,0.90)_50%,rgba(14,116,144,0.88)_100%)] px-3 text-white shadow-lg ${
-                            isActive ? 'cursor-grabbing ring-2 ring-sky-200' : 'cursor-grab'
-                          }`}
-                          style={{
-                            left: boxLeft,
-                            width: Math.max(boxWidth, CELL_WIDTH - 8),
-                          }}
-                          onPointerDown={(event) =>
-                            startInteraction(event, row.chunk.id, segment.id, 'move', segment)
-                          }
-                        >
-                          <div
-                            className="absolute bottom-0 left-0 top-0 w-2 cursor-ew-resize rounded-l-[1rem]"
-                            onPointerDown={(event) =>
-                              startInteraction(event, row.chunk.id, segment.id, 'resize-start', segment)
-                            }
-                          />
-                          <div className="min-w-0 flex-1 px-1">
-                            <div className="truncate text-sm font-semibold">{row.chunk.name}</div>
-                            <div className="mt-0.5 text-[11px] text-white/75">
-                              {formatCurrency(row.totalCost / row.totalTimelineSlots)} / slot
-                            </div>
-                          </div>
-                          <div
-                            className="absolute bottom-0 right-0 top-0 w-2 cursor-ew-resize rounded-r-[1rem]"
-                            onPointerDown={(event) =>
-                              startInteraction(event, row.chunk.id, segment.id, 'resize-end', segment)
-                            }
-                          />
-                        </div>
-                      )
-                    })}
-                  </div>
-                </div>
-              ))}
-            </div>
+            <TimelineGrid
+              rows={rows}
+              slotCosts={slotCosts}
+              slotLabels={slotLabels}
+              fiscalYearLabels={fiscalLabels}
+              links={links}
+              bodyHeight={bodyHeight}
+              slotCount={slotCount}
+              hoveredSlot={hoveredSlot}
+              readOnly={false}
+              onHoverSlot={setHoveredSlot}
+              onToggleExpand={handleToggleExpand}
+              onPhasePointerDown={handlePhasePointerDown}
+              onSelectLink={() => undefined}
+            />
+            <EnergyChart
+              series={energySeries}
+              slotCount={slotCount}
+              hoveredSlot={hoveredSlot}
+            />
           </div>
         </div>
       )}
+
+      {fiscalTotals.length > 0 ? (
+        <div className="rounded-[1.75rem] border border-slate-200 bg-white/86 p-5 shadow-sm">
+          <h3 className="text-sm font-semibold text-slate-950">By fiscal year</h3>
+          <p className="mt-1 text-xs text-slate-500">
+            What a capital plan is actually presented as — and what the client has to fit
+            into an annual allocation.
+          </p>
+          <div className="mt-3 flex flex-wrap gap-2">
+            {fiscalTotals.map((year) => (
+              <div
+                key={year.fiscalYear}
+                className="rounded-[1rem] border border-slate-200 bg-slate-50 px-3 py-2"
+              >
+                <div className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">
+                  FY{String(year.fiscalYear % 100).padStart(2, '0')}
+                </div>
+                <div className="text-sm font-semibold text-slate-900">
+                  {formatCurrency(year.escalatedTotal)}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : null}
     </div>
   )
 }

@@ -101,9 +101,13 @@ const ENERGY_USAGE_OPTIONS: RelativeOperationalEnergyUsage[] = [
   'N/A',
 ]
 
+// `eccAmount` is omitted alongside the server-assigned fields because it is
+// derived, not entered: a trigger recomputes it from `estimatedFirstCost` on
+// every write (migration 0006). Putting it in an editable draft would offer the
+// user a field whose value is silently discarded.
 type DraftLineItem = Omit<
   LineItem,
-  'id' | 'createdAt' | 'companyName' | 'discipline' | 'itemNumber'
+  'id' | 'createdAt' | 'companyName' | 'discipline' | 'itemNumber' | 'eccAmount'
 >
 
 type EditableFlagField =
@@ -157,6 +161,9 @@ function makeInitialDraft(project: Project, user: SafeUser): DraftLineItem {
     historicImpact: 'No',
     potentialSynergies: [],
     supportingNotes: '',
+    annualEnergySavings: 0,
+    annualCostSavings: 0,
+    energyNotes: '',
   }
 }
 
@@ -186,6 +193,9 @@ function makeEditableDraft(item: LineItem): DraftLineItem {
     historicImpact: item.historicImpact,
     potentialSynergies: item.potentialSynergies,
     supportingNotes: item.supportingNotes,
+    annualEnergySavings: item.annualEnergySavings,
+    annualCostSavings: item.annualCostSavings,
+    energyNotes: item.energyNotes,
   }
 }
 
@@ -613,6 +623,36 @@ export default function AddDataTab({ project, user }: Props) {
                                 updateEditingDraft(item.id, 'relativeOperationalEnergyUsage', value)
                               }
                             />
+                            <InputField
+                              label="Energy saved / year"
+                              value={
+                                editDraft.annualEnergySavings === 0
+                                  ? ''
+                                  : String(editDraft.annualEnergySavings)
+                              }
+                              onChange={(value) =>
+                                updateEditingDraft(
+                                  item.id,
+                                  'annualEnergySavings',
+                                  Number(value) || 0
+                                )
+                              }
+                            />
+                            <InputField
+                              label="Utility $ saved / year"
+                              value={
+                                editDraft.annualCostSavings === 0
+                                  ? ''
+                                  : String(editDraft.annualCostSavings)
+                              }
+                              onChange={(value) =>
+                                updateEditingDraft(
+                                  item.id,
+                                  'annualCostSavings',
+                                  Number(value) || 0
+                                )
+                              }
+                            />
                             <SelectField
                               label="Electrification / EO 594"
                               value={editDraft.electrificationEO594}
@@ -996,6 +1036,68 @@ export default function AddDataTab({ project, user }: Props) {
                                     }))
                                   }
                                 />
+                              </div>
+
+                              {/* The qualitative pills above stay — they are
+                                  what a consultant can answer on day one. These
+                                  are what the energy engineers deliver later,
+                                  and what the Timeline's reduction chart is
+                                  actually built from. Blank is a legitimate
+                                  answer and means "not quantified yet", which
+                                  is why nothing here is required. */}
+                              <div className="rounded-2xl border border-gray-200 bg-gray-50/70 p-4">
+                                <p className="text-sm font-medium text-gray-700">
+                                  Quantified annual savings
+                                </p>
+                                <p className="mt-1 text-xs text-gray-500">
+                                  Leave blank until an engineer supplies a figure. Units are
+                                  set per project on the Cost Model tab.
+                                </p>
+
+                                <div className="mt-3 grid gap-4 md:grid-cols-2">
+                                  <InputField
+                                    label="Energy saved / year"
+                                    value={
+                                      draft.annualEnergySavings === 0
+                                        ? ''
+                                        : String(draft.annualEnergySavings)
+                                    }
+                                    onChange={(value) =>
+                                      setDraft((prev) => ({
+                                        ...prev,
+                                        annualEnergySavings: Number(value) || 0,
+                                      }))
+                                    }
+                                    placeholder="e.g. 430000"
+                                  />
+                                  <InputField
+                                    label="Utility cost saved / year ($)"
+                                    value={
+                                      draft.annualCostSavings === 0
+                                        ? ''
+                                        : String(draft.annualCostSavings)
+                                    }
+                                    onChange={(value) =>
+                                      setDraft((prev) => ({
+                                        ...prev,
+                                        annualCostSavings: Number(value) || 0,
+                                      }))
+                                    }
+                                    placeholder="e.g. 61000"
+                                  />
+                                </div>
+
+                                <div className="mt-4">
+                                  <TextAreaField
+                                    label="Where did this number come from?"
+                                    rows={3}
+                                    value={draft.energyNotes}
+                                    onChange={(value) =>
+                                      setDraft((prev) => ({ ...prev, energyNotes: value }))
+                                    }
+                                    placeholder="Model, audit level, assumptions — an energy figure with no provenance is not usable in a deliverable six months later."
+                                  />
+                                </div>
                               </div>
 
                               <div>

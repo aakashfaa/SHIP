@@ -14,24 +14,46 @@
 
 import { getSupabaseBrowserClient } from './supabase/client'
 import {
+  ChunkPhaseRow,
   ChunkProjectRow,
+  EscalationRateOverrideRow,
   LineItemRow,
+  PhaseDependencyRow,
+  PhaseTemplateRow,
+  PhaseTemplateStepRow,
+  ProjectCostSettingsRow,
+  ProjectEnergySettingsRow,
   ProjectRow,
   TimelineSettingsRow,
+  chunkPhaseToRow,
+  costSettingsToRow,
+  energySettingsToRow,
   lineItemToRow,
   normalizeTimelineSegments,
+  phaseDependencyToRow,
+  rowToChunkPhase,
   rowToChunkProject,
+  rowToCostSettings,
+  rowToEnergySettings,
   rowToLineItem,
+  rowToPhaseDependency,
+  rowToPhaseTemplate,
   rowToProject,
   rowToTimelineSettings,
   timelineSettingsToRow,
 } from './mappers'
 import {
+  ChunkPhase,
   ChunkProject,
   ConsultantType,
+  DependencyType,
   LineItem,
+  PhaseDependency,
+  PhaseTemplate,
   Project,
   ProjectConsultant,
+  ProjectCostSettings,
+  ProjectEnergySettings,
   ProjectTimelineSettings,
 } from './types'
 
@@ -214,7 +236,14 @@ export async function getLineItemsForProjectUser(
 }
 
 export async function createLineItem(
-  input: Omit<LineItem, 'id' | 'createdAt' | 'companyName' | 'discipline' | 'itemNumber'>
+  input: Omit<
+    LineItem,
+    // `eccAmount` belongs with the other trigger-owned fields: migration 0006
+    // recomputes it from `estimated_first_cost` on every write, so accepting it
+    // here would let a caller believe they had set a cost that the database
+    // immediately overwrote.
+    'id' | 'createdAt' | 'companyName' | 'discipline' | 'itemNumber' | 'eccAmount'
+  >
 ): Promise<LineItem> {
   const supabase = getSupabaseBrowserClient()
 
@@ -467,4 +496,358 @@ export async function updateTimelineSettingsForProject(
   if (error) fail(`Failed to save timeline settings for "${projectId}"`, error)
 
   return rowToTimelineSettings(data as unknown as TimelineSettingsRow, projectId)
+}
+
+/* ------------------------------------------------------------ chunk phases -- */
+// supabase/migrations/0007_ship_phases.sql
+
+export async function getChunkPhasesForProject(projectId: string): Promise<ChunkPhase[]> {
+  const supabase = getSupabaseBrowserClient()
+
+  // chunk_phases carries no project_id of its own -- RLS authorises through
+  // chunk_project_id (ship.can_access_chunk()), which is fine for row-level
+  // security but does not help a query that needs to filter BY project. The
+  // `!inner` modifier is load-bearing here: PostgREST's default embed is a
+  // left join, so a `.eq` on an embedded column only filters which embedded
+  // rows come back, not which top-level rows do -- every phase from every
+  // project would still be returned, just with `chunk_projects: null` on the
+  // ones that don't match. `!inner` turns it into an actual join, which is
+  // what lets the `.eq` act as a WHERE on chunk_phases. Verified against the
+  // local stack.
+  const { data, error } = await supabase
+    .from('chunk_phases')
+    .select('*, chunk_projects!inner(project_id)')
+    .eq('chunk_projects.project_id', projectId)
+    .order('sort_order', { ascending: true })
+
+  if (error) fail(`Failed to load phases for project "${projectId}"`, error)
+
+  return ((data ?? []) as unknown as ChunkPhaseRow[]).map(rowToChunkPhase)
+}
+
+export async function createChunkPhase(
+  input: Omit<ChunkPhase, 'id' | 'createdAt'>
+): Promise<ChunkPhase> {
+  const supabase = getSupabaseBrowserClient()
+
+  const { data, error } = await supabase
+    .from('chunk_phases')
+    .insert(chunkPhaseToRow(input))
+    .select('*')
+    .single()
+
+  if (error) fail('Failed to create phase', error)
+
+  return rowToChunkPhase(data as unknown as ChunkPhaseRow)
+}
+
+export async function updateChunkPhase(
+  id: string,
+  updates: Partial<ChunkPhase>
+): Promise<ChunkPhase | null> {
+  const supabase = getSupabaseBrowserClient()
+
+  const row = chunkPhaseToRow(updates)
+
+  const { data, error } = await supabase
+    .from('chunk_phases')
+    .update(row)
+    .eq('id', id)
+    .select('*')
+    .maybeSingle()
+
+  if (error) fail(`Failed to update phase "${id}"`, error)
+  if (!data) return null
+
+  return rowToChunkPhase(data as unknown as ChunkPhaseRow)
+}
+
+export async function deleteChunkPhase(id: string): Promise<void> {
+  const supabase = getSupabaseBrowserClient()
+
+  const { error } = await supabase.from('chunk_phases').delete().eq('id', id)
+
+  if (error) fail(`Failed to delete phase "${id}"`, error)
+}
+
+/**
+ * Persists a full reorder in one round trip via upsert rather than N
+ * sequential `.update()` calls. PostgREST's upsert compiles to
+ * `INSERT ... ON CONFLICT (id) DO UPDATE SET <only the supplied columns>`,
+ * so it never touches `name`, `kind`, `pct_of_tpc`, etc. There is no insert
+ * branch to worry about in practice: every id here is an existing phase
+ * being reordered, never a new one. `chunk_project_id` is included, at the
+ * value the caller already asserts these phases belong to, purely so a
+ * caller that accidentally passes a foreign id fails loudly (a NOT NULL /
+ * FK mismatch) rather than silently reparenting a phase.
+ */
+export async function reorderChunkPhases(
+  chunkProjectId: string,
+  orderedIds: string[]
+): Promise<void> {
+  const supabase = getSupabaseBrowserClient()
+
+  const rows = orderedIds.map((id, index) => ({
+    id,
+    chunk_project_id: chunkProjectId,
+    sort_order: index,
+  }))
+
+  if (rows.length === 0) return
+
+  const { error } = await supabase.from('chunk_phases').upsert(rows, { onConflict: 'id' })
+
+  if (error) fail(`Failed to reorder phases for chunk "${chunkProjectId}"`, error)
+}
+
+/**
+ * Copies a template's steps into a chunk as new phases, at the template's
+ * default percentages and durations, all starting at slot 0 -- the user
+ * places them on the timeline afterwards. `template_step_id` is kept as
+ * provenance; editing the resulting phase does not reach back into the
+ * template, and editing the template later does not reach into phases
+ * already copied from it (see the header of 0007 on why).
+ */
+export async function applyPhaseTemplateToChunk(
+  chunkProjectId: string,
+  templateId: string
+): Promise<ChunkPhase[]> {
+  const supabase = getSupabaseBrowserClient()
+
+  const { data: stepRows, error: stepError } = await supabase
+    .from('phase_template_steps')
+    .select('*')
+    .eq('template_id', templateId)
+    .order('sort_order', { ascending: true })
+
+  if (stepError) fail(`Failed to load phase template "${templateId}"`, stepError)
+
+  const steps = (stepRows ?? []) as unknown as PhaseTemplateStepRow[]
+  if (steps.length === 0) return []
+
+  const inserts = steps.map((step) => ({
+    chunk_project_id: chunkProjectId,
+    template_step_id: step.id,
+    name: step.name,
+    kind: step.kind,
+    sort_order: step.sort_order,
+    pct_of_tpc: step.default_pct_of_tpc,
+    start_slot: 0,
+    duration_slots: step.default_duration_slots,
+    duration_locked: false,
+  }))
+
+  const { data, error } = await supabase.from('chunk_phases').insert(inserts).select('*')
+
+  if (error) fail(`Failed to apply phase template "${templateId}" to chunk "${chunkProjectId}"`, error)
+
+  return ((data ?? []) as unknown as ChunkPhaseRow[])
+    .slice()
+    .sort((a, b) => (Number(a.sort_order) || 0) - (Number(b.sort_order) || 0))
+    .map(rowToChunkPhase)
+}
+
+/* ------------------------------------------------------ phase dependencies -- */
+
+export async function getPhaseDependenciesForProject(
+  projectId: string
+): Promise<PhaseDependency[]> {
+  const supabase = getSupabaseBrowserClient()
+
+  const { data, error } = await supabase
+    .from('phase_dependencies')
+    .select('*')
+    .eq('project_id', projectId)
+    .order('created_at', { ascending: true })
+
+  if (error) fail(`Failed to load phase dependencies for "${projectId}"`, error)
+
+  return ((data ?? []) as unknown as PhaseDependencyRow[]).map(rowToPhaseDependency)
+}
+
+export async function createPhaseDependency(input: {
+  predecessorPhaseId: string
+  successorPhaseId: string
+  depType?: DependencyType
+  lagSlots?: number
+}): Promise<PhaseDependency> {
+  const supabase = getSupabaseBrowserClient()
+
+  // `project_id` is never sent: ship.sync_phase_dependency_project(), a
+  // BEFORE trigger, derives it from the predecessor phase and refuses a
+  // link whose two endpoints live in different projects. Sending our own
+  // value here would only ever be overwritten or (if it disagreed with what
+  // the trigger computes) misleading about which project this row actually
+  // belongs to.
+  const { data, error } = await supabase
+    .from('phase_dependencies')
+    .insert(phaseDependencyToRow(input))
+    .select('*')
+    .single()
+
+  if (error) fail('Failed to create phase dependency', error)
+
+  return rowToPhaseDependency(data as unknown as PhaseDependencyRow)
+}
+
+export async function deletePhaseDependency(id: string): Promise<void> {
+  const supabase = getSupabaseBrowserClient()
+
+  const { error } = await supabase.from('phase_dependencies').delete().eq('id', id)
+
+  if (error) fail(`Failed to delete phase dependency "${id}"`, error)
+}
+
+/* ---------------------------------------------------------- phase templates -- */
+
+export async function getPhaseTemplates(projectId: string): Promise<PhaseTemplate[]> {
+  const supabase = getSupabaseBrowserClient()
+
+  // Built-ins (`project_id is null`) plus this project's own. Matches the
+  // read policy in 0007 exactly: `(project_id is null) or can_read_project`.
+  const { data, error } = await supabase
+    .from('phase_templates')
+    .select('*, phase_template_steps(*)')
+    .or(`project_id.is.null,project_id.eq.${projectId}`)
+    .order('is_builtin', { ascending: false })
+    .order('name', { ascending: true })
+
+  if (error) fail(`Failed to load phase templates for "${projectId}"`, error)
+
+  return ((data ?? []) as unknown as PhaseTemplateRow[]).map(rowToPhaseTemplate)
+}
+
+/* ------------------------------------------------------------ cost settings -- */
+
+export async function getCostSettingsForProject(projectId: string): Promise<ProjectCostSettings> {
+  const supabase = getSupabaseBrowserClient()
+
+  const [settingsResult, overridesResult] = await Promise.all([
+    supabase.from('project_cost_settings').select('*').eq('project_id', projectId).maybeSingle(),
+    supabase
+      .from('escalation_rate_overrides')
+      .select('*')
+      .eq('project_id', projectId)
+      .order('year_offset', { ascending: true }),
+  ])
+
+  if (settingsResult.error) {
+    fail(`Failed to load cost settings for "${projectId}"`, settingsResult.error)
+  }
+  if (overridesResult.error) {
+    fail(`Failed to load escalation overrides for "${projectId}"`, overridesResult.error)
+  }
+
+  return rowToCostSettings(
+    settingsResult.data as unknown as ProjectCostSettingsRow | null,
+    (overridesResult.data ?? []) as unknown as EscalationRateOverrideRow[],
+    projectId
+  )
+}
+
+/**
+ * Cost settings are admin-write-only under current RLS (0006; widened when
+ * per-project roles land in 0009). A non-admin caller's write does not
+ * necessarily surface as a thrown error -- depending on whether the row
+ * already exists, Postgres either updates 0 rows (USING clause excludes it,
+ * no error) or raises 42501 (WITH CHECK fails on the insert branch). Both
+ * mean the same thing from here, "you don't have permission", and neither
+ * should crash a consultant's read-mostly session. Re-reading afterwards
+ * rather than trusting the upsert's own response is what collapses both
+ * cases to one: the caller always gets back what is actually on record.
+ */
+export async function updateCostSettingsForProject(
+  projectId: string,
+  updates: Partial<ProjectCostSettings>
+): Promise<ProjectCostSettings> {
+  const supabase = getSupabaseBrowserClient()
+
+  const existing = await getCostSettingsForProject(projectId)
+  const row = costSettingsToRow({ ...existing, ...updates, projectId })
+
+  const { error } = await supabase
+    .from('project_cost_settings')
+    .upsert(row, { onConflict: 'project_id' })
+
+  if (error && error.code !== '42501') {
+    fail(`Failed to save cost settings for "${projectId}"`, error)
+  }
+
+  return getCostSettingsForProject(projectId)
+}
+
+export async function setEscalationRateOverride(
+  projectId: string,
+  yearOffset: number,
+  ratePercent: number
+): Promise<void> {
+  const supabase = getSupabaseBrowserClient()
+
+  const { error } = await supabase.from('escalation_rate_overrides').upsert(
+    { project_id: projectId, year_offset: yearOffset, rate_percent: ratePercent },
+    { onConflict: 'project_id,year_offset' }
+  )
+
+  // Same admin-only write / silently-filtered-or-42501 story as
+  // updateCostSettingsForProject above.
+  if (error && error.code !== '42501') {
+    fail(`Failed to set escalation override for "${projectId}" year ${yearOffset}`, error)
+  }
+}
+
+export async function clearEscalationRateOverride(
+  projectId: string,
+  yearOffset: number
+): Promise<void> {
+  const supabase = getSupabaseBrowserClient()
+
+  const { error } = await supabase
+    .from('escalation_rate_overrides')
+    .delete()
+    .eq('project_id', projectId)
+    .eq('year_offset', yearOffset)
+
+  if (error && error.code !== '42501') {
+    fail(`Failed to clear escalation override for "${projectId}" year ${yearOffset}`, error)
+  }
+}
+
+/* ---------------------------------------------------------- energy settings -- */
+
+export async function getEnergySettingsForProject(
+  projectId: string
+): Promise<ProjectEnergySettings> {
+  const supabase = getSupabaseBrowserClient()
+
+  const { data, error } = await supabase
+    .from('project_energy_settings')
+    .select('*')
+    .eq('project_id', projectId)
+    .maybeSingle()
+
+  if (error) fail(`Failed to load energy settings for "${projectId}"`, error)
+
+  return rowToEnergySettings(data as unknown as ProjectEnergySettingsRow | null, projectId)
+}
+
+/** Same admin-only write / RLS-graceful-degradation story as
+ *  updateCostSettingsForProject above. */
+export async function updateEnergySettingsForProject(
+  projectId: string,
+  updates: Partial<ProjectEnergySettings>
+): Promise<ProjectEnergySettings> {
+  const supabase = getSupabaseBrowserClient()
+
+  const existing = await getEnergySettingsForProject(projectId)
+  const row = energySettingsToRow({ ...existing, ...updates, projectId })
+
+  const { error } = await supabase
+    .from('project_energy_settings')
+    .upsert(row, { onConflict: 'project_id' })
+
+  if (error && error.code !== '42501') {
+    fail(`Failed to save energy settings for "${projectId}"`, error)
+  }
+
+  return getEnergySettingsForProject(projectId)
 }

@@ -89,40 +89,41 @@ update ship.project_timeline_settings
 -- ---------------------------------------------------------------------
 -- Energy savings on line items
 --
--- Applied by category rather than to specific item numbers, so the seed
--- survives 001_seed.sql growing more rows. Envelope and mechanical work
--- saves energy; restoration and documentation work does not, which is
--- what produces flat runs between steps on the chart.
+-- Keyed on item_number rather than discipline. Discipline looked tidier and
+-- was wrong: the seeded items contain no Envelope or Plumbing rows at all, so
+-- a discipline-keyed CASE landed savings in exactly two packages, both of
+-- which happened to finish construction in the same year. The chart then drew
+-- a single step, which looks indistinguishable from a broken chart.
 --
--- Units are kBtu/yr, matching project_energy_settings.unit_label above.
--- Nothing enforces that agreement -- the unit is a project-level label
--- precisely because the client does not know their units yet ("We don't
--- know the scale or the units yet, but we can get that soon" -- Megan).
+-- Per-item also lets the numbers mean something. A central plant
+-- decarbonisation saves an order of magnitude more than an emergency power
+-- renewal, and a fixture that pretends otherwise trains the eye wrong.
+--
+-- Units are kBtu/yr, matching project_energy_settings.unit_label below.
+-- Nothing enforces that agreement -- the unit is a per-project free-text label
+-- precisely because the client does not know their units yet ("We don't know
+-- the scale or the units yet, but we can get that soon" -- Megan).
+--
+-- Totals to roughly a third of the 12.5M baseline, which is the right order of
+-- magnitude for a deep retrofit and large enough to actually see on the chart.
 -- ---------------------------------------------------------------------
-update ship.line_items
-   set annual_energy_savings = case discipline
-                                 when 'Mechanical' then 430000
-                                 when 'Envelope'   then 610000
-                                 when 'Electrical' then 185000
-                                 when 'Plumbing'   then  42000
-                                 else 0
-                               end,
-       annual_cost_savings   = case discipline
-                                 when 'Mechanical' then 61000
-                                 when 'Envelope'   then 88000
-                                 when 'Electrical' then 26000
-                                 when 'Plumbing'   then  6000
-                                 else 0
-                               end,
-       energy_notes          = case discipline
-                                 when 'Mechanical' then 'Placeholder pending engineer model. Not a calibrated figure.'
-                                 when 'Envelope'   then 'Placeholder pending engineer model. Not a calibrated figure.'
-                                 when 'Electrical' then 'Placeholder pending engineer model. Not a calibrated figure.'
-                                 when 'Plumbing'   then 'Placeholder pending engineer model. Not a calibrated figure.'
-                                 else ''
-                               end
- where project_id = 'federal-campus-master-plan'
-   and annual_energy_savings = 0;
+update ship.line_items li
+   set annual_energy_savings = v.energy,
+       annual_cost_savings   = v.cost,
+       energy_notes          = case when v.energy > 0
+                                 then 'Placeholder pending engineer model. Not a calibrated figure.'
+                                 else '' end
+  from (values
+          ('M1',  2100000, 295000),   -- Central Plant Decarbonization
+          ('M2',  1150000, 162000),   -- Floor-by-Floor Airside Renewal
+          ('HP1',  480000,  68000),   -- Stone Facade Conservation (air sealing)
+          ('E2',   390000,  55000),   -- Lighting and Controls Modernization
+          ('A3',   160000,  23000),   -- Public Meeting Center Renovation
+          ('E1',   120000,  17000)    -- Emergency Power Renewal
+       ) as v(item_number, energy, cost)
+ where li.project_id = 'federal-campus-master-plan'
+   and li.item_number = v.item_number
+   and li.annual_energy_savings = 0;
 
 -- ---------------------------------------------------------------------
 -- Phases
@@ -144,13 +145,24 @@ declare
   v_chunk      record;
   v_tpl        uuid;
   v_step       record;
-  -- (draft study start, design start, construction start, construction duration)
+  --
+  -- Construction windows are chosen so that (a) the two seeded FS dependencies
+  -- are SATISFIED on load and (b) every package finishes in a different year.
+  --
+  -- (a) matters because a fresh project opening with a red "2 dependencies are
+  -- not satisfied" banner reads as the tool being broken rather than as a
+  -- feature demonstration. Violations should be something the user creates by
+  -- dragging, not something they inherit.
+  --
+  -- (b) matters because the energy chart steps down at construction
+  -- completion. Two packages finishing in the same year merge into one step,
+  -- and a staircase with a single step is indistinguishable from a bug.
   v_layout     int[][] := array[
-    array[0, 1, 3, 4],   -- PP10  design early, build years 3-6
-    array[0, 1, 5, 3],   -- PP11  same design window, build later
-    array[1, 2, 8, 2],   -- PP12  far-out work: past the confidence horizon
-    array[0, 1, 4, 3],   -- PP13
-    array[2, 3, 6, 2]    -- PP14
+    array[0, 1, 3, 4],   -- PP10  design early, build 3..7   -> onset 7
+    array[0, 1, 7, 3],   -- PP11  build 7..10 (FS after PP10) -> onset 10
+    array[1, 2, 11, 2],  -- PP12  far-out: past the confidence horizon
+    array[0, 1, 4, 2],   -- PP13  build 4..6                  -> onset 6
+    array[2, 3, 7, 2]    -- PP14  build 7..9 (FS+1 after PP13) -> onset 9
   ];
   v_idx        int := 0;
   -- Postgres 2-D arrays are NOT arrays-of-arrays: v_layout[i] on a 2-D

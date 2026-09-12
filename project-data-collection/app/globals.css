@@ -64,3 +64,103 @@ textarea::placeholder {
   border-radius: 999px;
   border: 2px solid rgba(255, 255, 255, 0.75);
 }
+
+/* =====================================================================
+ * PDF export (spec R8.2) — a plain browser print, not a server-rendered
+ * PDF. `ExportBar`'s "Export PDF" button just calls `window.print()`; this
+ * stylesheet is the entire implementation of what that produces. It
+ * replaces the `window.open(...).print()` popup hack in
+ * MasterViewTab.tsx's `exportMatrixOnly`, which re-flowed the matrix into
+ * a bare HTML table in a detached window and lost every bar colour,
+ * gradient, and the energy chart's pixel alignment with the grid above it
+ * in the process.
+ *
+ * `.no-print` is an ordinary utility class: apply it to anything that is
+ * export/interaction chrome (ExportBar's own buttons already do). The
+ * other selectors below target markup that already exists in
+ * ProjectDashboardShell.tsx / TimelineGrid.tsx / EnergyChart.tsx by their
+ * REAL Tailwind utility classes — nothing here invents a class name that
+ * isn't already in the compiled output.
+ * ===================================================================== */
+
+@media print {
+  @page {
+    size: A3 landscape;
+    margin: 10mm;
+  }
+
+  /* Bar-chart gradients (package/phase bars) and the energy chart's fills
+   * are the entire point of a printed phasing schedule — without exact
+   * colour reproduction the PDF is a grid of blank boxes. */
+  * ,
+  *::before,
+  *::after {
+    print-color-adjust: exact !important;
+    -webkit-print-color-adjust: exact !important;
+  }
+
+  /* Explicit opt-out for anything that is export/interaction chrome
+   * rather than report content (ExportBar's own two buttons, and any
+   * future caller that wants the same escape hatch). */
+  .no-print {
+    display: none !important;
+  }
+
+  /* ProjectDashboardShell's persistent bottom tab bar. It has no id/class
+   * of its own beyond Tailwind utilities, so it's targeted by the exact
+   * combination that positions it (fixed, pinned to the bottom, centred) —
+   * a fixed-position nav bar has no meaning on a paginated printed page. */
+  .fixed.bottom-6.left-1\/2 {
+    display: none !important;
+  }
+
+  /* ProjectDashboardShell's header Back / Logout actions — the only two
+   * buttons in that header, each with its own distinct utility
+   * combination so this does not also hit unrelated buttons elsewhere
+   * (e.g. ChunkingTab's differently-rounded `rounded-[1rem]` buttons). */
+  a.rounded-2xl.border.border-slate-200.bg-white\/95.px-4.py-3,
+  button.rounded-2xl.bg-slate-950.px-4.py-3 {
+    display: none !important;
+  }
+
+  /* The page's decorative radial/linear-gradient background
+   * (ProjectDashboardShell's outer wrapper). A wash of amber/sky radial
+   * gradients behind a cost table is screen decoration, not a
+   * deliverable — flatten it to plain white paper. */
+  .min-h-screen {
+    background: #fff !important;
+  }
+
+  /* Glass-card dressing (blur + drop shadow) is a screen affordance that
+   * either disappears or prints as a grey smear depending on the engine;
+   * drop it everywhere it appears rather than leave that to chance. */
+  .backdrop-blur-2xl,
+  .backdrop-blur-xl {
+    backdrop-filter: none !important;
+    box-shadow: none !important;
+  }
+
+  /* TimelineGrid: a package's full row (label cell + its bar track) must
+   * stay together, and so must each phase sub-row once expanded — a bar
+   * sliced across a page break is unreadable. Both use this exact grid
+   * class combination. */
+  .grid.border-b.border-slate-200 {
+    break-inside: avoid;
+  }
+
+  /* TimelineGrid: the collapsed package summary bar (rounded-[0.9rem])
+   * and each individual phase bar (rounded-[0.8rem]) — never split a bar
+   * itself even if its row wrapper above already avoids it. */
+  .rounded-\[0\.9rem\],
+  .rounded-\[0\.8rem\] {
+    break-inside: avoid;
+  }
+
+  /* EnergyChart's outer row and the SVG step chart inside it must not be
+   * cut mid-chart — a staircase broken across two pages reads as a
+   * rendering bug, not a page break. */
+  .grid.border-t.border-slate-200.bg-white,
+  svg {
+    break-inside: avoid;
+  }
+}

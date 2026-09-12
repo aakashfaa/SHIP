@@ -11,6 +11,7 @@ import AddDataTab from './AddDataTab'
 import MasterViewTab from './MasterViewTab'
 import ChunkingTab from './ChunkingTab'
 import TimelineTab from './TimelineTab'
+import CostModelTab from './CostModelTab'
 
 type ProjectDashboardShellProps = {
   user: SafeUser
@@ -23,6 +24,7 @@ type TabKey =
   | 'master-view'
   | 'chunking'
   | 'timeline'
+  | 'cost-model'
 
 type Tab = {
   key: TabKey
@@ -46,6 +48,7 @@ export default function ProjectDashboardShell({
         { key: 'master-view', label: 'Master View' },
         { key: 'chunking', label: 'Chunking' },
         { key: 'timeline', label: 'Timeline' },
+        { key: 'cost-model', label: 'Cost Model' },
       ]
     : [
         { key: 'add-data', label: 'Add Data' },
@@ -75,6 +78,12 @@ export default function ProjectDashboardShell({
         return <ChunkingTab project={project} />
       case 'timeline':
         return <TimelineTab project={project} />
+      // Admin-only for now, matching migration 0006's write policy. A
+      // consultant would otherwise get a form whose every save is silently
+      // filtered to zero rows, which reads as the app being broken. 0009
+      // widens the policy and this gate together.
+      case 'cost-model':
+        return isAdmin ? <CostModelTab project={project} /> : null
       default:
         return null
     }
