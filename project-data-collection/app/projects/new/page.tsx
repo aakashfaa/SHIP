@@ -10,6 +10,8 @@ import { ConsultantType, Project, ProjectConsultant } from '@/lib/types'
 
 type ConsultantDraft = ProjectConsultant & {
   emailInput: string
+  // Inline error for the email box (bad format); cleared on the next keystroke.
+  emailError?: string | null
 }
 
 type InviteResult = {
@@ -30,6 +32,10 @@ const createConsultantDraft = (
   emails,
   emailInput: '',
 })
+
+// Deliberately simple: one @, no spaces, a dot in the domain. The server is the
+// real authority; this just catches typos before they are stored and invited.
+const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
 
 const CONSULTANT_THEME: Record<
   ConsultantType,
@@ -152,7 +158,7 @@ export default function NewProjectPage() {
   const [formError, setFormError] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
   const [consultants, setConsultants] = useState<ConsultantDraft[]>([
-    createConsultantDraft('Architecture', 'FAA', ['admin@gmail.com']),
+    createConsultantDraft('Architecture', 'FAA'),
   ])
 
   const [createdProject, setCreatedProject] = useState<Project | null>(null)
@@ -191,7 +197,7 @@ export default function NewProjectPage() {
   function updateConsultant(
     type: ConsultantType,
     field: keyof ConsultantDraft,
-    value: string | string[]
+    value: string | string[] | null
   ) {
     setConsultants((prev) =>
       prev.map((consultant) =>
@@ -218,10 +224,27 @@ export default function NewProjectPage() {
 
     const email = consultant.emailInput.trim().toLowerCase()
     if (!email) return
-    if (consultant.emails.includes(email)) return
+    if (!EMAIL_PATTERN.test(email)) {
+      updateConsultant(type, 'emailError', `"${email}" isn't a valid email address.`)
+      return
+    }
+    if (consultant.emails.includes(email)) {
+      updateConsultant(type, 'emailError', `${email} is already in the list.`)
+      return
+    }
 
-    updateConsultant(type, 'emails', [...consultant.emails, email])
-    updateConsultant(type, 'emailInput', '')
+    setConsultants((prev) =>
+      prev.map((item) =>
+        item.type === type
+          ? {
+              ...item,
+              emails: [...item.emails, email],
+              emailInput: '',
+              emailError: null,
+            }
+          : item
+      )
+    )
   }
 
   function removeEmail(type: ConsultantType, emailToRemove: string) {
@@ -241,6 +264,10 @@ export default function NewProjectPage() {
     }
 
     for (const consultant of consultants) {
+      // Text typed into the email box but never added would be silently lost.
+      if (consultant.emailInput.trim()) {
+        return `You typed "${consultant.emailInput.trim()}" for ${consultant.type} but didn't add it. Click Add (or press Enter) to add it, or clear the box.`
+      }
       if (!consultant.orgName.trim()) {
         return `Please enter an organization name for ${consultant.type}.`
       }
@@ -531,12 +558,26 @@ export default function NewProjectPage() {
                           name={`email-input-${consultant.type}`}
                           value={consultant.emailInput}
                           onChange={(e) =>
-                            updateConsultant(
-                              consultant.type,
-                              'emailInput',
-                              e.target.value
+                            setConsultants((prev) =>
+                              prev.map((item) =>
+                                item.type === consultant.type
+                                  ? {
+                                      ...item,
+                                      emailInput: e.target.value,
+                                      emailError: null,
+                                    }
+                                  : item
+                              )
                             )
                           }
+                          onKeyDown={(e) => {
+                            // Enter adds the email; it must never submit (create) the project.
+                            if (e.key === 'Enter') {
+                              e.preventDefault()
+                              addEmail(consultant.type)
+                            }
+                          }}
+                          aria-invalid={consultant.emailError ? true : undefined}
                           placeholder="name@company.com"
                           className="flex-1 rounded-2xl border border-slate-200 bg-white/95 px-4 py-3 text-sm outline-none transition focus:border-teal-600 focus:ring-2 focus:ring-teal-100"
                         />
@@ -548,6 +589,11 @@ export default function NewProjectPage() {
                           Add
                         </button>
                       </div>
+                      {consultant.emailError && (
+                        <p role="alert" className="mt-2 text-xs text-red-600">
+                          {consultant.emailError}
+                        </p>
+                      )}
                     </div>
                   </div>
 
