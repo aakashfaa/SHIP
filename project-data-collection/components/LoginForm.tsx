@@ -2,20 +2,68 @@
 
 import { useState } from 'react'
 import Link from 'next/link'
-import { useRouter } from 'next/navigation'
 import { getSupabaseBrowserClient } from '@/lib/supabase/client'
+import {
+  authErrorFromHash,
+  readAuthErrorCode,
+  type AuthErrorCode,
+} from '@/lib/supabase/redirects'
+import { useLocationHash, useQueryParam } from '@/lib/supabase/use-location'
+
+// The sign-in card on `/`.
+//
+// Navigation after a successful sign-in is deliberately NOT done here. The
+// page (`app/page.tsx`) redirects as soon as the auth context has loaded the
+// ship.profiles row — to `?next=` if it's a safe same-origin path, else
+// /projects, or /no-access. Navigating from here, before the profile arrived,
+// is what caused the /projects → / → /projects bounce with a flash of an
+// empty sign-in form (UX-7). Until then the button simply stays on
+// "Signing in...".
+//
+// `?auth_error=` (set by /auth/confirm and /auth/callback when an email link
+// is expired, already used, or mangled) and Supabase's own `#error_code=`
+// fragment become a plain-language banner instead of the silent "nothing
+// happened" users used to get (UX-5).
+
+const BANNERS: Record<AuthErrorCode, string> = {
+  link_expired:
+    "That link has expired or has already been used. Sign in with your password, or reset it below. If you were invited and haven't set a password yet, ask your project admin to resend the invite.",
+  link_invalid:
+    "That link didn't work. It may have been copied incompletely. Try the button in the email again, or sign in below.",
+  session_expired: 'You were signed out. Please sign in again.',
+}
+
+function friendlySignInError(error: { code?: string; message: string }): string {
+  if (error.code === 'invalid_credentials' || /invalid login credentials/i.test(error.message)) {
+    return "That email and password don't match. Try again, or reset your password."
+  }
+  if (error.code === 'email_not_confirmed' || /email not confirmed/i.test(error.message)) {
+    return 'Please confirm your email first. Check your inbox for the link we sent.'
+  }
+  if (error.code === 'over_request_rate_limit' || error.code === 'too_many_requests') {
+    return 'Too many attempts. Please wait a minute and try again.'
+  }
+  return 'Could not sign you in. Please try again.'
+}
 
 export default function LoginForm() {
-  const router = useRouter()
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [error, setError] = useState('')
+  const [bannerDismissed, setBannerDismissed] = useState(false)
   const [loading, setLoading] = useState(false)
+
+  const authErrorParam = useQueryParam('auth_error')
+  const hash = useLocationHash()
+  const banner: AuthErrorCode | null = bannerDismissed
+    ? null
+    : (readAuthErrorCode(authErrorParam) ?? authErrorFromHash(hash))
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault()
     setLoading(true)
     setError('')
+    setBannerDismissed(true)
 
     const supabase = getSupabaseBrowserClient()
     const { error: signInError } = await supabase.auth.signInWithPassword({
@@ -24,18 +72,22 @@ export default function LoginForm() {
     })
 
     if (signInError) {
-      setError(signInError.message)
+      setError(friendlySignInError(signInError))
       setLoading(false)
       return
     }
-
-    router.replace('/projects')
+    // Success: stay in the "Signing in..." state; app/page.tsx redirects
+    // once the profile has loaded.
   }
+
+  const forgotHref = email.trim()
+    ? `/auth/forgot?email=${encodeURIComponent(email.trim())}`
+    : '/auth/forgot'
 
   return (
     <div className="w-full max-w-md rounded-[2rem] border border-white/70 bg-white/76 p-8 shadow-[0_30px_100px_rgba(15,23,42,0.16)] backdrop-blur-2xl">
       <div className="mb-8">
-        <p className="mb-2 text-xs font-semibold uppercase tracking-[0.25em] text-amber-700/70">
+        <p className="mb-2 text-xs font-semibold uppercase tracking-[0.25em] text-amber-800">
           Master Plan Dashboard
         </p>
         <h1 className="text-4xl font-semibold tracking-tight text-slate-950">
@@ -45,6 +97,16 @@ export default function LoginForm() {
           Sign in to access your project workspaces, line-item data, and package views.
         </p>
       </div>
+
+      {banner ? (
+        <div
+          role="alert"
+          data-testid="auth-error-banner"
+          className="mb-4 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm leading-6 text-amber-900"
+        >
+          {BANNERS[banner]}
+        </div>
+      ) : null}
 
       <form onSubmit={handleSubmit} className="space-y-4">
         <div>
@@ -67,12 +129,20 @@ export default function LoginForm() {
         </div>
 
         <div>
-          <label
-            htmlFor="login-password"
-            className="mb-2 block text-sm font-medium text-slate-700"
-          >
-            Password
-          </label>
+          <div className="mb-2 flex items-baseline justify-between gap-2">
+            <label
+              htmlFor="login-password"
+              className="block text-sm font-medium text-slate-700"
+            >
+              Password
+            </label>
+            <Link
+              href={forgotHref}
+              className="text-sm font-medium text-teal-700 hover:text-teal-800"
+            >
+              Forgot password?
+            </Link>
+          </div>
           <input
             id="login-password"
             name="password"
@@ -86,7 +156,10 @@ export default function LoginForm() {
         </div>
 
         {error ? (
-          <div className="rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">
+          <div
+            role="alert"
+            className="rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700"
+          >
             {error}
           </div>
         ) : null}

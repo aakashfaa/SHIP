@@ -164,7 +164,9 @@ site_url = "http://127.0.0.1:3000"
 # The public URL that Auth serves on. Defaults to the API external URL with `/auth/v1` appended.
 # external_url = ""
 # A list of *exact* URLs that auth providers are permitted to redirect to post authentication.
-additional_redirect_urls = ["https://127.0.0.1:3000"]
+# SHIP builds its own email links (lib/email/links.ts -> /auth/confirm on
+# APP_URL), so these only matter for the legacy /auth/callback route.
+additional_redirect_urls = ["https://127.0.0.1:3000", "http://127.0.0.1:3100", "http://127.0.0.1:3410"]
 # How long tokens are valid for, in seconds. Defaults to 3600 (1 hour), maximum 604,800 (1 week).
 jwt_expiry = 3600
 # JWT issuer URL. If not set, defaults to auth.external_url.
@@ -183,7 +185,9 @@ enable_anonymous_sign_ins = false
 # Allow/disallow testing manual linking of accounts
 enable_manual_linking = false
 # Passwords shorter than this value will be rejected as weak. Minimum 6, recommended 8 or more.
-minimum_password_length = 6
+# 8, not 6: matches the app (sign-up / set-password pages and /api/auth/sign-up
+# all require 8). The hosted project must be set the same way (D-6, PREFLIGHT.md).
+minimum_password_length = 8
 # Passwords that do not meet the following requirements will be rejected as weak. Supported values
 # are: `letters_digits`, `lower_upper_letters_digits`, `lower_upper_letters_digits_symbols`
 password_requirements = ""
@@ -227,7 +231,11 @@ enable_signup = true
 # addresses. If disabled, only the new email is required to confirm.
 double_confirm_changes = true
 # If enabled, users need to confirm their email address before signing in.
-enable_confirmations = false
+# ON (D-6, M-16). With it off, whoever signed up first with an invited address
+# got a session and claimed the invite. SHIP never relies on Supabase to SEND
+# the confirmation email: /api/auth/sign-up uses auth.admin.generateLink and
+# emails the link itself via Resend (or local Mailpit).
+enable_confirmations = true
 # If enabled, users will need to reauthenticate or have logged in recently to change their password.
 secure_password_change = false
 # Controls the minimum amount of time that must pass before sending another signup confirmation or password reset email.
@@ -235,7 +243,9 @@ max_frequency = "1s"
 # Number of characters used in the email OTP.
 otp_length = 6
 # Number of seconds before the email OTP expires (defaults to 1 hour).
-otp_expiry = 3600
+# 24h, so an invite opened the next morning still works. lib/email/links.ts
+# (linkExpiryHours) quotes this in the email copy; keep them in sync.
+otp_expiry = 86400
 
 # Use a production-ready SMTP server
 # [auth.email.smtp]

@@ -191,3 +191,41 @@ A `service_role` (secret) API key and the database password are available throug
 5. **[Low] Leaked-password protection is disabled** (`auth_leaked_password_protection` advisor finding) and several RLS policies re-evaluate `auth.uid()` per-row instead of `(select auth.uid())` (performance-only). Pre-existing, unrelated to the SHIP rollout, listed here only so future advisor diffs can distinguish pre-existing findings from anything SHIP introduces. Full pre-existing advisor findings (7 security WARN, 11 performance INFO/WARN) were captured during this audit and are available on request if a baseline diff file is wanted.
 
 6. **[Info] Row-count baseline captured in §2 above** — re-run the same `n_live_tup` query after `ship` deployment to prove the other app's tables were undisturbed.
+
+---
+
+## 7. Auth email launch checklist (added in the pre-launch fix wave, WS-2)
+
+Since D-6, **every** SHIP auth email (invite, "you've been added to a project", sign-up confirmation, password reset) is built and sent by SHIP's own server through the Resend REST API (`lib/email/send.ts`). Supabase's mailer is never asked to send anything: the code never calls `inviteUserByEmail`, client `signUp`, or `resetPasswordForEmail`. It uses `auth.admin.generateLink(...)` server-side and emails a link to `${APP_URL}/auth/confirm?token_hash=…&type=…`, which verifies it with `verifyOtp`.
+
+Before inviting real users, an operator must do all of these:
+
+**Vercel / server environment**
+- [ ] `APP_URL` = the production URL (e.g. `https://ship.example.com`, no trailing slash). Required: email links are built only from it, never from the request's Host header.
+- [ ] `RESEND_API_KEY` set (server-only, never `NEXT_PUBLIC_`).
+- [ ] `EMAIL_FROM` set to an address on the verified domain, e.g. `Master Plan Dashboard <no-reply@ship.example.com>`. Optional `EMAIL_REPLY_TO`.
+- [ ] Without `RESEND_API_KEY`, production refuses to send (reports a per-email error) rather than silently sending nowhere.
+
+**Resend**
+- [ ] Add and **verify the sending domain** (SPF and DKIM DNS records; add DMARC). Unverified domains can only send to the account owner.
+- [ ] Send yourself one invite and one reset from production and check they land in the inbox, not spam.
+- [ ] Note the plan's sending limits. The app spaces sends to stay under Resend's default 2 requests/second and retries once on 429.
+
+**Supabase Dashboard → Authentication** (this project is shared with another production app; agree each change with its owner first)
+- [ ] **URL Configuration → Redirect URLs:** add `https://<production-domain>/**` (and any preview domain you test with). SHIP's own links go to `/auth/confirm` directly, but the allow-list still guards `/auth/callback` and any `redirectTo`. Do **not** change the Site URL if the other app depends on it.
+- [ ] **Providers → Email → Confirm email: ON** (D-6). Today the hosted project has `mailer_autoconfirm: true` (§4), which lets whoever signs up first with an invited address claim it (M-16). SHIP's sign-up never relies on Supabase sending the confirmation, so this doesn't add Supabase-sent mail for SHIP users. **But it does change sign-up for the other app**, which is why it needs its owner's agreement.
+- [ ] **Minimum password length: 8** (matches the app).
+- [ ] **Email OTP expiration: 86400** (24 h), so an invite opened the next day still works. If you keep a different value, set `AUTH_LINK_EXPIRY_HOURS` to match, because the email copy quotes it.
+- [ ] Leave the built-in email templates alone. SHIP does not use them.
+
+**After deploy, smoke test**
+- [ ] Invite a brand-new address from Settings. The email arrives, the button opens `/auth/set-password`, choosing a password lands in the project.
+- [ ] Invite an address that already has an account. The email has **no** token link (plain sign-in page with `?next=`), and after sign-in a "You've been added to …" toast appears.
+- [ ] "Forgot password?" round trip works.
+- [ ] Opening an already-used link shows the "That link has expired or has already been used" banner on the sign-in page.
+
+The automated version of these checks is `tests/app/ws2-invite.spec.ts` (local stack + Mailpit).
+
+**Migrations on the hosted project**
+- [ ] After applying migrations (0013 onward) to the hosted project, run `notify pgrst, 'reload schema';` in the SQL editor so PostgREST sees the new functions and tables (`project_access_notices`, `update_project`'s new argument, the bulk-write RPCs). Without it the API answers "function not found" until its next schema reload.
+- [ ] Verify the `service_role` can reach the `ship` schema after migrations (0013 grants `usage` on `ship`, `select` on its tables, and writes on `pending_invites` / `project_access_notices`). Before 0013 every server-side admin call failed with "permission denied for schema ship", so the invite route never worked. Quick check in the SQL editor: `select has_schema_privilege('service_role', 'ship', 'usage');` → `true`.

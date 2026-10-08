@@ -280,7 +280,7 @@ export default function NewProjectPage() {
     return null
   }
 
-  async function sendInvites(emails: string[]) {
+  async function sendInvites(emails: string[], projectId: string) {
     setInviteLoading(true)
     setInviteError(null)
 
@@ -288,7 +288,7 @@ export default function NewProjectPage() {
       const res = await fetch('/api/admin/invite', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ emails }),
+        body: JSON.stringify({ emails, projectId }),
       })
 
       if (!res.ok) {
@@ -334,8 +334,15 @@ export default function NewProjectPage() {
       setInvitedEmails(result.invitedEmails)
       setSubmitting(false)
 
-      if (result.invitedEmails.length > 0) {
-        await sendInvites(result.invitedEmails)
+      // Everyone on the new roster, not just result.invitedEmails: that list
+      // only holds addresses that had no pending invite yet, so a person who
+      // already has an account would get neither the "added to <project>"
+      // email nor the in-app notice. The route works out which is which.
+      const rosterEmails = [
+        ...new Set(consultants.flatMap((consultant) => consultant.emails)),
+      ]
+      if (rosterEmails.length > 0) {
+        await sendInvites(rosterEmails, result.project.id)
       }
     } catch (err) {
       setSubmitting(false)

@@ -5,6 +5,7 @@ import { motion } from 'framer-motion'
 import { useRouter } from 'next/navigation'
 import LoginForm from '@/components/LoginForm'
 import { useAuth } from '@/lib/auth-context'
+import { safeNextPath } from '@/lib/supabase/redirects'
 
 export default function HomePage() {
   const router = useRouter()
@@ -12,7 +13,14 @@ export default function HomePage() {
 
   useEffect(() => {
     if (user) {
-      router.replace('/projects')
+      // `?next=` is set when a signed-out user opened a deep link (the
+      // project page sends them here with it) or followed a "you've been
+      // added to <project>" email (D-7). Only same-origin relative paths are
+      // honoured; see lib/supabase/redirects.ts. Read from window rather than
+      // useSearchParams so this statically prerendered page needs no
+      // Suspense boundary.
+      const next = safeNextPath(new URLSearchParams(window.location.search).get('next'))
+      router.replace(next ?? '/projects')
       return
     }
 
@@ -24,7 +32,7 @@ export default function HomePage() {
   if (loading || user || noAccess) {
     return (
       <main className="flex min-h-screen items-center justify-center bg-[radial-gradient(circle_at_top_left,_rgba(251,191,36,0.18),_transparent_26%),radial-gradient(circle_at_top_right,_rgba(45,212,191,0.18),_transparent_28%),linear-gradient(180deg,_#fffdf7_0%,_#f8fafc_50%,_#eef2f7_100%)] px-4">
-        <p className="text-sm text-slate-500">Redirecting...</p>
+        <p className="text-sm text-slate-500">{loading ? 'Loading...' : 'Redirecting...'}</p>
       </main>
     )
   }

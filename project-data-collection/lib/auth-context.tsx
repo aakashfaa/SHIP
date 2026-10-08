@@ -16,6 +16,20 @@ type AuthContextValue = {
   user: SafeUser | null
   loading: boolean
   noAccess: boolean
+  /**
+   * The user HAS a ship.profiles row, but an admin turned it off
+   * (`is_active = false`). Always paired with `noAccess = true`; /no-access
+   * uses it to say "your access was turned off" instead of "ask to be added",
+   * and to hide "Check again", which can never help them (UX-13 / M-31).
+   */
+  deactivated: boolean
+  /**
+   * Signed in, but the email address isn't confirmed yet, so claim_invite
+   * (0013) refuses with hint `email_not_confirmed`. /no-access shows "confirm
+   * your email first" with a resend button instead of "ask to be added".
+   */
+  unconfirmed: boolean
+  /** Signs out and always ends on the sign-in page (full navigation). */
   signOut: () => Promise<void>
 }
 
@@ -25,6 +39,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<SafeUser | null>(null)
   const [loading, setLoading] = useState(true)
   const [noAccess, setNoAccess] = useState(false)
+  const [deactivated, setDeactivated] = useState(false)
+  const [unconfirmed, setUnconfirmed] = useState(false)
   const supabase = getSupabaseBrowserClient()
 
   // Guards against a stale async profile lookup clobbering state when the
@@ -47,6 +63,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         if (requestId !== requestIdRef.current) return
         setUser(null)
         setNoAccess(false)
+        setDeactivated(false)
         setLoading(false)
         return
       }
@@ -58,6 +75,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         .maybeSingle()
 
       if (requestId !== requestIdRef.current) return
+      setDeactivated(false)
 
       if (error) {
         // Unexpected failure on the select itself (network, RLS misconfig,
@@ -72,6 +90,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         if (data.is_active === false) {
           setUser(null)
           setNoAccess(true)
+          setDeactivated(true)
           setLoading(false)
           return
         }
@@ -115,6 +134,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         if (claimError.code !== '42501') {
           console.error('claim_invite failed in auth provider:', claimError)
         }
+        setUnconfirmed(
+          claimError.hint === 'email_not_confirmed' || !session.user.email_confirmed_at
+        )
         setUser(null)
         setNoAccess(true)
         setLoading(false)
@@ -132,6 +154,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       if (reloadError || !claimedProfile || claimedProfile.is_active === false) {
         setUser(null)
         setNoAccess(true)
+        setDeactivated(claimedProfile?.is_active === false)
         setLoading(false)
         return
       }
@@ -167,14 +190,26 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }
   }, [supabase, loadProfile])
 
+  // Always ends on `/` with a full navigation. Callers used to be responsible
+  // for navigating afterwards, and /no-access forgot to, so its "Sign out"
+  // button cleared the session but left the page exactly as it was (UX-3 /
+  // M-31). A full navigation (not router.replace) also drops every piece of
+  // in-memory state from the previous user. A failed network sign-out still
+  // clears the local session (`scope: 'local'` fallback) so the user is never
+  // stuck signed in.
   const signOut = useCallback(async () => {
-    await supabase.auth.signOut()
+    const { error } = await supabase.auth.signOut()
+    if (error) await supabase.auth.signOut({ scope: 'local' })
     setUser(null)
     setNoAccess(false)
+    setDeactivated(false)
+    setUnconfirmed(false)
+    // eslint-disable-next-line @next/next/no-location-assign-relative-destination -- a full reload is deliberate: it drops every bit of the previous user's in-memory state
+    window.location.assign('/')
   }, [supabase])
 
   return (
-    <AuthContext.Provider value={{ user, loading, noAccess, signOut }}>
+    <AuthContext.Provider value={{ user, loading, noAccess, deactivated, unconfirmed, signOut }}>
       {children}
     </AuthContext.Provider>
   )
