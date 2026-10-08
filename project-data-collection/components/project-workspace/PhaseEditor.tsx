@@ -58,12 +58,17 @@ export default function PhaseEditor({
   onChanged,
   readOnly = false,
 }: Props) {
-  const [selectedTemplateId, setSelectedTemplateId] = useState<string | null>(
-    defaultTemplateId ?? templates[0]?.id ?? null
-  )
+  // The user's explicit pick, if any. Until they pick, the effective choice
+  // follows the project default / first template as those props load in
+  // (derived at render rather than synced from an effect).
+  const [pickedTemplateId, setSelectedTemplateId] = useState<string | null>(null)
+  const selectedTemplateId = pickedTemplateId ?? defaultTemplateId ?? templates[0]?.id ?? null
   const [applyingTemplate, setApplyingTemplate] = useState(false)
   const [addingPhase, setAddingPhase] = useState(false)
   const [deletingId, setDeletingId] = useState<string | null>(null)
+  // Two-step inline confirm (no window.confirm): the first click on Delete
+  // only arms this; the second, on "Confirm delete", actually deletes.
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null)
   const [movingId, setMovingId] = useState<string | null>(null)
   const [savingId, setSavingId] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -78,16 +83,13 @@ export default function PhaseEditor({
 
   useEffect(() => {
     isMountedRef.current = true
+    const pending = timers.current
     return () => {
       isMountedRef.current = false
-      timers.current.forEach((timer) => clearTimeout(timer))
-      timers.current.clear()
+      pending.forEach((timer) => clearTimeout(timer))
+      pending.clear()
     }
   }, [])
-
-  useEffect(() => {
-    setSelectedTemplateId((current) => current ?? defaultTemplateId ?? templates[0]?.id ?? null)
-  }, [defaultTemplateId, templates])
 
   const tpcBase = eccBase * tpcFactor
 
@@ -194,6 +196,7 @@ export default function PhaseEditor({
 
   async function handleDeletePhase(phaseId: string) {
     setError(null)
+    setConfirmDeleteId(null)
     setDeletingId(phaseId)
     try {
       await deleteChunkPhase(phaseId)
@@ -517,15 +520,42 @@ export default function PhaseEditor({
                         {formatCurrency(derivedCost)}
                       </td>
                       <td className="px-3 py-3 align-top">
-                        <button
-                          type="button"
-                          onClick={() => handleDeletePhase(phase.id)}
-                          disabled={deletingId === phase.id}
-                          aria-label={`Delete ${phase.name || 'phase'}`}
-                          className="rounded-[0.85rem] border border-rose-200 bg-rose-50 px-3 py-2 text-xs font-semibold text-rose-700 disabled:cursor-not-allowed disabled:opacity-50"
-                        >
-                          {deletingId === phase.id ? '…' : 'Delete'}
-                        </button>
+                        {confirmDeleteId === phase.id ? (
+                          <div className="flex flex-col gap-1.5">
+                            <span className="text-[11px] text-rose-700">
+                              Delete this phase? Can&apos;t be undone.
+                            </span>
+                            <div className="flex gap-1.5">
+                              <button
+                                type="button"
+                                onClick={() => handleDeletePhase(phase.id)}
+                                disabled={deletingId === phase.id}
+                                aria-label={`Confirm delete ${phase.name || 'phase'}`}
+                                className="rounded-[0.85rem] bg-rose-600 px-3 py-2 text-xs font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50"
+                              >
+                                {deletingId === phase.id ? '…' : 'Confirm delete'}
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setConfirmDeleteId(null)}
+                                disabled={deletingId === phase.id}
+                                className="rounded-[0.85rem] border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-700 disabled:opacity-50"
+                              >
+                                Cancel
+                              </button>
+                            </div>
+                          </div>
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={() => setConfirmDeleteId(phase.id)}
+                            disabled={deletingId === phase.id}
+                            aria-label={`Delete ${phase.name || 'phase'}`}
+                            className="rounded-[0.85rem] border border-rose-200 bg-rose-50 px-3 py-2 text-xs font-semibold text-rose-700 disabled:cursor-not-allowed disabled:opacity-50"
+                          >
+                            Delete
+                          </button>
+                        )}
                       </td>
                     </tr>
                   )

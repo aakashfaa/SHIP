@@ -156,13 +156,16 @@ function OptionsEditor({
   )
   const fixedSet = FIXED_OPTION_SET_KEYS.has(field.key)
 
-  async function run(action: () => Promise<unknown>) {
+  async function run(action: () => Promise<unknown>, refetchOnError = false) {
     setBusy(true)
     setError(null)
     try {
       await action()
       onChanged()
     } catch (err) {
+      // A failed reorder leaves the list on screen out of step with the
+      // database (or with whoever else is editing), so reorders re-fetch.
+      if (refetchOnError) onChanged()
       // Verbatim: `ship.form_field_options` errors and the client-side
       // blank check below are both meant to be read, not paraphrased.
       setError(err instanceof Error ? err.message : 'Something went wrong.')
@@ -198,8 +201,12 @@ function OptionsEditor({
     if (target < 0 || target >= next.length) return
     ;[next[index], next[target]] = [next[target], next[index]]
 
-    void run(() =>
-      reorderFieldOptions(field.id, [...next.map((o) => o.id), ...archived.map((o) => o.id)])
+    // The full ordered id list (active in their new order, then archived),
+    // which the reorder RPC renumbers 0..n-1 in one statement.
+    void run(
+      () =>
+        reorderFieldOptions(field.id, [...next.map((o) => o.id), ...archived.map((o) => o.id)]),
+      true
     )
   }
 
@@ -708,7 +715,14 @@ export default function FormBuilder({ projectId, fields, onChanged, readOnly = f
       return f
     })
 
-    await reorderFormFields(projectId, next.map((f) => f.id))
+    try {
+      await reorderFormFields(projectId, next.map((f) => f.id))
+    } catch (err) {
+      // Re-fetch so the list shows what the database really holds, then
+      // rethrow so the row's own error banner shows the message.
+      onChanged()
+      throw err
+    }
   }
 
   return (

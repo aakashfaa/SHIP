@@ -12,14 +12,29 @@ import {
   getChunkProjectsForProject,
   getCostSettingsForProject,
   getLineItemsForProject,
+  getPhaseDependenciesForProject,
   getPhaseTemplates,
   removeLineItemFromChunkProject,
   updateChunkProject,
   updateChunkProjectItemQuantity,
 } from '@/lib/store'
 import { useAsyncData } from '@/lib/useAsyncData'
-import { formatCurrency, parseCostInput, parseQuantityInput } from '@/lib/costs'
-import { ChunkPhase, ChunkProject, LineItem, PhaseTemplate, Project, ProjectCostSettings } from '@/lib/types'
+import {
+  QUANTITY_PARSE_MESSAGES,
+  formatCurrency,
+  parseCostInput,
+  parseQuantity,
+  quantityInputFeedback,
+} from '@/lib/costs'
+import {
+  ChunkPhase,
+  ChunkProject,
+  LineItem,
+  PhaseDependency,
+  PhaseTemplate,
+  Project,
+  ProjectCostSettings,
+} from '@/lib/types'
 import PhaseEditor from '@/components/project-workspace/PhaseEditor'
 import type { ProjectPermissions } from '@/lib/project-role'
 
@@ -106,8 +121,19 @@ function itemNumberSort(a: string, b: string) {
   return Number(aNum) - Number(bNum)
 }
 
+/**
+ * Reads the shared strict quantity parser (lib/costs.ts `parseQuantity`):
+ * commas and a trailing unit are fine ("1,200 sf"), 0 is zero, blank is one
+ * unit, and non-numeric / negative text is invalid and must not be saved.
+ */
+function readQuantity(text: string): { ok: boolean; value: number; message: string } {
+  const result = parseQuantity(text)
+  if (!result.ok) return { ok: false, value: 0, message: QUANTITY_PARSE_MESSAGES[result.reason] }
+  return { ok: true, value: result.quantity ?? 1, message: '' }
+}
+
 function getLineItemTotal(item: LineItem, quantity: string) {
-  return parseCostInput(item.estimatedFirstCost) * parseQuantityInput(quantity)
+  return parseCostInput(item.estimatedFirstCost) * readQuantity(quantity).value
 }
 
 export default function ChunkingTab({ project, permissions }: Props) {
@@ -132,7 +158,6 @@ export default function ChunkingTab({ project, permissions }: Props) {
   )
   const {
     data: allLineItems,
-    loading: lineItemsLoading,
     error: lineItemsError,
   } = useAsyncData<LineItem[]>(
     async () => {
@@ -152,6 +177,13 @@ export default function ChunkingTab({ project, permissions }: Props) {
     error: phasesError,
     reload: reloadPhases,
   } = useAsyncData<ChunkPhase[]>(() => getChunkPhasesForProject(project.id), [project.id], [])
+  // Only used to name, in the delete confirm, how many dependency links go
+  // with a package (a link row cascades when either of its phases goes).
+  const { data: allDependencies, reload: reloadDependencies } = useAsyncData<PhaseDependency[]>(
+    () => getPhaseDependenciesForProject(project.id),
+    [project.id],
+    []
+  )
   const { data: phaseTemplates } = useAsyncData<PhaseTemplate[]>(
     () => getPhaseTemplates(project.id),
     [project.id],
@@ -171,6 +203,8 @@ export default function ChunkingTab({ project, permissions }: Props) {
   const [editingName, setEditingName] = useState('')
   const [isCreatingChunk, setIsCreatingChunk] = useState(false)
   const [deletingChunkId, setDeletingChunkId] = useState<string | null>(null)
+  // Two-step inline confirm (no window.confirm): first click arms, second deletes.
+  const [confirmDeleteChunkId, setConfirmDeleteChunkId] = useState<string | null>(null)
   const [savingEditChunkId, setSavingEditChunkId] = useState<string | null>(null)
   const [addingItemKey, setAddingItemKey] = useState<string | null>(null)
   const [removingItemKey, setRemovingItemKey] = useState<string | null>(null)
@@ -183,10 +217,11 @@ export default function ChunkingTab({ project, permissions }: Props) {
 
   useEffect(() => {
     isMountedRef.current = true
+    const pending = quantityTimers.current
     return () => {
       isMountedRef.current = false
-      quantityTimers.current.forEach((timer) => clearTimeout(timer))
-      quantityTimers.current.clear()
+      pending.forEach((timer) => clearTimeout(timer))
+      pending.clear()
     }
   }, [])
 
@@ -254,12 +289,15 @@ export default function ChunkingTab({ project, permissions }: Props) {
 
   async function handleDeleteChunk(chunkId: string) {
     setActionError(null)
+    setConfirmDeleteChunkId(null)
     setDeletingChunkId(chunkId)
     try {
       await deleteChunkProject(chunkId)
       if (!isMountedRef.current) return
 
       reloadChunks()
+      reloadPhases()
+      reloadDependencies()
 
       if (expandedChunkId === chunkId) setExpandedChunkId(null)
       if (editingChunkId === chunkId) {
@@ -340,6 +378,13 @@ export default function ChunkingTab({ project, permissions }: Props) {
     return quantityDrafts[key] ?? fallback
   }
 
+  // What the totals should price: the draft while it parses, otherwise the
+  // last saved quantity (so an invalid half-typed value never moves the money).
+  function getPricedQuantity(chunkId: string, lineItemId: string, fallback: string) {
+    const effective = getEffectiveQuantity(chunkId, lineItemId, fallback)
+    return readQuantity(effective).ok ? effective : fallback
+  }
+
   async function persistQuantityChange(chunkId: string, lineItemId: string, quantity: string) {
     const key = getQuantityKey(chunkId, lineItemId)
     try {
@@ -374,6 +419,22 @@ export default function ChunkingTab({ project, permissions }: Props) {
 
     const existingTimer = quantityTimers.current.get(key)
     if (existingTimer) clearTimeout(existingTimer)
+
+    // Invalid text is never persisted (it used to be stored verbatim and then
+    // silently priced as 1). The user's text stays in the box with an inline
+    // error until they fix it; totals keep using the last saved quantity.
+    const parsedQuantity = readQuantity(quantity)
+    if (!parsedQuantity.ok) {
+      quantityTimers.current.delete(key)
+      setQuantityErrors((prev) => ({ ...prev, [key]: parsedQuantity.message }))
+      return
+    }
+    setQuantityErrors((prev) => {
+      if (!(key in prev)) return prev
+      const next = { ...prev }
+      delete next[key]
+      return next
+    })
 
     const timer = setTimeout(() => {
       quantityTimers.current.delete(key)
@@ -481,7 +542,7 @@ export default function ChunkingTab({ project, permissions }: Props) {
                 sum +
                 getLineItemTotal(
                   entry.item,
-                  getEffectiveQuantity(chunk.id, entry.item.id, entry.link.quantity)
+                  getPricedQuantity(chunk.id, entry.item.id, entry.link.quantity)
                 ),
               0
             )
@@ -495,13 +556,25 @@ export default function ChunkingTab({ project, permissions }: Props) {
             const chunkEccBase = linkedItems.reduce(
               (sum, entry) =>
                 sum +
-                entry.item.eccAmount *
-                  parseQuantityInput(
-                    getEffectiveQuantity(chunk.id, entry.item.id, entry.link.quantity)
-                  ),
+                // Null = unanswered or unreadable cost (0019); it prices as $0
+                // here, the same as on the Timeline and in the export.
+                (entry.item.eccAmount ?? 0) *
+                  readQuantity(
+                    getPricedQuantity(chunk.id, entry.item.id, entry.link.quantity)
+                  ).value,
               0
             )
             const chunkPhases = phasesByChunk.get(chunk.id) ?? []
+            // What a package delete takes with it, for the confirm text.
+            const chunkPhaseIds = new Set(chunkPhases.map((p) => p.id))
+            const chunkLinks = allDependencies.filter(
+              (d) =>
+                chunkPhaseIds.has(d.predecessorPhaseId) || chunkPhaseIds.has(d.successorPhaseId)
+            )
+            const crossPackageLinks = chunkLinks.filter(
+              (d) =>
+                !(chunkPhaseIds.has(d.predecessorPhaseId) && chunkPhaseIds.has(d.successorPhaseId))
+            ).length
 
             const availableItems = allLineItems.filter(
               (item) => !chunk.itemLinks.some((link) => link.lineItemId === item.id)
@@ -594,8 +667,12 @@ export default function ChunkingTab({ project, permissions }: Props) {
                       {canEdit || permissionsLoading ? (
                         <button
                           type="button"
-                          onClick={() => handleDeleteChunk(chunk.id)}
-                          disabled={!canEdit || deletingChunkId === chunk.id}
+                          onClick={() => setConfirmDeleteChunkId(chunk.id)}
+                          disabled={
+                            !canEdit ||
+                            deletingChunkId === chunk.id ||
+                            confirmDeleteChunkId === chunk.id
+                          }
                           className="rounded-[1rem] border border-rose-200 bg-rose-50 px-4 py-2.5 text-sm font-medium text-rose-700 disabled:cursor-not-allowed disabled:opacity-50"
                         >
                           {deletingChunkId === chunk.id ? 'Deleting…' : 'Delete'}
@@ -603,6 +680,42 @@ export default function ChunkingTab({ project, permissions }: Props) {
                       ) : null}
                     </div>
                   </div>
+
+                  {confirmDeleteChunkId === chunk.id ? (
+                    <div
+                      role="alertdialog"
+                      aria-label={`Confirm delete package ${chunk.chunkNumber}`}
+                      className="mt-4 flex flex-col gap-3 rounded-[1.25rem] border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-800 md:flex-row md:items-center md:justify-between"
+                    >
+                      <span>
+                        Delete {chunk.chunkNumber} &ldquo;{chunk.name}&rdquo;? This also deletes its{' '}
+                        {chunkPhases.length} {chunkPhases.length === 1 ? 'phase' : 'phases'} and{' '}
+                        {chunkLinks.length} dependency {chunkLinks.length === 1 ? 'link' : 'links'}
+                        {crossPackageLinks > 0
+                          ? ` (${crossPackageLinks} used by other packages)`
+                          : ''}
+                        . Can&apos;t be undone.
+                      </span>
+                      <span className="flex gap-2">
+                        <button
+                          type="button"
+                          onClick={() => handleDeleteChunk(chunk.id)}
+                          disabled={deletingChunkId === chunk.id}
+                          className="rounded-[1rem] bg-rose-600 px-4 py-2 text-sm font-medium text-white disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                          Confirm delete
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setConfirmDeleteChunkId(null)}
+                          disabled={deletingChunkId === chunk.id}
+                          className="rounded-[1rem] border border-slate-200 bg-white px-4 py-2 text-sm font-medium text-slate-700 disabled:opacity-50"
+                        >
+                          Cancel
+                        </button>
+                      </span>
+                    </div>
+                  ) : null}
                 </div>
 
                 <div className="px-6 py-6">
@@ -700,6 +813,8 @@ export default function ChunkingTab({ project, permissions }: Props) {
                                   </td>
                                   <td className="px-4 py-3 align-top">
                                     <input
+                                      aria-label={`Quantity for ${item.itemNumber}`}
+                                      aria-invalid={quantityError ? true : undefined}
                                       value={effectiveQuantity}
                                       onChange={(e) =>
                                         handleQuantityChange(chunk.id, item.id, e.target.value)
@@ -714,6 +829,18 @@ export default function ChunkingTab({ project, permissions }: Props) {
                                         quantityError ? 'border-red-300' : 'border-slate-200'
                                       }`}
                                     />
+                                    {quantityError ? (
+                                      <div
+                                        role="alert"
+                                        className="mt-1 max-w-[11rem] text-xs text-red-600"
+                                      >
+                                        {quantityError}
+                                      </div>
+                                    ) : quantityInputFeedback(effectiveQuantity).kind === 'ok' ? (
+                                      <div className="mt-1 text-xs text-slate-500">
+                                        {quantityInputFeedback(effectiveQuantity).message}
+                                      </div>
+                                    ) : null}
                                   </td>
                                 </tr>
                               )
