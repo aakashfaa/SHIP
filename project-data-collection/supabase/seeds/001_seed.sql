@@ -430,14 +430,18 @@ on conflict do nothing;
 -- Timeline tab behaves identically either way.
 -- NOTE the column is `interval_unit`, not `interval` (reserved word).
 -- ---------------------------------------------------------------------
+-- start_calendar_year is NOT NULL since migration 0018 and is a fixed
+-- fact about the project (M-25): the year it was created, never the
+-- year the seed happens to run.
 insert into ship.project_timeline_settings
-  (project_id, years, interval_unit, zoom_level, escalation_percent, escalation_every_years)
+  (project_id, years, interval_unit, zoom_level, escalation_percent, escalation_every_years,
+   start_calendar_year)
 values
-  ('federal-campus-master-plan', 15, 'yearly', 3, 0, 5)
+  ('federal-campus-master-plan', 15, 'yearly', 3, 0, 5, 2026)
 on conflict (project_id) do nothing;
 
-insert into ship.project_timeline_settings (project_id)
-select p.id from ship.projects p
+insert into ship.project_timeline_settings (project_id, start_calendar_year)
+select p.id, extract(year from p.created_at)::integer from ship.projects p
 on conflict (project_id) do nothing;
 
 -- =====================================================================

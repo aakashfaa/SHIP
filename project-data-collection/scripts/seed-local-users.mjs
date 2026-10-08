@@ -62,17 +62,49 @@ async function createUser(email) {
       Authorization: `Bearer ${SERVICE_ROLE}`,
       'Content-Type': 'application/json',
     },
+    // email_confirm: ship.claim_invite() (migration 0013) refuses an address
+    // whose auth.users.email_confirmed_at is NULL.
     body: JSON.stringify({ email, password: PASSWORD, email_confirm: true }),
   })
 
   if (res.ok) return 'created'
 
   const body = await res.json().catch(() => ({}))
-  // GoTrue returns 422 email_exists on re-run; that is success for our purposes.
+  // GoTrue returns 422 email_exists on re-run; that is success for our
+  // purposes -- as long as the existing account is confirmed.
   if (res.status === 422 || /already been registered|email_exists/i.test(JSON.stringify(body))) {
-    return 'exists'
+    return ensureConfirmed(email)
   }
   throw new Error(`${email}: HTTP ${res.status} ${JSON.stringify(body)}`)
+}
+
+/**
+ * An account that already exists may have been created unconfirmed (an
+ * earlier sign-up or invite while email confirmation was on). Since 0013 an
+ * unconfirmed seed user would sign in and then land on /no-access, because
+ * claim_invite() refuses it. Confirm it in place.
+ */
+async function ensureConfirmed(email) {
+  const headers = {
+    apikey: SERVICE_ROLE,
+    Authorization: `Bearer ${SERVICE_ROLE}`,
+    'Content-Type': 'application/json',
+  }
+
+  const list = await fetch(`${API}/auth/v1/admin/users?page=1&per_page=1000`, { headers })
+  if (!list.ok) throw new Error(`${email}: listing users failed, HTTP ${list.status}`)
+  const { users = [] } = await list.json()
+  const user = users.find((u) => (u.email ?? '').toLowerCase() === email.toLowerCase())
+  if (!user) throw new Error(`${email}: GoTrue reports it exists, but it is not in the user list`)
+  if (user.email_confirmed_at) return 'exists'
+
+  const res = await fetch(`${API}/auth/v1/admin/users/${user.id}`, {
+    method: 'PUT',
+    headers,
+    body: JSON.stringify({ email_confirm: true }),
+  })
+  if (!res.ok) throw new Error(`${email}: confirming failed, HTTP ${res.status}`)
+  return 'confirmed'
 }
 
 assertLocal(API)
@@ -80,7 +112,7 @@ assertLocal(API)
 console.log(`Seeding local users against ${API}\n`)
 for (const { email, note } of USERS) {
   const status = await createUser(email)
-  console.log(`  ${status.padEnd(8)} ${email.padEnd(24)} ${note}`)
+  console.log(`  ${status.padEnd(9)} ${email.padEnd(24)} ${note}`)
 }
 console.log(`\nPassword for all of the above: ${PASSWORD}`)
 console.log(`Emails (invites, magic links) are captured by Mailpit, not sent.`)
