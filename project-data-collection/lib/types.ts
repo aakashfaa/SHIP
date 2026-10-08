@@ -34,6 +34,32 @@ export type Project = {
   consultants: ProjectConsultant[]
   assignedUsers: string[]
   createdAt: string
+  // `projects.updated_at`, bumped by every `update_project` call. Pass it back
+  // as `expectedUpdatedAt` to lib/store.ts updateProject so a Settings save
+  // made from a stale draft is refused instead of silently replacing a
+  // colleague's roster edit (DATA-19). Optional only so the handful of places
+  // that build a Project literal by hand keep compiling; rowToProject always
+  // sets it.
+  updatedAt?: string | null
+}
+
+/**
+ * "You've been added to <project>" -- one row of `ship.project_access_notices`
+ * (migration 0013, product decision D-7). Written by the invite route (service
+ * role) when an invite names someone who ALREADY has an account; read back on
+ * their next sign-in and shown as a toast, then stamped `seenAt`. RLS limits
+ * both the read and the update to rows addressed to the caller's own email.
+ */
+export type AccessNotice = {
+  id: string
+  email: string
+  projectId: string
+  // Resolved separately from the notice row (see lib/store.ts
+  // fetchAccessNotices); falls back to the project id when the caller can't
+  // read the project (e.g. access was granted and then revoked again).
+  projectName: string
+  createdAt: string
+  seenAt: string | null
 }
 
 export type LineItemCategory =
@@ -144,9 +170,19 @@ export type LineItem = {
   // write, so sending it back is at best a no-op and at worst a stale value
   // that loses a race with the trigger's own recompute. lib/mappers.ts strips
   // it from every write path.
-  eccAmount: number
-  annualEnergySavings: number
-  annualCostSavings: number
+  //
+  // `null` since migration 0019: no number could be derived -- unanswered
+  // when estimatedFirstCost is blank, unreadable when it isn't (tell the two
+  // apart from the text with lib/costs.ts isUnreadableCost). Sums treat null
+  // as 0 (`?? 0`); display code should not show it as "$0".
+  eccAmount: number | null
+  // D-9: blank is a real answer. `null` means "not answered", `0` means "no
+  // saving". The columns became nullable in migration 0014; lib/mappers.ts
+  // maps a blank/unparseable value to null in BOTH directions, so consumers
+  // that sum these must decide what blank means for them (usually `?? 0`)
+  // rather than having the mapper silently decide it for every caller.
+  annualEnergySavings: number | null
+  annualCostSavings: number | null
   energyNotes: string
   // v2 (migration 0012). Values for `storage='custom'` form_fields, keyed by
   // FormField.key. Built-in fields (the properties above) never appear in
@@ -205,7 +241,13 @@ export type ProjectTimelineSettings = {
   // v2 (migration 0006). Anchors slot 0 to a real calendar year so
   // escalation and fiscal-year reporting mean something; see
   // lib/cost-model.ts TimelineGeometry, which these three feed directly.
-  startCalendarYear: number
+  //
+  // `null` = "not set" (M-25). Migration 0018 guarantees every project has a
+  // row with a real year, so null should never be seen in practice; when it
+  // is, it is surfaced as missing rather than defaulted to the viewer's
+  // current year, which used to shift every FY label and escalation anchor by
+  // one on 1 January without anyone touching the project.
+  startCalendarYear: number | null
   fiscalYearStartMonth: number
   fiscalYearLabelsBy: FiscalYearLabelsBy
 }
@@ -294,7 +336,12 @@ export type PhaseTemplate = {
 export type ProjectCostSettings = {
   projectId: string
   tpcFactor: number
-  baseYear: number
+  // `null` = "not set" -- same reasoning as ProjectTimelineSettings
+  // .startCalendarYear (M-25). Never defaulted to "now" by the mapper:
+  // a money base year that drifts with the clock re-prices the whole plan
+  // every New Year. Consumers must treat null as an error state
+  // ("base year not set"), not invent a year.
+  baseYear: number | null
   escalationMode: EscalationMode
   escalationAnnualPercent: number
   escalationStepYears: number

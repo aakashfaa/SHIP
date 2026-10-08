@@ -13,7 +13,7 @@
  * `satisfies` clauses keep the two from drifting apart.
  */
 
-import {
+import type {
   BooleanChoice,
   BuildingAreaImpacted,
   BuildingLevelImpacted,

@@ -15,7 +15,11 @@
  */
 
 import { CONSULTANT_TYPES } from './constants'
-import {
+// `import type`, not a plain import: every name below is a type, and saying
+// so lets tests/unit load this file straight through Node's type stripping
+// (which keeps a plain import and then fails on the missing runtime export).
+import type {
+  AccessNotice,
   ChunkPhase,
   ChunkProject,
   ChunkProjectItem,
@@ -104,9 +108,11 @@ export type LineItemRow = {
   // v2 (0006). ecc_amount is maintained by ship.sync_line_item_ecc(), a
   // BEFORE trigger keyed off estimated_first_cost - see lineItemToRow below,
   // which strips it on every write.
-  ecc_amount: number | string
-  annual_energy_savings: number | string
-  annual_cost_savings: number | string
+  // Nullable since migration 0019: no amount derivable from the cost text.
+  ecc_amount: number | string | null
+  // Nullable since migration 0014 (D-9: blank = unanswered).
+  annual_energy_savings: number | string | null
+  annual_cost_savings: number | string | null
   energy_notes: string | null
   // v2 (0012). `not null default '{}'` at the column, but read defensively
   // anyway (see toPlainObject below) the same way every other jsonb column
@@ -141,8 +147,9 @@ export type TimelineSettingsRow = {
   escalation_percent: number | string | null
   escalation_every_years: number | string | null
   // v2 (0006): calendar anchoring, consumed as lib/cost-model.ts's
-  // TimelineGeometry.
-  start_calendar_year: number | string | null
+  // TimelineGeometry. Optional because timelineSettingsToRow omits a null
+  // year rather than writing it (M-25).
+  start_calendar_year?: number | string | null
   fiscal_year_start_month: number | string | null
   fiscal_year_labels_by: string | null
 }
@@ -202,9 +209,36 @@ export function rowToProject(row: ProjectRow): Project {
     id: row.id,
     name: row.name,
     createdAt: row.created_at,
+    // Round-tripped as updateProject's `expectedUpdatedAt` (optimistic
+    // concurrency for Settings saves, migration 0013).
+    updatedAt: row.updated_at ?? null,
     consultants,
     // `assignedUsers` is derived, never stored: the distinct set of member emails.
     assignedUsers: distinct(memberRows.map((member) => member.email)),
+  }
+}
+
+/* -------------------------------------------------------- access notices -- */
+// supabase/migrations/0013_access_hardening.sql, product decision D-7.
+
+export type AccessNoticeRow = {
+  id: string
+  email: string
+  project_id: string
+  created_at: string
+  seen_at: string | null
+}
+
+/** `projectName` is not on the row -- lib/store.ts fetchAccessNotices looks
+ *  it up and passes it in; the project id is the fallback label. */
+export function rowToAccessNotice(row: AccessNoticeRow, projectName?: string | null): AccessNotice {
+  return {
+    id: row.id,
+    email: row.email,
+    projectId: row.project_id,
+    projectName: projectName && projectName.trim() !== '' ? projectName : row.project_id,
+    createdAt: row.created_at,
+    seenAt: row.seen_at ?? null,
   }
 }
 
@@ -247,22 +281,45 @@ export function rowToLineItem(row: LineItemRow): LineItem {
     potentialSynergies: (row.potential_synergies ?? []) as ConsultantType[],
     supportingNotes: row.supporting_notes ?? '',
     createdAt: row.created_at,
-    eccAmount: toNumber(row.ecc_amount) ?? 0,
-    annualEnergySavings: toNumber(row.annual_energy_savings) ?? 0,
-    annualCostSavings: toNumber(row.annual_cost_savings) ?? 0,
+    // Null kept as null (0019): "no amount" must stay distinguishable from
+    // a real $0. Consumers summing it use `?? 0`.
+    eccAmount: toNumber(row.ecc_amount),
+    // D-9: blank stays blank. A null column is "not answered", which is a
+    // different statement from 0 ("no saving"), so it is not collapsed here.
+    annualEnergySavings: toNumber(row.annual_energy_savings),
+    annualCostSavings: toNumber(row.annual_cost_savings),
     energyNotes: row.energy_notes ?? '',
     customFields: toPlainObject(row.custom_fields),
   }
 }
 
-const LINE_ITEM_COLUMNS: Array<[keyof LineItem, keyof LineItemRow]> = [
-  ['id', 'id'],
+/**
+ * Columns a client may set on INSERT but never again (M-11). They say who
+ * filed the item and where; migration 0014's BEFORE UPDATE trigger refuses a
+ * change to any of them from a non-platform-admin (42501, "<column> can't be
+ * changed"), so sending them on an update -- even unchanged -- would only
+ * ever be a way to trip that error.
+ */
+const LINE_ITEM_INSERT_ONLY_COLUMNS: Array<[keyof LineItem, keyof LineItemRow]> = [
   ['projectId', 'project_id'],
   ['userEmail', 'user_email'],
   ['consultantType', 'consultant_type'],
-  ['companyName', 'company_name'],
-  ['discipline', 'discipline'],
-  ['itemNumber', 'item_number'],
+]
+
+/*
+ * NEVER written from the client, on insert or update (M-11):
+ *
+ *   id, created_at                 database-assigned
+ *   item_number                    ship.fill_item_number(); a hand-set number
+ *                                  used to brick numbering for a discipline
+ *   company_name, discipline       ship.normalize_line_item()
+ *   ecc_amount                     ship.sync_line_item_ecc(), derived from
+ *                                  estimated_first_cost on every write
+ *
+ * They are absent from both tables here, not filtered out afterwards, so a
+ * future column added by copy-paste cannot silently start sending them.
+ */
+const LINE_ITEM_WRITABLE_COLUMNS: Array<[keyof LineItem, keyof LineItemRow]> = [
   ['name', 'name'],
   ['shortDescription', 'short_description'],
   ['category', 'category'],
@@ -284,36 +341,56 @@ const LINE_ITEM_COLUMNS: Array<[keyof LineItem, keyof LineItemRow]> = [
   ['historicImpact', 'historic_impact'],
   ['potentialSynergies', 'potential_synergies'],
   ['supportingNotes', 'supporting_notes'],
-  ['createdAt', 'created_at'],
   ['annualEnergySavings', 'annual_energy_savings'],
   ['annualCostSavings', 'annual_cost_savings'],
   ['energyNotes', 'energy_notes'],
   ['customFields', 'custom_fields'],
-  // `eccAmount` is DELIBERATELY ABSENT from this list, not merely unused.
-  // ship.sync_line_item_ecc() (0006) recomputes it from estimated_first_cost
-  // on every insert/update, so a write from here is at best a no-op and at
-  // worst a stale value racing the trigger. Omitting it from the table -
-  // rather than filtering it out below - means a future column added here
-  // by copy-paste cannot silently start sending it again.
 ]
 
-/**
- * Maps only the keys actually present on `patch`, so the same function serves
- * both inserts and partial updates. Callers must not send `company_name`,
- * `discipline`, `item_number` or `ecc_amount` on insert - those are filled by
- * triggers.
- */
-export function lineItemToRow(patch: Partial<LineItem>): Partial<LineItemRow> {
+/** Built-in numeric columns where blank is a legal answer (D-9). Written as
+ *  a finite number or `null` -- never `''` (Postgres rejects it for numeric)
+ *  and never a silent 0 (which would claim "no saving" for "not answered"). */
+const LINE_ITEM_NULLABLE_NUMERIC_COLUMNS: ReadonlySet<keyof LineItemRow> = new Set<
+  keyof LineItemRow
+>(['annual_energy_savings', 'annual_cost_savings'])
+
+function mapLineItemColumns(
+  patch: Partial<LineItem>,
+  columns: ReadonlyArray<[keyof LineItem, keyof LineItemRow]>
+): Partial<LineItemRow> {
   const row: Record<string, unknown> = {}
 
-  LINE_ITEM_COLUMNS.forEach(([domainKey, columnKey]) => {
+  columns.forEach(([domainKey, columnKey]) => {
     const value = patch[domainKey]
     if (value === undefined) return
-    row[columnKey] = value
+    row[columnKey] = LINE_ITEM_NULLABLE_NUMERIC_COLUMNS.has(columnKey) ? toNumber(value) : value
   })
 
   return row as Partial<LineItemRow>
 }
+
+/**
+ * Domain -> row for an INSERT. Sends the filing columns (project, submitter,
+ * consultant type) plus every user-editable column present on `input`; never
+ * the trigger-owned ones listed above.
+ */
+export function lineItemToInsertRow(input: Partial<LineItem>): Partial<LineItemRow> {
+  return mapLineItemColumns(input, [...LINE_ITEM_INSERT_ONLY_COLUMNS, ...LINE_ITEM_WRITABLE_COLUMNS])
+}
+
+/**
+ * Domain -> row for an UPDATE. Maps only the user-editable keys actually
+ * present on `patch`; `projectId`, `userEmail`, `consultantType`, `id`,
+ * `createdAt`, `itemNumber`, `companyName`, `discipline` and `eccAmount` are
+ * dropped even if the caller passes a whole LineItem back (AddDataTab does).
+ */
+export function lineItemToUpdateRow(patch: Partial<LineItem>): Partial<LineItemRow> {
+  return mapLineItemColumns(patch, LINE_ITEM_WRITABLE_COLUMNS)
+}
+
+/** @deprecated Kept for existing importers; the update-safe mapping. Use
+ *  `lineItemToInsertRow` / `lineItemToUpdateRow` to say which you mean. */
+export const lineItemToRow = lineItemToUpdateRow
 
 /* --------------------------------------------------------- chunk projects -- */
 
@@ -390,7 +467,8 @@ export function rowToChunkProject(row: ChunkProjectRow): ChunkProject {
 
 /**
  * Absorbs the old `normalizeTimelineSettings`. Pass `null` for a project with
- * no stored row yet and you get the defaults.
+ * no stored row and you get the defaults -- except `startCalendarYear`, which
+ * is `null` ("not set") rather than the current year; see below (M-25).
  */
 export function rowToTimelineSettings(
   row: Partial<TimelineSettingsRow> | null | undefined,
@@ -409,13 +487,15 @@ export function rowToTimelineSettings(
   const escalationEveryYears =
     everyYearsValue !== null && everyYearsValue > 0 ? Math.round(everyYearsValue) : 5
 
-  // Matches lib/cost-model.ts DEFAULT_COST_SETTINGS.baseYear's fallback: a
-  // project with no row yet (or, in principle, a pre-backfill null) anchors
-  // to "now" rather than a fixed literal, so a freshly created project does
-  // not silently claim to start in some past year.
+  // M-25: NO fallback to "now". This used to default to the viewer's current
+  // year, so a project whose year was never stored re-anchored every FY label
+  // and escalation clock on 1 January without anyone touching it (bsb2301
+  // moved by -$3.02M). Migration 0018 makes create_project store a year and
+  // backfills existing projects, so a missing year is now a data error, and
+  // it is reported as one: `null`, which consumers render as "start year not
+  // set" instead of silently inventing a number.
   const startYearValue = toNumber(row?.start_calendar_year)
-  const startCalendarYear =
-    startYearValue !== null ? Math.round(startYearValue) : new Date().getUTCFullYear()
+  const startCalendarYear = startYearValue !== null ? Math.round(startYearValue) : null
 
   const fyStartMonthValue = toNumber(row?.fiscal_year_start_month)
   const fiscalYearStartMonth =
@@ -440,6 +520,9 @@ export function rowToTimelineSettings(
   }
 }
 
+/** A `null` start year is OMITTED rather than written: on an upsert of an
+ *  existing row that keeps whatever year is stored, and it never writes
+ *  null into a column 0018 made NOT NULL. */
 export function timelineSettingsToRow(settings: ProjectTimelineSettings): TimelineSettingsRow {
   return {
     project_id: settings.projectId,
@@ -448,7 +531,9 @@ export function timelineSettingsToRow(settings: ProjectTimelineSettings): Timeli
     zoom_level: settings.zoomLevel,
     escalation_percent: settings.escalationPercent,
     escalation_every_years: settings.escalationEveryYears,
-    start_calendar_year: settings.startCalendarYear,
+    ...(settings.startCalendarYear !== null
+      ? { start_calendar_year: settings.startCalendarYear }
+      : {}),
     fiscal_year_start_month: settings.fiscalYearStartMonth,
     fiscal_year_labels_by: settings.fiscalYearLabelsBy,
   }
@@ -608,7 +693,8 @@ export function rowToPhaseTemplate(row: PhaseTemplateRow): PhaseTemplate {
 export type ProjectCostSettingsRow = {
   project_id: string
   tpc_factor: number | string | null
-  base_year: number | string | null
+  // Optional: costSettingsToRow omits a null year (M-25).
+  base_year?: number | string | null
   escalation_mode: string | null
   escalation_annual_percent: number | string | null
   escalation_step_years: number | string | null
@@ -626,11 +712,12 @@ export type EscalationRateOverrideRow = {
 /**
  * Mirrors the column defaults in migration 0006 / `DEFAULT_COST_SETTINGS` in
  * lib/cost-model.ts, restated here rather than imported so this file keeps
- * its existing rule of owning every default by itself. Pass `null` row and
- * an empty overrides array for a project that has never had a settings row
- * written - a supported state, not an error (see the RLS note on
- * `getCostSettingsForProject` in lib/store.ts: a non-admin write is filtered
- * to 0 rows rather than erroring, so "no row yet" is common).
+ * its existing rule of owning every default by itself. A `null` row (no
+ * settings row written) still yields the defaults for every RATE/FACTOR, but
+ * NOT for `baseYear`, which comes back `null` (M-25): a factor default is a
+ * reasonable assumption, a year default is a guess that changes on its own
+ * every 1 January. Since migration 0018 create_project writes the row, so a
+ * null row means something is wrong and the caller should say so.
  */
 export function rowToCostSettings(
   row: Partial<ProjectCostSettingsRow> | null | undefined,
@@ -640,8 +727,12 @@ export function rowToCostSettings(
   const tpcFactorValue = toNumber(row?.tpc_factor)
   const tpcFactor = tpcFactorValue !== null && tpcFactorValue > 0 ? tpcFactorValue : 1.33
 
+  // M-25: no "now" fallback -- see rowToTimelineSettings.startCalendarYear.
+  // A missing row (impossible after migration 0018) yields `baseYear: null`,
+  // which the Cost Model and the export treat as "base year not set" rather
+  // than escalating from whatever year the viewer's clock says.
   const baseYearValue = toNumber(row?.base_year)
-  const baseYear = baseYearValue !== null ? Math.round(baseYearValue) : new Date().getUTCFullYear()
+  const baseYear = baseYearValue !== null ? Math.round(baseYearValue) : null
 
   const escalationMode: EscalationMode =
     row?.escalation_mode === 'stepped' ? 'stepped' : 'compound_annual'
@@ -696,7 +787,9 @@ export function costSettingsToRow(
   return {
     project_id: settings.projectId,
     tpc_factor: settings.tpcFactor,
-    base_year: settings.baseYear,
+    // Omitted when null, same as timelineSettingsToRow's start year: never
+    // write a null into the NOT NULL column, never clobber a stored year.
+    ...(settings.baseYear !== null ? { base_year: settings.baseYear } : {}),
     escalation_mode: settings.escalationMode,
     escalation_annual_percent: settings.escalationAnnualPercent,
     escalation_step_years: settings.escalationStepYears,
@@ -835,25 +928,40 @@ export function rowToScenario(row: ScenarioRow): Scenario {
  *  untouched so a future column does not silently get reset to a default. */
 export function scenarioPayloadToRow(payload: ScenarioPayload): Record<string, unknown> {
   return {
-    phases: payload.phases.map((p) => ({
-      id: p.id,
-      chunk_project_id: p.chunkProjectId,
-      name: p.name,
-      kind: p.kind,
-      sort_order: p.sortOrder,
-      pct_of_tpc: p.pctOfTpc,
-      start_slot: p.startSlot,
-      duration_slots: p.durationSlots,
-      duration_locked: p.durationLocked,
-    })),
-    dependencies: payload.dependencies.map((d) => ({
-      id: d.id,
-      predecessor_phase_id: d.predecessorPhaseId,
-      successor_phase_id: d.successorPhaseId,
-      dep_type: d.depType,
-      lag_slots: d.lagSlots,
-    })),
+    phases: scenarioPhasesToRows(payload.phases),
+    dependencies: scenarioDependenciesToRows(payload.dependencies),
   }
+}
+
+/** The `p_phases` argument of `ship.save_scenario_payload` (migration 0015):
+ *  the same per-phase shape the payload stores. */
+export function scenarioPhasesToRows(
+  phases: readonly ScenarioPhase[]
+): Array<Record<string, unknown>> {
+  return phases.map((p) => ({
+    id: p.id,
+    chunk_project_id: p.chunkProjectId,
+    name: p.name,
+    kind: p.kind,
+    sort_order: p.sortOrder,
+    pct_of_tpc: p.pctOfTpc,
+    start_slot: p.startSlot,
+    duration_slots: p.durationSlots,
+    duration_locked: p.durationLocked,
+  }))
+}
+
+/** The `p_dependencies` argument of `ship.save_scenario_payload`. */
+export function scenarioDependenciesToRows(
+  dependencies: readonly ScenarioDependency[]
+): Array<Record<string, unknown>> {
+  return dependencies.map((d) => ({
+    id: d.id,
+    predecessor_phase_id: d.predecessorPhaseId,
+    successor_phase_id: d.successorPhaseId,
+    dep_type: d.depType,
+    lag_slots: d.lagSlots,
+  }))
 }
 
 /* -------------------------------------------------------------- form fields -- */

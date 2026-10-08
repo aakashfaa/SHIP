@@ -14,6 +14,7 @@
 
 import { getSupabaseBrowserClient } from './supabase/client'
 import {
+  AccessNoticeRow,
   ChunkPhaseRow,
   ChunkProjectRow,
   EscalationRateOverrideRow,
@@ -32,9 +33,11 @@ import {
   costSettingsToRow,
   energySettingsToRow,
   formFieldToRow,
-  lineItemToRow,
+  lineItemToInsertRow,
+  lineItemToUpdateRow,
   normalizeTimelineSegments,
   phaseDependencyToRow,
+  rowToAccessNotice,
   rowToChunkPhase,
   rowToChunkProject,
   rowToCostSettings,
@@ -47,10 +50,12 @@ import {
   rowToProject,
   rowToScenario,
   rowToTimelineSettings,
-  scenarioPayloadToRow,
+  scenarioDependenciesToRows,
+  scenarioPhasesToRows,
   timelineSettingsToRow,
 } from './mappers'
 import {
+  AccessNotice,
   ChunkPhase,
   ChunkProject,
   ConsultantType,
@@ -68,7 +73,9 @@ import {
   ProjectTaxonomyValue,
   ProjectTimelineSettings,
   Scenario,
+  ScenarioDependency,
   ScenarioPayload,
+  ScenarioPhase,
   TaxonomyKind,
 } from './types'
 
@@ -199,22 +206,94 @@ export async function createProject(input: {
   return { project, invitedEmails: result.invited_emails ?? [] }
 }
 
+/**
+ * Thrown by `updateProject` when `expectedUpdatedAt` no longer matches the
+ * stored `projects.updated_at` -- someone else saved the project since the
+ * caller loaded it (DATA-19). Callers should reload and let the user redo
+ * their edit rather than retrying blind, which would silently replace the
+ * other person's roster change.
+ */
+export class ProjectChangedError extends Error {
+  constructor(projectId: string, detail?: string) {
+    super(
+      `Project "${projectId}" was changed by someone else since you opened it. ` +
+        'Reload to see the latest version, then make your change again.' +
+        (detail ? ` (${detail})` : '')
+    )
+    this.name = 'ProjectChangedError'
+  }
+}
+
+/**
+ * Two call shapes, same RPC:
+ *
+ *   updateProject(id, { name?, consultants? }, expectedUpdatedAt?)
+ *   updateProject(id, name, consultants, expectedUpdatedAt?)
+ *
+ * The first is the original signature (fills whatever `updates` leaves out
+ * from a fresh read); the second is the Phase 2 contract shape. Either way,
+ * `expectedUpdatedAt` -- pass `project.updatedAt` from the copy the user was
+ * editing -- makes `ship.update_project` (migration 0013) refuse the write
+ * if the project changed in the meantime, surfaced as `ProjectChangedError`.
+ * Omit it and the save is last-write-wins, as before.
+ */
 export async function updateProject(
   projectId: string,
-  updates: Partial<Project>
+  updates: Partial<Project>,
+  expectedUpdatedAt?: string | null
+): Promise<{ project: Project; invitedEmails: string[] } | null>
+export async function updateProject(
+  projectId: string,
+  name: string,
+  consultants: ProjectConsultant[],
+  expectedUpdatedAt?: string | null
+): Promise<{ project: Project; invitedEmails: string[] } | null>
+export async function updateProject(
+  projectId: string,
+  updatesOrName: Partial<Project> | string,
+  consultantsOrExpected?: ProjectConsultant[] | string | null,
+  maybeExpected?: string | null
 ): Promise<{ project: Project; invitedEmails: string[] } | null> {
   const supabase = getSupabaseBrowserClient()
 
-  const existing = await getProjectById(projectId)
-  if (!existing) return null
+  let name: string
+  let consultants: ProjectConsultant[]
+  let expectedUpdatedAt: string | null | undefined
 
-  const { data, error } = await supabase.rpc('update_project', {
+  if (typeof updatesOrName === 'string') {
+    name = updatesOrName
+    consultants = Array.isArray(consultantsOrExpected) ? consultantsOrExpected : []
+    expectedUpdatedAt = maybeExpected
+  } else {
+    expectedUpdatedAt = typeof consultantsOrExpected === 'string' ? consultantsOrExpected : null
+    let existing: Project | null = null
+    if (updatesOrName.name === undefined || updatesOrName.consultants === undefined) {
+      existing = await getProjectById(projectId)
+      if (!existing) return null
+    }
+    name = updatesOrName.name ?? existing?.name ?? ''
+    consultants = updatesOrName.consultants ?? existing?.consultants ?? []
+  }
+
+  const args: Record<string, unknown> = {
     p_project_id: projectId,
-    p_name: (updates.name ?? existing.name).trim(),
-    p_consultants: updates.consultants ?? existing.consultants,
-  })
+    p_name: name.trim(),
+    p_consultants: consultants,
+  }
+  // Only sent when the caller has one: `p_expected_updated_at` defaults to
+  // null in SQL (= no check), and leaving it out keeps this call valid
+  // against a database that predates migration 0013.
+  if (expectedUpdatedAt) args.p_expected_updated_at = expectedUpdatedAt
 
-  if (error) fail(`Failed to update project "${projectId}"`, error)
+  const { data, error } = await supabase.rpc('update_project', args)
+
+  if (error) {
+    // 0013 raises serialization_failure (40001) for a stale
+    // p_expected_updated_at -- the same SQLSTATE publish_scenario uses for
+    // "the baseline moved under you".
+    if (error.code === '40001') throw new ProjectChangedError(projectId, error.message)
+    fail(`Failed to update project "${projectId}"`, error)
+  }
 
   const result = readMutationResult(`Failed to update project "${projectId}"`, data)
 
@@ -247,6 +326,69 @@ export async function removeConsultantFromProject(
   return updateProject(projectId, {
     consultants: project.consultants.filter((c) => c.type !== consultantType),
   })
+}
+
+/* -------------------------------------------------------- access notices -- */
+// supabase/migrations/0013_access_hardening.sql, product decision D-7: when
+// an invite names someone who already has an account, the invite route
+// (service role) records a notice instead of handing anyone a login link,
+// and the invitee sees "You've been added to <project>" on next sign-in.
+
+/**
+ * The signed-in user's UNSEEN notices, oldest first. No email filter here on
+ * purpose: RLS on `project_access_notices` already restricts every read to
+ * rows addressed to the caller's own email.
+ */
+export async function fetchAccessNotices(): Promise<AccessNotice[]> {
+  const supabase = getSupabaseBrowserClient()
+
+  const { data, error } = await supabase
+    .from('project_access_notices')
+    .select('*')
+    .is('seen_at', null)
+    .order('created_at', { ascending: true })
+
+  if (error) fail('Failed to load access notices', error)
+
+  const rows = (data ?? []) as unknown as AccessNoticeRow[]
+  if (rows.length === 0) return []
+
+  // Project names are a best-effort lookup, not an embed: a project the user
+  // can no longer read (access revoked again since) should still produce a
+  // notice rather than an error -- it just falls back to the project id.
+  const projectIds = [...new Set(rows.map((row) => row.project_id))]
+  const names = new Map<string, string>()
+  const { data: projectRows, error: projectError } = await supabase
+    .from('projects')
+    .select('id, name')
+    .in('id', projectIds)
+
+  if (projectError) {
+    console.error('Failed to resolve project names for access notices:', projectError)
+  } else {
+    for (const project of (projectRows ?? []) as Array<{ id: string; name: string }>) {
+      names.set(project.id, project.name)
+    }
+  }
+
+  return rows.map((row) => rowToAccessNotice(row, names.get(row.project_id)))
+}
+
+/** Stamps `seen_at` so each toast shows once. RLS limits the update to the
+ *  caller's own notices; `seen_at is null` keeps the first-seen time. */
+export async function markAccessNoticesSeen(ids: readonly string[]): Promise<void> {
+  const unique = [...new Set(ids)].filter(Boolean)
+  if (unique.length === 0) return
+
+  const supabase = getSupabaseBrowserClient()
+
+  const { error } = await supabase
+    .from('project_access_notices')
+    .update({ seen_at: new Date().toISOString() })
+    .in('id', unique)
+    .is('seen_at', null)
+
+  if (error) fail('Failed to mark access notices as seen', error)
 }
 
 /* ------------------------------------------------------------ line items -- */
@@ -297,9 +439,10 @@ export async function createLineItem(
 
   // `item_number`, `company_name` and the normalized `discipline` /
   // `consultant_type` are filled by triggers; never send them from here.
+  // lineItemToInsertRow enforces that (M-11): it has no mapping for them.
   const { data, error } = await supabase
     .from('line_items')
-    .insert(lineItemToRow(input))
+    .insert(lineItemToInsertRow(input))
     .select('*')
     .single()
 
@@ -314,9 +457,12 @@ export async function updateLineItem(
 ): Promise<LineItem | null> {
   const supabase = getSupabaseBrowserClient()
 
-  const row = lineItemToRow(updates)
-  delete row.id
-  delete row.created_at
+  // Only user-editable columns (M-11). The filing/system columns -- project,
+  // submitter, consultant type, number, company, discipline, created_at,
+  // ecc_amount -- are dropped by the mapper even when `updates` is a whole
+  // LineItem, because migration 0014's trigger refuses a change to any of
+  // them from a non-platform-admin.
+  const row = lineItemToUpdateRow(updates)
 
   const { data, error } = await supabase
     .from('line_items')
@@ -945,23 +1091,108 @@ export async function createScenario(
   return rowToScenario(data as unknown as ScenarioRow)
 }
 
-/** Persists the in-memory overlay back onto the scenario row — NOT onto the
- *  baseline. This is the "save my sandbox" write; `publishScenario` is the
- *  separate, deliberate act of pushing it to the shared plan. */
+/**
+ * Persists the in-memory overlay back onto the scenario row — NOT onto the
+ * baseline. This is the "save my sandbox" write; `publishScenario` is the
+ * separate, deliberate act of pushing it to the shared plan.
+ *
+ * Goes through `ship.save_scenario_payload` (migration 0015, M-13) rather
+ * than a table UPDATE: the owner can no longer write `payload` directly. The
+ * RPC is owner-only, merges the phases/dependencies into the stored payload
+ * (so keys this client never sees -- `cost_settings` -- survive the save),
+ * and rejects ids from another project and out-of-range slots.
+ *
+ * Accepts either `(id, payload)` -- the original signature -- or
+ * `(id, phases, dependencies)`, the Phase 2 contract shape.
+ */
 export async function saveScenarioPayload(
   scenarioId: string,
   payload: ScenarioPayload
+): Promise<Scenario | null>
+export async function saveScenarioPayload(
+  scenarioId: string,
+  phases: readonly ScenarioPhase[],
+  dependencies: readonly ScenarioDependency[]
+): Promise<Scenario | null>
+export async function saveScenarioPayload(
+  scenarioId: string,
+  payloadOrPhases: ScenarioPayload | readonly ScenarioPhase[],
+  maybeDependencies?: readonly ScenarioDependency[]
 ): Promise<Scenario | null> {
   const supabase = getSupabaseBrowserClient()
 
+  let phases: readonly ScenarioPhase[]
+  let dependencies: readonly ScenarioDependency[]
+  if (isScenarioPhaseList(payloadOrPhases)) {
+    phases = payloadOrPhases
+    dependencies = maybeDependencies ?? []
+  } else {
+    phases = payloadOrPhases.phases
+    dependencies = payloadOrPhases.dependencies
+  }
+
+  const { data, error } = await supabase.rpc('save_scenario_payload', {
+    p_scenario_id: scenarioId,
+    p_phases: scenarioPhasesToRows(phases),
+    p_dependencies: scenarioDependenciesToRows(dependencies),
+  })
+
+  if (error) fail('Failed to save the scenario', error)
+
+  // `returns ship.scenarios` comes back as one object; tolerate a one-row
+  // array as well rather than depend on PostgREST's composite-return shape.
+  const row = (Array.isArray(data) ? data[0] : data) as ScenarioRow | null | undefined
+  if (!row || typeof row !== 'object' || !row.id) return null
+
+  return rowToScenario(row)
+}
+
+function isScenarioPhaseList(
+  value: ScenarioPayload | readonly ScenarioPhase[]
+): value is readonly ScenarioPhase[] {
+  return Array.isArray(value)
+}
+
+/**
+ * Renames / re-describes / shares a scenario. Since migration 0015 these
+ * three columns are ALL an owner may UPDATE directly (the payload goes
+ * through `saveScenarioPayload`), so this sends nothing else -- not even
+ * `updated_at`, which the column grant would refuse. Returns null when the
+ * update matched no row (not the owner, or the scenario is gone).
+ */
+export async function updateScenarioMeta(
+  scenarioId: string,
+  updates: { name?: string; description?: string; visibility?: Scenario['visibility'] }
+): Promise<Scenario | null> {
+  const supabase = getSupabaseBrowserClient()
+
+  const row: Record<string, unknown> = {}
+  if (updates.name !== undefined) {
+    const name = updates.name.trim()
+    if (name === '') throw new Error('A what-if needs a name.')
+    row.name = name
+  }
+  if (updates.description !== undefined) row.description = updates.description
+  if (updates.visibility !== undefined) row.visibility = updates.visibility
+
+  if (Object.keys(row).length === 0) {
+    const { data, error } = await supabase
+      .from('scenarios')
+      .select('*')
+      .eq('id', scenarioId)
+      .maybeSingle()
+    if (error) fail('Failed to load the scenario', error)
+    return data ? rowToScenario(data as unknown as ScenarioRow) : null
+  }
+
   const { data, error } = await supabase
     .from('scenarios')
-    .update({ payload: scenarioPayloadToRow(payload), updated_at: new Date().toISOString() })
+    .update(row)
     .eq('id', scenarioId)
     .select('*')
     .maybeSingle()
 
-  if (error) fail('Failed to save the scenario', error)
+  if (error) fail('Failed to update the scenario', error)
   if (!data) return null
 
   return rowToScenario(data as unknown as ScenarioRow)
@@ -1362,24 +1593,23 @@ export async function deleteFormField(fieldId: string): Promise<void> {
   if (error) fail(`Failed to delete form field "${fieldId}"`, error)
 }
 
-/** Persist a reordering. One upsert, like `reorderTaxonomyValues` /
- *  `reorderChunkPhases` above -- these lists are a few dozen entries long at
- *  most, so a bulk RPC would be machinery for no gain. `project_id` is
- *  included at the value the caller already asserts these fields belong to,
- *  purely so a caller that passes a foreign id fails loudly (a project
- *  mismatch) rather than silently reparenting a field. */
+/** Persist a project-wide field order (index = new sort_order). */
 export async function reorderFormFields(projectId: string, orderedFieldIds: string[]): Promise<void> {
+  if (orderedFieldIds.length === 0) return
+
   const supabase = getSupabaseBrowserClient()
 
-  const rows = orderedFieldIds.map((id, index) => ({
-    id,
-    project_id: projectId,
-    sort_order: index,
-  }))
-
-  if (rows.length === 0) return
-
-  const { error } = await supabase.from('form_fields').upsert(rows, { onConflict: 'id' })
+  // M-18: via `ship.reorder_form_fields` (migration 0017) -- one
+  // UPDATE ... FROM unnest(ids) WITH ORDINALITY scoped to the project, so a
+  // foreign id simply matches nothing. The upsert this replaces never
+  // worked: PostgREST compiles it to INSERT ... ON CONFLICT, and Postgres
+  // checks NOT NULL on the proposed insert tuple (no key/label/input_type)
+  // before looking at the conflict, so every reorder failed with 23502.
+  // SECURITY INVOKER, so form_fields RLS still decides who may reorder.
+  const { error } = await supabase.rpc('reorder_form_fields', {
+    p_project_id: projectId,
+    p_ids: orderedFieldIds,
+  })
 
   if (error) fail(`Failed to reorder form fields for "${projectId}"`, error)
 }
@@ -1449,22 +1679,21 @@ export async function setFieldOptionArchived(optionId: string, isArchived: boole
   if (error) fail(`Failed to update option "${optionId}"`, error)
 }
 
-/** Persist a reordering, one upsert, matching `reorderFormFields` above. */
+/** Persist a reordering, one RPC, matching `reorderFormFields` above. */
 export async function reorderFieldOptions(
   fieldId: string,
   orderedOptionIds: string[]
 ): Promise<void> {
+  if (orderedOptionIds.length === 0) return
+
   const supabase = getSupabaseBrowserClient()
 
-  const rows = orderedOptionIds.map((id, index) => ({
-    id,
-    field_id: fieldId,
-    sort_order: index,
-  }))
-
-  if (rows.length === 0) return
-
-  const { error } = await supabase.from('form_field_options').upsert(rows, { onConflict: 'id' })
+  // Same reason and shape as reorderFormFields: the old upsert hit NOT NULL
+  // on form_field_options.value. `ship.reorder_field_options`, migration 0017.
+  const { error } = await supabase.rpc('reorder_field_options', {
+    p_field_id: fieldId,
+    p_ids: orderedOptionIds,
+  })
 
   if (error) fail(`Failed to reorder options for field "${fieldId}"`, error)
 }
