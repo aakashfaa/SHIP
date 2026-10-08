@@ -17,14 +17,20 @@ import {
 import {
   DEFAULT_COST_SETTINGS,
   applyScenarioOverlay,
+  calendarMonthName,
   DEFAULT_ENERGY_SETTINGS,
   computeEnergySeries,
   computeFiscalYearTotals,
   computeSlotCosts,
-  fiscalYearLabel,
   findDependencyViolations,
+  formatFiscalYear,
+  monthLabel,
+  monthsPerSlot as computeMonthsPerSlot,
   propagateDependencies,
+  resolveHorizon,
+  slotCalendarLabel,
   slotCount as computeSlotCount,
+  slotFiscalLabel,
   summarisePackage,
   type CostSettings,
   type EnergySettings,
@@ -97,20 +103,16 @@ import {
 const SETTINGS_PERSIST_DEBOUNCE_MS = 400
 
 /**
- * Zoom is LOCKED for now (M-01, interim).
+ * Zoom is a VIEW, and only a view (M-01, D-1).
  *
- * Phases are stored in "slots", and a slot means whatever the project's zoom
- * says it means -- a year at Year zoom, a month at Month zoom. Moving the
- * slider therefore did not zoom anything: it reinterpreted every stored phase,
- * re-priced the whole plan (about -24% going Year -> Month on a test plan) and
- * saved that for every user and for the Excel export. Until schedules are
- * stored in one fixed unit (the months conversion, a coordinated later wave),
- * the slider is disabled and `handleZoomChange` refuses to write, so
- * `interval_unit` cannot change from this screen. The code path stays so that
- * wave only has to flip this flag and add the conversion.
+ * Phases used to be stored in "slots" whose size the zoom set, so moving the
+ * slider re-priced the whole plan and saved that for everyone and for the
+ * Excel export. Since migration 0020 schedules are stored in months, every
+ * total is computed from months, and the zoom only decides how many months
+ * one column shows. So it is per-viewer state here -- anyone, viewers
+ * included, can zoom -- and changing it writes nothing. The project's stored
+ * `zoomLevel` is just the view a page opens at.
  */
-const ZOOM_LOCKED = true
-
 const ZOOM_LEVELS: Array<{ level: number; interval: TimelineInterval; label: string }> = [
   { level: 1, interval: '5-yearly', label: '5 year' },
   { level: 2, interval: '3-yearly', label: '3 year' },
@@ -127,25 +129,6 @@ function zoomLabel(zoomLevel: number): string {
   return ZOOM_LEVELS.find((z) => z.level === zoomLevel)?.label ?? 'Year'
 }
 
-function slotLabel(index: number, interval: TimelineInterval): string {
-  switch (interval) {
-    case 'monthly':
-      return `Y${Math.floor(index / 12) + 1} M${(index % 12) + 1}`
-    case 'quarterly':
-      return `Y${Math.floor(index / 4) + 1} Q${(index % 4) + 1}`
-    case 'yearly':
-      return `Year ${index + 1}`
-    case 'bi-yearly':
-      return `Y${index * 2 + 1}-${index * 2 + 2}`
-    case '3-yearly':
-      return `Y${index * 3 + 1}-${index * 3 + 3}`
-    case '5-yearly':
-      return `Y${index * 5 + 1}-${index * 5 + 5}`
-    default:
-      return `${index + 1}`
-  }
-}
-
 /** Domain row → engine row. The engine deliberately knows nothing about
  *  Supabase or the wire format, so this is the one place the two meet. */
 function toEnginePhase(phase: ChunkPhase): Phase {
@@ -156,8 +139,8 @@ function toEnginePhase(phase: ChunkPhase): Phase {
     kind: phase.kind,
     sortOrder: phase.sortOrder,
     pctOfTpc: phase.pctOfTpc,
-    startSlot: phase.startSlot,
-    durationSlots: phase.durationSlots,
+    startMonth: phase.startMonth,
+    durationMonths: phase.durationMonths,
     durationLocked: phase.durationLocked,
   }
 }
@@ -168,7 +151,7 @@ function toEngineDependency(dep: PhaseDependency): EnginePhaseDependency {
     predecessorPhaseId: dep.predecessorPhaseId,
     successorPhaseId: dep.successorPhaseId,
     depType: dep.depType,
-    lagSlots: dep.lagSlots,
+    lagMonths: dep.lagMonths,
   }
 }
 
@@ -243,10 +226,23 @@ function toScenarioPhase(phase: ChunkPhase): ScenarioPhase {
     kind: phase.kind,
     sortOrder: phase.sortOrder,
     pctOfTpc: phase.pctOfTpc,
-    startSlot: phase.startSlot,
-    durationSlots: phase.durationSlots,
+    startMonth: phase.startMonth,
+    durationMonths: phase.durationMonths,
     durationLocked: phase.durationLocked,
   }
+}
+
+/** "Jul 2027 – Jun 2029 · 24 months": a phase's span in words, from months. */
+function describeSpan(
+  startMonth: number,
+  durationMonths: number,
+  geometry: TimelineGeometry
+): string {
+  const last = startMonth + Math.max(durationMonths, 1) - 1
+  const months = Math.round(durationMonths * 100) / 100
+  return `${monthLabel(startMonth, geometry)} – ${monthLabel(last, geometry)} · ${months} month${
+    months === 1 ? '' : 's'
+  }`
 }
 
 const DEFAULT_TIMELINE_SETTINGS: Omit<ProjectTimelineSettings, 'projectId'> = {
@@ -315,6 +311,10 @@ export default function TimelineTab({ project, permissions }: Props) {
 
   const [expanded, setExpanded] = useState<Set<string>>(new Set())
   const [hoveredSlot, setHoveredSlot] = useState<number | null>(null)
+  // The viewer's own zoom (D-1). Null = "the project's default view", so the
+  // page follows the stored default until this person picks something else.
+  const [viewZoomLevel, setViewZoomLevel] = useState<number | null>(null)
+  const zoomLevel = viewZoomLevel ?? timelineSettings.zoomLevel
   const [saveError, setSaveError] = useState<string | null>(null)
 
   /**
@@ -396,20 +396,18 @@ export default function TimelineTab({ project, permissions }: Props) {
   )
   const energySettings = useMemo(() => toEnergySettings(energySettingsRow), [energySettingsRow])
 
-  const geometry: TimelineGeometry = useMemo(
+  // The CONFIGURED geometry, at the viewer's zoom. Everything that draws or
+  // totals uses `geometry` below, which is this stretched by the one horizon
+  // rule (M-27) to cover every phase.
+  const configuredGeometry: TimelineGeometry = useMemo(
     () => ({
-      interval: intervalForZoom(timelineSettings.zoomLevel),
+      interval: intervalForZoom(zoomLevel),
       years: timelineSettings.years,
       startCalendarYear: timelineSettings.startCalendarYear ?? standInYear,
       fiscalYearStartMonth: timelineSettings.fiscalYearStartMonth,
       fiscalYearLabelsBy: timelineSettings.fiscalYearLabelsBy,
     }),
-    [timelineSettings, standInYear]
-  )
-
-  const slotCount = useMemo(
-    () => computeSlotCount(geometry.years, geometry.interval),
-    [geometry]
+    [timelineSettings, standInYear, zoomLevel]
   )
 
   const lineItemMap = useMemo(() => new Map(lineItems.map((i) => [i.id, i])), [lineItems])
@@ -493,8 +491,8 @@ export default function TimelineTab({ project, permissions }: Props) {
       phase.id === dragPreview.phaseId
         ? {
             ...phase,
-            startSlot: dragPreview.startSlot,
-            durationSlots: dragPreview.durationSlots,
+            startMonth: dragPreview.startMonth,
+            durationMonths: dragPreview.durationMonths,
           }
         : phase
     )
@@ -509,6 +507,29 @@ export default function TimelineTab({ project, permissions }: Props) {
     return map
   }, [effectivePhases])
 
+  const enginePhases = useMemo(() => effectivePhases.map(toEnginePhase), [effectivePhases])
+
+  /**
+   * The one horizon rule (M-27, lib/cost-model `resolveHorizon`), the same
+   * call the Excel export makes: the timeline runs to the end of the
+   * furthest phase if that is past the Timeline Length, so every dollar in
+   * the headline has a column and a fiscal year.
+   */
+  const horizon = useMemo(
+    () => resolveHorizon(configuredGeometry, enginePhases),
+    [configuredGeometry, enginePhases]
+  )
+  const geometry = horizon.geometry
+  const monthsPerSlot = computeMonthsPerSlot(geometry.interval)
+  const horizonMonths = geometry.years * 12
+
+  const slotCount = useMemo(
+    () => computeSlotCount(geometry.years, geometry.interval),
+    [geometry]
+  )
+
+  // Priced from months only: `summarisePackage` never sees the zoom, so the
+  // headline and every package total are the same at every zoom level.
   const summaries = useMemo(
     () =>
       packageInputs.map((input) =>
@@ -529,9 +550,12 @@ export default function TimelineTab({ project, permissions }: Props) {
     [summaries, energySettings, geometry]
   )
 
-  const fiscalTotals = useMemo(() => computeFiscalYearTotals(slotCosts), [slotCosts])
-
-  const enginePhases = useMemo(() => effectivePhases.map(toEnginePhase), [effectivePhases])
+  // Monthly resolution, fiscal quarters (M-26, D-11) -- the same function the
+  // export's Annual Cost Summary uses.
+  const fiscalTotals = useMemo(
+    () => computeFiscalYearTotals(summaries, geometry),
+    [summaries, geometry]
+  )
   const engineDependencies = useMemo(
     () => dependencies.map(toEngineDependency),
     [dependencies]
@@ -556,8 +580,8 @@ export default function TimelineTab({ project, permissions }: Props) {
 
   const rows = useMemo<RowLayout[]>(() => {
     const sorted = summaries.slice().sort((a, b) => {
-      const aStart = phasesByChunk.get(a.input.chunkProjectId)?.[0]?.startSlot ?? 0
-      const bStart = phasesByChunk.get(b.input.chunkProjectId)?.[0]?.startSlot ?? 0
+      const aStart = phasesByChunk.get(a.input.chunkProjectId)?.[0]?.startMonth ?? 0
+      const bStart = phasesByChunk.get(b.input.chunkProjectId)?.[0]?.startMonth ?? 0
       if (aStart !== bStart) return aStart - bStart
       return a.input.chunkNumber.localeCompare(b.input.chunkNumber)
     })
@@ -593,7 +617,12 @@ export default function TimelineTab({ project, permissions }: Props) {
     for (const row of rows) {
       if (row.expanded) {
         row.phases.forEach((phase, index) => {
-          const rect = barRect(phase.startSlot, phase.durationSlots, PHASE_ROW_HEIGHT)
+          const rect = barRect(
+            phase.startMonth,
+            phase.durationMonths,
+            PHASE_ROW_HEIGHT,
+            monthsPerSlot
+          )
           rects.set(phase.id, {
             x: rect.left,
             y: phaseRowTop(row, index) + rect.top,
@@ -605,7 +634,12 @@ export default function TimelineTab({ project, permissions }: Props) {
       }
 
       for (const phase of row.phases) {
-        const rect = barRect(phase.startSlot, phase.durationSlots, PACKAGE_ROW_HEIGHT)
+        const rect = barRect(
+          phase.startMonth,
+          phase.durationMonths,
+          PACKAGE_ROW_HEIGHT,
+          monthsPerSlot
+        )
         rects.set(phase.id, {
           x: rect.left,
           y: row.top + rect.top,
@@ -616,7 +650,7 @@ export default function TimelineTab({ project, permissions }: Props) {
     }
 
     return rects
-  }, [rows])
+  }, [rows, monthsPerSlot])
 
   const links = useMemo<ArrowLink[]>(
     () =>
@@ -628,7 +662,7 @@ export default function TimelineTab({ project, permissions }: Props) {
           {
             id: dep.id,
             depType: dep.depType,
-            lagSlots: dep.lagSlots,
+            lagMonths: dep.lagMonths,
             predecessor,
             successor,
             violated: violatedLinkIds.has(dep.id),
@@ -738,8 +772,8 @@ export default function TimelineTab({ project, permissions }: Props) {
       await Promise.all(
         changed.map((phase) =>
           updateChunkPhase(phase.id, {
-            startSlot: phase.startSlot,
-            durationSlots: phase.durationSlots,
+            startMonth: phase.startMonth,
+            durationMonths: phase.durationMonths,
           })
         )
       )
@@ -961,23 +995,36 @@ export default function TimelineTab({ project, permissions }: Props) {
     const origin: DragOrigin = {
       phaseId: phase.id,
       mode,
-      startSlot: phase.startSlot,
-      durationSlots: phase.durationSlots,
+      startMonth: phase.startMonth,
+      durationMonths: phase.durationMonths,
     }
     // Refuses a resize of a phase that starts past the last column (M-27).
-    if (!canStartDrag(origin, slotCount)) return
+    if (!canStartDrag(origin, horizonMonths)) return
 
     event.preventDefault()
     event.stopPropagation()
 
     const originX = event.clientX
-    let latest: Placement = { startSlot: origin.startSlot, durationSlots: origin.durationSlots }
+    let latest: Placement = {
+      startMonth: origin.startMonth,
+      durationMonths: origin.durationMonths,
+    }
+    // Captured per drag, like the origin: the handler must not read a later
+    // render's zoom or horizon mid-gesture.
+    const unitMonths = monthsPerSlot
+    const dragHorizonMonths = horizonMonths
 
     const onMove = (moveEvent: PointerEvent) => {
-      const deltaSlots = Math.round((moveEvent.clientX - originX) / CELL_WIDTH)
-      const next = placementForDelta(origin, deltaSlots, slotCount)
+      // Snaps to whole columns of the current zoom -- a year at Year zoom, a
+      // month at Month zoom -- and converts to months, which is what is
+      // stored (D-1). A bar that sits mid-column keeps its offset.
+      const deltaColumns = Math.round((moveEvent.clientX - originX) / CELL_WIDTH)
+      const next = placementForDelta(origin, deltaColumns * unitMonths, dragHorizonMonths)
       // Most pointermoves land in the same column; skip the re-render.
-      if (next.startSlot === latest.startSlot && next.durationSlots === latest.durationSlots) {
+      if (
+        next.startMonth === latest.startMonth &&
+        next.durationMonths === latest.durationMonths
+      ) {
         return
       }
       latest = next
@@ -998,7 +1045,7 @@ export default function TimelineTab({ project, permissions }: Props) {
       // live preview, which is not "before").
       const before = effectivePhasesRef.current.map((row) =>
         row.id === origin.phaseId
-          ? { ...row, startSlot: origin.startSlot, durationSlots: origin.durationSlots }
+          ? { ...row, startMonth: origin.startMonth, durationMonths: origin.durationMonths }
           : row
       )
 
@@ -1039,7 +1086,7 @@ export default function TimelineTab({ project, permissions }: Props) {
         prev.map((row) => {
           const moved = changedById.get(row.id)
           return moved
-            ? { ...row, startSlot: moved.startSlot, durationSlots: moved.durationSlots }
+            ? { ...row, startMonth: moved.startMonth, durationMonths: moved.durationMonths }
             : row
         })
       )
@@ -1089,24 +1136,30 @@ export default function TimelineTab({ project, permissions }: Props) {
     scheduleSettingsPersist({ years })
   }
 
-  function handleZoomChange(zoomLevel: number) {
-    // M-01 interim: never write a new zoom while slots still mean "whatever
-    // the zoom says". See ZOOM_LOCKED.
-    if (ZOOM_LOCKED) return
-    const interval = intervalForZoom(zoomLevel)
-    setTimelineSettings((prev) => ({ ...prev, zoomLevel, interval }))
-    scheduleSettingsPersist({ zoomLevel, interval })
+  /** The viewer's own zoom. Writes nothing (D-1): no stored value, no price
+   *  and no export depends on it. */
+  function handleZoomChange(nextZoomLevel: number) {
+    setViewZoomLevel(nextZoomLevel)
   }
 
   /* -------------------------------------------------------------- render -- */
 
+  // Calendar span on top ("CY2026", "Jan–Mar 26"), fiscal span underneath
+  // ("FY26–27", "FY26 Q3"): columns are calendar-anchored, so at Year zoom a
+  // column is a calendar year and is no longer headed as one fiscal year
+  // (M-26, D-11). Quarters are fiscal quarters.
   const slotLabels = useMemo(
-    () => Array.from({ length: slotCount }, (_, i) => slotLabel(i, geometry.interval)),
-    [slotCount, geometry.interval]
+    () => Array.from({ length: slotCount }, (_, i) => slotCalendarLabel(i, geometry)),
+    [slotCount, geometry]
   )
   const fiscalLabels = useMemo(
-    () => Array.from({ length: slotCount }, (_, i) => fiscalYearLabel(i, geometry)),
+    () => Array.from({ length: slotCount }, (_, i) => slotFiscalLabel(i, geometry)),
     [slotCount, geometry]
+  )
+  const describePhaseSpan = useCallback(
+    (startMonth: number, durationMonths: number) =>
+      describeSpan(startMonth, durationMonths, geometry),
+    [geometry]
   )
 
   const loadError =
@@ -1248,32 +1301,31 @@ export default function TimelineTab({ project, permissions }: Props) {
                 Zoom
               </label>
               <div className="rounded-full bg-white px-3 py-1 text-sm font-semibold text-slate-900">
-                {zoomLabel(timelineSettings.zoomLevel)}
+                {zoomLabel(zoomLevel)}
               </div>
             </div>
+            {/* Enabled for everyone, viewers included: it changes the view and
+                nothing else (D-1). */}
             <input
               id="timeline-zoom"
               type="range"
               min={1}
               max={5}
               step={1}
-              value={timelineSettings.zoomLevel}
+              value={zoomLevel}
               onChange={(e) => handleZoomChange(Number(e.target.value))}
-              disabled={ZOOM_LOCKED || !canEditBaseline}
-              aria-describedby={ZOOM_LOCKED ? 'timeline-zoom-locked' : undefined}
-              className="mt-4 w-full accent-slate-900 disabled:cursor-not-allowed disabled:opacity-60"
+              aria-describedby="timeline-zoom-note"
+              className="mt-4 w-full accent-slate-900"
             />
             <div className="mt-3 grid grid-cols-5 text-center text-[10px] font-medium text-slate-500">
               {ZOOM_LEVELS.map((z) => (
                 <span key={z.level}>{z.label}</span>
               ))}
             </div>
-            {ZOOM_LOCKED ? (
-              <p id="timeline-zoom-locked" className="mt-3 text-[11px] text-slate-500">
-                Zoom is temporarily fixed. Changing it would move every phase and change the
-                totals; it comes back once schedules are stored in months.
-              </p>
-            ) : null}
+            <p id="timeline-zoom-note" className="mt-3 text-[11px] text-slate-500">
+              Changes only your view. Schedules are kept in months, so totals are the same at
+              every zoom.
+            </p>
           </div>
 
           {/* Escalation is READ-ONLY here and edited on the Cost Model tab.
@@ -1318,13 +1370,28 @@ export default function TimelineTab({ project, permissions }: Props) {
           <ul className="mt-2 space-y-1 text-xs text-rose-800">
             {violations.slice(0, 5).map((violation) => (
               <li key={violation.dependency.id}>
-                <span className="font-medium">{violation.successor.name}</span> starts at slot{' '}
-                {violation.actualStart} but cannot start before{' '}
-                {violation.requiredStart.toFixed(0)} ({violation.dependency.depType} from{' '}
-                {violation.predecessor.name})
+                <span className="font-medium">{violation.successor.name}</span> starts{' '}
+                {monthLabel(violation.actualStart, geometry)} but cannot start before{' '}
+                {monthLabel(Math.ceil(violation.requiredStart), geometry)} (
+                {violation.dependency.depType} from {violation.predecessor.name})
               </li>
             ))}
           </ul>
+        </div>
+      ) : null}
+
+      {/* M-27: the horizon was stretched to cover a phase past the Timeline
+          Length. Said out loud, because the grid is now longer than the
+          setting says, and that is on purpose: those phases are in the
+          headline, so they have to be in the columns and fiscal years too. */}
+      {horizon.extended ? (
+        <div
+          role="status"
+          className="rounded-[1.25rem] border border-sky-200 bg-sky-50 px-5 py-3 text-sm text-sky-900"
+        >
+          Some phases run past the {horizon.configuredYears}-year Timeline Length, so the
+          timeline below is extended to {geometry.years} years to show them. Every total
+          includes them, and the Excel export does the same.
         </div>
       ) : null}
 
@@ -1345,6 +1412,8 @@ export default function TimelineTab({ project, permissions }: Props) {
               links={links}
               bodyHeight={bodyHeight}
               slotCount={slotCount}
+              monthsPerSlot={monthsPerSlot}
+              describeSpan={describePhaseSpan}
               hoveredSlot={hoveredSlot}
               // Was hardcoded false. `canDrag`, not `canEdit`: a viewer may
               // drag inside their ephemeral sandbox and a consultant may drag
@@ -1377,20 +1446,32 @@ export default function TimelineTab({ project, permissions }: Props) {
           <h3 className="text-sm font-semibold text-slate-950">By fiscal year</h3>
           <p className="mt-1 text-xs text-slate-500">
             What a capital plan is actually presented as — and what the client has to fit
-            into an annual allocation.
+            into an annual allocation. Split month by month into fiscal years and fiscal
+            quarters (Q1 starts in {calendarMonthName(geometry.fiscalYearStartMonth - 1)}), the
+            same at every zoom and the same as the Excel Annual Cost Summary.
           </p>
           <div className="mt-3 flex flex-wrap gap-2">
             {fiscalTotals.map((year) => (
               <div
                 key={year.fiscalYear}
+                data-fiscal-year={year.fiscalYear}
                 className="rounded-[1rem] border border-slate-200 bg-slate-50 px-3 py-2"
               >
                 <div className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">
-                  FY{String(year.fiscalYear % 100).padStart(2, '0')}
+                  {formatFiscalYear(year.fiscalYear)}
                 </div>
                 <div className="text-sm font-semibold text-slate-900">
                   {formatCurrency(year.escalatedTotal)}
                 </div>
+                {year.escalatedTotal > 0 ? (
+                  <div className="mt-1 grid grid-cols-2 gap-x-2 text-[10px] text-slate-500">
+                    {year.quarters.map((q) => (
+                      <span key={q.quarter}>
+                        Q{q.quarter} {q.escalatedTotal > 0 ? formatCurrency(q.escalatedTotal) : '—'}
+                      </span>
+                    ))}
+                  </div>
+                ) : null}
               </div>
             ))}
           </div>

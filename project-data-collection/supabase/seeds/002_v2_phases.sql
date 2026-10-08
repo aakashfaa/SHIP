@@ -136,9 +136,15 @@ update ship.line_items li
 --    because they've acknowledged that they can't do more than one wing
 --    at a time."                                              -- Steve
 --
--- Slot units are whatever project_timeline_settings.interval_unit says;
--- the fixture project is on 'yearly', so a slot is a year and slot 0 is
--- calendar 2026.
+-- Positions are stored in MONTHS (migration 0020, decision D-1): month 0
+-- is January 2026, the timeline's start_calendar_year. The layout below
+-- is written in YEARS because that is how the story reads, and converted
+-- with `* 12` at the insert -- so PP12's [1, 2, 11, 2] is study from
+-- month 12, design from month 24, construction months 132-155. These are
+-- exactly the positions the fixture had before 0020 at its Year zoom, so
+-- every total (the Playwright fixture's $56,003,188 headline included)
+-- is unchanged. Seeds run after migrations, so 0020 never touches these
+-- rows: they must be written in months here.
 -- ---------------------------------------------------------------------
 do $$
 declare
@@ -157,6 +163,7 @@ declare
   -- (b) matters because the energy chart steps down at construction
   -- completion. Two packages finishing in the same year merge into one step,
   -- and a staircase with a single step is indistinguishable from a bug.
+  -- In YEARS; multiplied by 12 (v_months_per_year) at the insert below.
   v_layout     int[][] := array[
     array[0, 1, 3, 4],   -- PP10  design early, build 3..7   -> onset 7
     array[0, 1, 7, 3],   -- PP11  build 7..10 (FS after PP10) -> onset 10
@@ -170,6 +177,7 @@ declare
   -- dimensions, v_layout[i][j].
   v_n          int := array_length(v_layout, 1);
   v_pick       int;
+  v_months_per_year constant int := 12;
 begin
   select id into v_tpl from ship.phase_templates
    where is_builtin and name = 'DCAMM Study + Design';
@@ -202,12 +210,12 @@ begin
         v_step.kind,
         v_step.sort_order,
         v_step.default_pct_of_tpc,
-        case v_step.kind
+        v_months_per_year * case v_step.kind
           when 'study'        then v_layout[v_pick][1]
           when 'design'       then v_layout[v_pick][2]
           else                     v_layout[v_pick][3]
         end,
-        case v_step.kind
+        v_months_per_year * case v_step.kind
           when 'study'        then 1
           when 'design'       then 2
           else                     v_layout[v_pick][4]
@@ -253,7 +261,8 @@ update ship.chunk_phases p
 --    automatically push out the bulfinch?"                     -- Jeff
 --
 -- Both are finish-to-start, which is what ~all real links are. The
--- second carries a one-slot lag, so the lag rendering has a subject.
+-- second carries a one-year (12-month, migration 0020) lag, so the lag
+-- rendering has a subject.
 -- ---------------------------------------------------------------------
 insert into ship.phase_dependencies
   (predecessor_phase_id, successor_phase_id, dep_type, lag_slots)
@@ -270,7 +279,7 @@ select pred.id, succ.id, 'FS', 0
 
 insert into ship.phase_dependencies
   (predecessor_phase_id, successor_phase_id, dep_type, lag_slots)
-select pred.id, succ.id, 'FS', 1
+select pred.id, succ.id, 'FS', 12
   from ship.chunk_phases pred
   join ship.chunk_projects pc on pc.id = pred.chunk_project_id and pc.chunk_number = 'PP13'
   join ship.chunk_projects sc on sc.chunk_number = 'PP14' and sc.project_id = pc.project_id

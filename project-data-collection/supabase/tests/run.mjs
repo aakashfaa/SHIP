@@ -27,9 +27,23 @@ const files = readdirSync(here)
   .filter((f) => filters.length === 0 || filters.some((p) => f.startsWith(p)))
   .sort()
 
+/**
+ * `-- @include <path relative to the repo root>` on a line of its own is
+ * replaced by that file. It exists for one-off DATA migrations (0020): the
+ * only honest test of a conversion is to stage the "before" data inside the
+ * test's transaction, run the migration's real text over it -- twice, to
+ * prove the run-once guard -- and roll everything back.
+ */
+const repoRoot = join(here, '..', '..')
+function expandIncludes(sql) {
+  return sql.replace(/^--\s*@include\s+(\S+)\s*$/gm, (_, path) =>
+    readFileSync(join(repoRoot, path), 'utf8')
+  )
+}
+
 let failed = 0
 for (const file of files) {
-  const sql = helpers + '\n' + readFileSync(join(here, file), 'utf8')
+  const sql = helpers + '\n' + expandIncludes(readFileSync(join(here, file), 'utf8'))
   process.stdout.write(`\n=== ${file}\n`)
   const res = spawnSync(
     'docker',

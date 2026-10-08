@@ -47,13 +47,13 @@ import { formatFieldValue, getFieldValue, orderedVisibleFields } from '../form-v
 import {
   DEFAULT_ENERGY_SETTINGS,
   applyScenarioOverlay,
-  computeEnergySeries,
+  computeEnergyByFiscalYear,
   computeFiscalYearTotals,
-  computeSlotCosts,
-  fiscalYearForSlot,
-  slotCount as computeSlotCount,
+  fiscalYearForMonth,
+  formatFiscalYear,
+  monthLabel,
+  resolveHorizon,
   summarisePackage,
-  yearsPerSlot,
   type CostSettings,
   type EnergySettings,
   type PackageInput,
@@ -92,7 +92,6 @@ import type {
   ProjectEnergySettings,
   ProjectTimelineSettings,
   Scenario,
-  TimelineInterval,
 } from '../types'
 
 /**
@@ -304,34 +303,6 @@ async function fetchScenarioForExport(
 
 /* --------------------------------------------------------- engine wiring -- */
 
-/**
- * Maps the on-screen zoom slider (1-5) to the engine's `TimelineInterval`.
- *
- * This MUST mirror `ZOOM_LEVELS` / `intervalForZoom` in
- * `components/project-workspace/TimelineTab.tsx` exactly: the Timeline tab
- * derives its rendered geometry from `timelineSettings.zoomLevel`, NOT from
- * the stored `timelineSettings.interval` column, and spec §6 check 4
- * requires the export to equal the on-screen total "to the cent". That file
- * is owned by parallel work and is a Client Component (so it cannot be
- * imported into this server-only module) — this is a deliberate, commented
- * duplication of five lines rather than a shared import, not an
- * independent re-derivation of the mapping.
- */
-function intervalForZoom(zoomLevel: number): TimelineInterval {
-  switch (zoomLevel) {
-    case 1:
-      return '5-yearly'
-    case 2:
-      return '3-yearly'
-    case 4:
-      return 'quarterly'
-    case 5:
-      return 'monthly'
-    default:
-      return 'yearly'
-  }
-}
-
 function toEnginePhase(phase: ChunkPhase): Phase {
   return {
     id: phase.id,
@@ -340,8 +311,8 @@ function toEnginePhase(phase: ChunkPhase): Phase {
     kind: phase.kind,
     sortOrder: phase.sortOrder,
     pctOfTpc: phase.pctOfTpc,
-    startSlot: phase.startSlot,
-    durationSlots: phase.durationSlots,
+    startMonth: phase.startMonth,
+    durationMonths: phase.durationMonths,
     durationLocked: phase.durationLocked,
   }
 }
@@ -368,14 +339,6 @@ function toEnergySettings(row: ProjectEnergySettings | null): EnergySettings {
     baselineAnnual: row.baselineAnnual,
     interactionFactor: row.interactionFactor,
   }
-}
-
-/** `FY29` — same tail-formatting `fiscalYearLabel` in lib/cost-model.ts
- *  uses, restated here because that helper takes a SLOT, and the fiscal
- *  years here already come out of `computeFiscalYearTotals` as plain
- *  numbers. */
-function formatFiscalYear(year: number): string {
-  return `FY${String(((year % 100) + 100) % 100).padStart(2, '0')}`
 }
 
 /* ------------------------------------------------------------- shaping -- */
@@ -414,6 +377,9 @@ export type ReportPhase = {
   phaseName: string
   kind: string
   startFiscalYear: string
+  /** "Jul 2027": the phase's first month (D-1, schedules are in months). */
+  startMonth: string
+  durationMonths: number
   durationYears: number
   durationLocked: boolean
   escalatedCost: number
@@ -423,6 +389,8 @@ export type ReportAnnualTotal = {
   fiscalYear: number
   fiscalYearLabel: string
   escalatedTotal: number
+  /** Fiscal quarters Q1..Q4 (D-11), summing to `escalatedTotal`. */
+  quarterTotals: [number, number, number, number]
 }
 
 export type ReportEnergyPoint = {
@@ -616,8 +584,12 @@ export async function buildProjectReportData(
   const costSettings = toCostSettings(costSettingsRow, baseYear)
   const energySettings = toEnergySettings(energySettingsRow)
 
-  const geometry: TimelineGeometry = {
-    interval: intervalForZoom(timelineSettings.zoomLevel),
+  // No zoom here any more (M-01, D-1): schedules are in months and nothing
+  // the workbook contains depends on how many months a screen column shows,
+  // so two people exporting at different zooms get the same file. `interval`
+  // is required by the type and read by nothing below.
+  const configuredGeometry: TimelineGeometry = {
+    interval: 'yearly',
     years: timelineSettings.years,
     startCalendarYear,
     fiscalYearStartMonth: timelineSettings.fiscalYearStartMonth,
@@ -642,6 +614,12 @@ export async function buildProjectReportData(
     ])
   }
   for (const list of phasesByChunk.values()) list.sort((a, b) => a.sortOrder - b.sortOrder)
+
+  // The one horizon rule the Timeline uses too (M-27): stretched to the end
+  // of the furthest phase, so the Annual Cost Summary adds up to the
+  // Packages total instead of silently dropping what is scheduled late.
+  const horizon = resolveHorizon(configuredGeometry, effectivePhases.map(toEnginePhase))
+  const geometry = horizon.geometry
 
   let unreadableQuantityLinks = 0
 
@@ -687,12 +665,10 @@ export async function buildProjectReportData(
     )
   )
 
-  const slotCosts = computeSlotCosts(summaries, geometry)
-  const energySeries = computeEnergySeries(summaries, energySettings, geometry)
-  const fiscalTotals = computeFiscalYearTotals(slotCosts)
-
-  const yearsPerSlotValue = yearsPerSlot(geometry.interval)
-  const slotCountValue = computeSlotCount(geometry.years, geometry.interval)
+  // Monthly resolution, fiscal quarters (M-26, D-11): the same function the
+  // Timeline's "By fiscal year" strip calls.
+  const fiscalTotals = computeFiscalYearTotals(summaries, geometry)
+  const energyByYear = computeEnergyByFiscalYear(summaries, energySettings, geometry)
 
   const unreadableCostItems = lineItems
     .filter((item) => !parseCostAmount(item.estimatedFirstCost).ok)
@@ -702,6 +678,12 @@ export async function buildProjectReportData(
   if (scenario) {
     notices.push(
       `What-if scenario "${scenario.name}": these figures are the scenario's schedule, not the live plan.`
+    )
+  }
+  if (horizon.extended) {
+    notices.push(
+      `Some phases run past the ${horizon.configuredYears}-year timeline, so the annual figures run to ` +
+        `${geometry.years} years to include them.`
     )
   }
   if (unreadableCostItems.length > 0) {
@@ -734,8 +716,10 @@ export async function buildProjectReportData(
       packageName: summary.input.name,
       phaseName: phaseCost.phase.name,
       kind: phaseCost.phase.kind,
-      startFiscalYear: formatFiscalYear(fiscalYearForSlot(phaseCost.phase.startSlot, geometry)),
-      durationYears: Math.round(phaseCost.phase.durationSlots * yearsPerSlotValue * 100) / 100,
+      startFiscalYear: formatFiscalYear(fiscalYearForMonth(phaseCost.phase.startMonth, geometry)),
+      startMonth: monthLabel(phaseCost.phase.startMonth, geometry),
+      durationMonths: Math.round(phaseCost.phase.durationMonths * 100) / 100,
+      durationYears: Math.round((phaseCost.phase.durationMonths / 12) * 100) / 100,
       durationLocked: phaseCost.phase.durationLocked,
       escalatedCost: phaseCost.escalatedCost,
     }))
@@ -745,16 +729,21 @@ export async function buildProjectReportData(
     fiscalYear: total.fiscalYear,
     fiscalYearLabel: formatFiscalYear(total.fiscalYear),
     escalatedTotal: total.escalatedTotal,
+    quarterTotals: [
+      total.quarters[0].escalatedTotal,
+      total.quarters[1].escalatedTotal,
+      total.quarters[2].escalatedTotal,
+      total.quarters[3].escalatedTotal,
+    ],
   }))
 
-  const energySummary: ReportEnergyPoint[] = Array.from({ length: slotCountValue }, (_, slot) => {
-    const point = energySeries.points[slot]
-    return {
-      fiscalYear: formatFiscalYear(fiscalYearForSlot(slot, geometry)),
-      cumulativeSavings: point?.cumulativeSavings ?? 0,
-      remainingConsumption: point?.remainingConsumption ?? null,
-    }
-  })
+  // One row per fiscal year, read at the year's end -- not one row per
+  // screen column, which made this sheet's length depend on the zoom.
+  const energySummary: ReportEnergyPoint[] = energyByYear.map((point) => ({
+    fiscalYear: formatFiscalYear(point.fiscalYear),
+    cumulativeSavings: point.cumulativeSavings,
+    remainingConsumption: point.remainingConsumption,
+  }))
 
   return {
     project: { id: project.id, name: project.name },

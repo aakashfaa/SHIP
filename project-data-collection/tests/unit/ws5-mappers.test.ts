@@ -219,8 +219,8 @@ describe('scenario payload RPC arguments', () => {
         kind: 'design',
         sortOrder: 0,
         pctOfTpc: 20,
-        startSlot: 2,
-        durationSlots: 3,
+        startMonth: 2,
+        durationMonths: 3,
         durationLocked: false,
       },
     ])
@@ -236,7 +236,7 @@ describe('scenario payload RPC arguments', () => {
       duration_locked: false,
     })
     const deps = m.scenarioDependenciesToRows([
-      { id: 'd1', predecessorPhaseId: 'a', successorPhaseId: 'b', depType: 'FS', lagSlots: -1 },
+      { id: 'd1', predecessorPhaseId: 'a', successorPhaseId: 'b', depType: 'FS', lagMonths: -1 },
     ])
     assert.deepEqual(deps[0], {
       id: 'd1',

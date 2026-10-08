@@ -234,6 +234,9 @@ export type FiscalYearLabelsBy = 'start_year' | 'end_year'
 export type ProjectTimelineSettings = {
   projectId: string
   years: number
+  // The DEFAULT VIEW only (D-1). Each viewer zooms locally on the Timeline;
+  // nothing that is priced, stored or exported depends on either of these
+  // since schedules moved to months (migration 0020).
   interval: TimelineInterval
   zoomLevel: number
   escalationPercent: number
@@ -291,8 +294,12 @@ export type ChunkPhase = {
   // rescaling a number a cost estimator typed is worse than showing them
   // it's wrong. See lib/cost-model.ts summarisePackage.
   pctOfTpc: number
-  startSlot: number
-  durationSlots: number
+  // Months from January of the timeline's start year, and length in months
+  // (D-1). Stored in chunk_phases.start_slot / duration_slots -- the column
+  // names predate the change; migration 0020 converted every row and
+  // comments the columns. NEVER zoom-dependent: the zoom is a view.
+  startMonth: number
+  durationMonths: number
   // Fixed Duration in the MS Project sense: the bar's length is constant,
   // its position is not. A locked phase can still be moved.
   durationLocked: boolean
@@ -307,9 +314,9 @@ export type PhaseDependency = {
   predecessorPhaseId: string
   successorPhaseId: string
   depType: DependencyType
-  // In slots. May be negative, which is a lead ("bidding can overlap the
-  // tail of CD").
-  lagSlots: number
+  // In months (column lag_slots, see migration 0020). May be negative,
+  // which is a lead ("bidding can overlap the tail of CD").
+  lagMonths: number
 }
 
 export type PhaseTemplateStep = {
@@ -319,7 +326,8 @@ export type PhaseTemplateStep = {
   kind: PhaseKind
   sortOrder: number
   defaultPctOfTpc: number
-  defaultDurationSlots: number
+  // Months (column default_duration_slots, see migration 0020).
+  defaultDurationMonths: number
 }
 
 export type PhaseTemplate = {
@@ -503,8 +511,11 @@ export type ScenarioPhase = {
   kind: PhaseKind
   sortOrder: number
   pctOfTpc: number
-  startSlot: number
-  durationSlots: number
+  // Months, like ChunkPhase. The payload's jsonb keys are still
+  // `start_slot` / `duration_slots` (the RPCs read them by name); migration
+  // 0020 converted their values.
+  startMonth: number
+  durationMonths: number
   durationLocked: boolean
 }
 
@@ -513,7 +524,7 @@ export type ScenarioDependency = {
   predecessorPhaseId: string
   successorPhaseId: string
   depType: DependencyType
-  lagSlots: number
+  lagMonths: number
 }
 
 export type ScenarioPayload = {

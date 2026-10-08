@@ -10,7 +10,8 @@ import { settle } from '../helpers/settle'
  * - M-30: "Back to live plan" then "Resume…" shows the latest moves, in the
  *   same session and after a reload.
  * - M-23: Discard asks first, naming the what-if.
- * - M-01 (interim): the Zoom slider is locked and cannot change the totals.
+ * - M-01 (Wave B, D-1): zoom is a per-viewer view. Every level shows the
+ *   same totals, and nothing is saved -- a reload opens at the default view.
  *
  * Signs in as planning@atlasmech.com (an editor on the seed project) rather
  * than reusing the admin storage state, because editors are the people who
@@ -107,29 +108,28 @@ test.afterEach(async ({ page }) => {
   await discardOurScenarios(page)
 })
 
-test('zoom is locked and cannot change the totals (M-01 interim)', async ({ page }) => {
+test('zoom changes the view only: same totals at every level, nothing saved (M-01, D-1)', async ({
+  page,
+}) => {
   await openTimeline(page)
   const before = await totalText(page)
+  const fyStrip = page.getByRole('heading', { name: 'By fiscal year' }).locator('..')
+  const fyBefore = (await fyStrip.innerText()).trim()
 
   const zoom = page.locator('#timeline-zoom')
-  await expect(zoom).toBeDisabled()
-  await expect(page.getByText('Zoom is temporarily fixed.')).toBeVisible()
+  await expect(zoom).toBeEnabled()
+  for (const level of ['1', '2', '4', '5', '3']) {
+    await zoom.fill(level)
+    expect(await totalText(page)).toBe(before)
+    expect((await fyStrip.innerText()).trim()).toBe(fyBefore)
+  }
 
-  // Even a synthetic change event (bypassing the disabled attribute) must not
-  // re-zoom or persist anything.
-  await zoom.evaluate((el) => {
-    const input = el as HTMLInputElement
-    input.disabled = false
-    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!
-    setter.call(input, '5')
-    input.dispatchEvent(new Event('input', { bubbles: true }))
-    input.dispatchEvent(new Event('change', { bubbles: true }))
-  })
-  await page.waitForTimeout(800) // past the 400ms settings debounce
-  expect(await totalText(page)).toBe(before)
-
+  // Month zoom, then reload: the view is not persisted, so the page opens at
+  // the project's default (Year) again -- and the totals never moved.
+  await zoom.fill('5')
   await page.reload()
   await settle(page)
+  await expect(page.locator('#timeline-zoom')).toHaveValue('3')
   expect(await totalText(page)).toBe(before)
 })
 

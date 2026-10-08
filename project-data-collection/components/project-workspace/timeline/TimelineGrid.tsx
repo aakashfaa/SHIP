@@ -45,6 +45,12 @@ type Props = {
   links: ArrowLink[]
   bodyHeight: number
   slotCount: number
+  /** Months per column at the viewer's zoom. Phases are stored in months
+   *  (D-1); this is the only place the grid turns them into pixels. */
+  monthsPerSlot: number
+  /** "Jul 2027 – Jun 2029 · 24 months" for a bar's tooltip, so the stored
+   *  months can be read exactly at any zoom. */
+  describeSpan: (startMonth: number, durationMonths: number) => string
   hoveredSlot: number | null
   readOnly: boolean
   /**
@@ -81,6 +87,8 @@ export default function TimelineGrid({
   links,
   bodyHeight,
   slotCount,
+  monthsPerSlot,
+  describeSpan,
   hoveredSlot,
   readOnly,
   permissionsLoading,
@@ -185,11 +193,11 @@ export default function TimelineGrid({
           // unit the client talks about ("the wings project is $3 million").
           // It spans the full extent of its phases.
           const spanStart = phases.length
-            ? Math.min(...phases.map((p) => p.startSlot))
+            ? Math.min(...phases.map((p) => p.startMonth))
             : 0
           const spanEnd = phases.length
-            ? Math.max(...phases.map((p) => p.startSlot + p.durationSlots))
-            : 1
+            ? Math.max(...phases.map((p) => p.startMonth + p.durationMonths))
+            : monthsPerSlot
 
           return (
             <Fragment key={pkg.chunkProjectId}>
@@ -251,7 +259,7 @@ export default function TimelineGrid({
                       aria-expanded={false}
                       className="absolute flex cursor-pointer items-center rounded-[0.9rem] border border-slate-700 bg-[linear-gradient(135deg,rgba(15,23,42,0.94)_0%,rgba(30,41,59,0.92)_50%,rgba(14,116,144,0.9)_100%)] px-3 text-left text-white shadow-lg transition hover:brightness-110 focus:outline-none focus-visible:ring-2 focus-visible:ring-teal-300"
                       style={{
-                        ...barRect(spanStart, spanEnd - spanStart, PACKAGE_ROW_HEIGHT),
+                        ...barRect(spanStart, spanEnd - spanStart, PACKAGE_ROW_HEIGHT, monthsPerSlot),
                         position: 'absolute',
                       }}
                     >
@@ -275,7 +283,7 @@ export default function TimelineGrid({
                       aria-expanded={true}
                       className="absolute flex cursor-pointer items-center rounded-[0.9rem] border-2 border-dashed border-slate-400 bg-slate-50/80 px-3 text-left text-slate-700 transition hover:border-slate-600 hover:bg-slate-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-teal-300"
                       style={{
-                        ...barRect(spanStart, spanEnd - spanStart, PACKAGE_ROW_HEIGHT),
+                        ...barRect(spanStart, spanEnd - spanStart, PACKAGE_ROW_HEIGHT, monthsPerSlot),
                         position: 'absolute',
                       }}
                     >
@@ -294,7 +302,12 @@ export default function TimelineGrid({
                 ? phases.map((phase) => {
                     const style = PHASE_STYLES[phase.kind]
                     const phaseCost = summary.phases.find((p) => p.phase.id === phase.id)
-                    const rect = barRect(phase.startSlot, phase.durationSlots, PHASE_ROW_HEIGHT)
+                    const rect = barRect(
+                      phase.startMonth,
+                      phase.durationMonths,
+                      PHASE_ROW_HEIGHT,
+                      monthsPerSlot
+                    )
 
                     return (
                       <div
@@ -345,21 +358,28 @@ export default function TimelineGrid({
                             style={{ ...rect, height: BAR_HEIGHT }}
                             // Stable hooks for the what-if browser spec, which
                             // has to find "this bar" again after a reload and
-                            // read where it landed.
+                            // read where it landed. Months are the stored
+                            // values (D-1); the slot pair is the same position
+                            // in columns at the current zoom.
                             data-phase-id={phase.id}
                             data-chunk-id={phase.chunkProjectId}
-                            data-start-slot={phase.startSlot}
-                            data-duration-slots={phase.durationSlots}
+                            data-start-month={phase.startMonth}
+                            data-duration-months={phase.durationMonths}
+                            data-start-slot={phase.startMonth / monthsPerSlot}
+                            data-duration-slots={phase.durationMonths / monthsPerSlot}
                             onPointerDown={
                               readOnly
                                 ? undefined
                                 : (event) => onPhasePointerDown(event, phase, 'move')
                             }
-                            title={
+                            title={[
+                              describeSpan(phase.startMonth, phase.durationMonths),
                               phaseCost?.beyondConfidenceHorizon
                                 ? 'Past the escalation confidence horizon — treat this number as a range, not a forecast'
-                                : undefined
-                            }
+                                : null,
+                            ]
+                              .filter(Boolean)
+                              .join('\n')}
                           >
                             {/* Resize handles are ABSENT, not merely inert, on
                                 a locked phase. A disabled handle that still

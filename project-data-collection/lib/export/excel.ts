@@ -161,6 +161,8 @@ export function buildExcelWorkbook(data: ProjectReportData): ExcelJS.Workbook {
       { header: 'Phase Name', width: 32, value: (r) => r.phaseName },
       { header: 'Kind', width: 14, value: (r) => r.kind },
       { header: 'Start (Fiscal Year)', width: 18, value: (r) => r.startFiscalYear },
+      { header: 'Start Month', width: 14, value: (r) => r.startMonth },
+      { header: 'Duration (months)', width: 18, value: (r) => r.durationMonths },
       { header: 'Duration (years)', width: 16, value: (r) => r.durationYears },
       { header: 'Locked', width: 10, value: (r) => (r.durationLocked ? 'Yes' : 'No') },
       { header: 'Cost', width: 18, currency: true, value: (r) => r.escalatedCost },
@@ -174,6 +176,12 @@ export function buildExcelWorkbook(data: ProjectReportData): ExcelJS.Workbook {
     'Annual Cost Summary',
     [
       { header: 'Fiscal Year', width: 14, value: (r) => r.fiscalYearLabel },
+      // Fiscal quarters (D-11), split month by month like the total: Q1 is
+      // the fiscal year's first three months (Jul-Sep for a July year).
+      { header: 'Q1', width: 16, currency: true, value: (r) => r.quarterTotals[0] },
+      { header: 'Q2', width: 16, currency: true, value: (r) => r.quarterTotals[1] },
+      { header: 'Q3', width: 16, currency: true, value: (r) => r.quarterTotals[2] },
+      { header: 'Q4', width: 16, currency: true, value: (r) => r.quarterTotals[3] },
       { header: 'Total Cost', width: 18, currency: true, value: (r) => r.escalatedTotal },
     ],
     data.annualCostSummary,

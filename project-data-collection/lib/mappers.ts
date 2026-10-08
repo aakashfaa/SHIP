@@ -10,6 +10,18 @@
  *
  * The second exists because `interval` is a reserved type name in Postgres.
  *
+ * And one family of renames that is about UNITS, not spelling (migration
+ * 0020, decision D-1): schedule positions are stored in months, under column
+ * names that predate the change.
+ *
+ *   chunk_phases.start_slot / duration_slots          <-> startMonth / durationMonths
+ *   phase_dependencies.lag_slots                      <-> lagMonths
+ *   phase_template_steps.default_duration_slots       <-> defaultDurationMonths
+ *   scenarios.payload {start_slot, duration_slots, lag_slots} (same)
+ *
+ * No conversion happens here -- the stored values ARE months. The zoom never
+ * enters into it; it is a view (see TimelineTab).
+ *
  * This file also owns the defaulting/clamping that used to live in `store.ts`
  * as `normalizeChunkProject` and `normalizeTimelineSettings`.
  */
@@ -565,8 +577,8 @@ export function rowToChunkPhase(row: ChunkPhaseRow): ChunkPhase {
     kind: row.kind as PhaseKind,
     sortOrder: toNumber(row.sort_order) ?? 0,
     pctOfTpc: toNumber(row.pct_of_tpc) ?? 0,
-    startSlot: toNumber(row.start_slot) ?? 0,
-    durationSlots: toNumber(row.duration_slots) ?? 1,
+    startMonth: toNumber(row.start_slot) ?? 0,
+    durationMonths: toNumber(row.duration_slots) ?? 1,
     durationLocked: row.duration_locked,
     createdAt: row.created_at,
   }
@@ -586,8 +598,8 @@ export function chunkPhaseToRow(patch: Partial<ChunkPhase>): Partial<ChunkPhaseR
   if (patch.kind !== undefined) row.kind = patch.kind
   if (patch.sortOrder !== undefined) row.sort_order = patch.sortOrder
   if (patch.pctOfTpc !== undefined) row.pct_of_tpc = patch.pctOfTpc
-  if (patch.startSlot !== undefined) row.start_slot = patch.startSlot
-  if (patch.durationSlots !== undefined) row.duration_slots = patch.durationSlots
+  if (patch.startMonth !== undefined) row.start_slot = patch.startMonth
+  if (patch.durationMonths !== undefined) row.duration_slots = patch.durationMonths
   if (patch.durationLocked !== undefined) row.duration_locked = patch.durationLocked
 
   return row
@@ -612,7 +624,7 @@ export function rowToPhaseDependency(row: PhaseDependencyRow): PhaseDependency {
     predecessorPhaseId: row.predecessor_phase_id,
     successorPhaseId: row.successor_phase_id,
     depType: row.dep_type as DependencyType,
-    lagSlots: toNumber(row.lag_slots) ?? 0,
+    lagMonths: toNumber(row.lag_slots) ?? 0,
   }
 }
 
@@ -627,14 +639,14 @@ export function phaseDependencyToRow(input: {
   predecessorPhaseId: string
   successorPhaseId: string
   depType?: DependencyType
-  lagSlots?: number
+  lagMonths?: number
 }): Partial<PhaseDependencyRow> {
   const row: Partial<PhaseDependencyRow> = {
     predecessor_phase_id: input.predecessorPhaseId,
     successor_phase_id: input.successorPhaseId,
   }
   if (input.depType !== undefined) row.dep_type = input.depType
-  if (input.lagSlots !== undefined) row.lag_slots = input.lagSlots
+  if (input.lagMonths !== undefined) row.lag_slots = input.lagMonths
   return row
 }
 
@@ -658,7 +670,7 @@ export function rowToPhaseTemplateStep(row: PhaseTemplateStepRow): PhaseTemplate
     kind: row.kind as PhaseKind,
     sortOrder: toNumber(row.sort_order) ?? 0,
     defaultPctOfTpc: toNumber(row.default_pct_of_tpc) ?? 0,
-    defaultDurationSlots: toNumber(row.default_duration_slots) ?? 1,
+    defaultDurationMonths: toNumber(row.default_duration_slots) ?? 1,
   }
 }
 
@@ -880,8 +892,8 @@ function toScenarioPayload(value: unknown): ScenarioPayload {
             kind: (p.kind as ScenarioPhase['kind']) ?? 'construction',
             sortOrder: toNumber(p.sort_order) ?? 0,
             pctOfTpc: toNumber(p.pct_of_tpc) ?? 0,
-            startSlot: toNumber(p.start_slot) ?? 0,
-            durationSlots: Math.max(toNumber(p.duration_slots) ?? 1, 1),
+            startMonth: toNumber(p.start_slot) ?? 0,
+            durationMonths: Math.max(toNumber(p.duration_slots) ?? 1, 1),
             durationLocked: p.duration_locked === true,
           },
         ]
@@ -898,7 +910,7 @@ function toScenarioPayload(value: unknown): ScenarioPayload {
             predecessorPhaseId: String(d.predecessor_phase_id ?? ''),
             successorPhaseId: String(d.successor_phase_id ?? ''),
             depType: (d.dep_type as ScenarioDependency['depType']) ?? 'FS',
-            lagSlots: toNumber(d.lag_slots) ?? 0,
+            lagMonths: toNumber(d.lag_slots) ?? 0,
           },
         ]
       })
@@ -945,8 +957,8 @@ export function scenarioPhasesToRows(
     kind: p.kind,
     sort_order: p.sortOrder,
     pct_of_tpc: p.pctOfTpc,
-    start_slot: p.startSlot,
-    duration_slots: p.durationSlots,
+    start_slot: p.startMonth,
+    duration_slots: p.durationMonths,
     duration_locked: p.durationLocked,
   }))
 }
@@ -960,7 +972,7 @@ export function scenarioDependenciesToRows(
     predecessor_phase_id: d.predecessorPhaseId,
     successor_phase_id: d.successorPhaseId,
     dep_type: d.depType,
-    lag_slots: d.lagSlots,
+    lag_slots: d.lagMonths,
   }))
 }
 

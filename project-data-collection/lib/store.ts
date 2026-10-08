@@ -863,7 +863,7 @@ export async function createPhaseDependency(input: {
   predecessorPhaseId: string
   successorPhaseId: string
   depType?: DependencyType
-  lagSlots?: number
+  lagMonths?: number
 }): Promise<PhaseDependency> {
   const supabase = getSupabaseBrowserClient()
 

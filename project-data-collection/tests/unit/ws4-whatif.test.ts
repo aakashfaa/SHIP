@@ -27,20 +27,20 @@ type Row = {
   kind: 'study' | 'design' | 'construction' | 'closeout'
   sortOrder: number
   pctOfTpc: number
-  startSlot: number
-  durationSlots: number
+  startMonth: number
+  durationMonths: number
   durationLocked: boolean
 }
 
-const P = (id: string, startSlot: number, durationSlots = 1): Row => ({
+const P = (id: string, startMonth: number, durationMonths = 1): Row => ({
   id,
   chunkProjectId: 'c',
   name: id,
   kind: 'construction',
   sortOrder: 0,
   pctOfTpc: 50,
-  startSlot,
-  durationSlots,
+  startMonth,
+  durationMonths,
   durationLocked: false,
 })
 
@@ -54,8 +54,8 @@ function drop(baseline: Row[], overlay: Map<string, Row>, id: string, delta: num
   const origin: DragOrigin = {
     phaseId: id,
     mode: 'move',
-    startSlot: phase.startSlot,
-    durationSlots: phase.durationSlots,
+    startMonth: phase.startMonth,
+    durationMonths: phase.durationMonths,
   }
   const placement = placementForDelta(origin, delta, 10)
   if (isNoOpDrop(origin, placement)) return overlay
@@ -70,8 +70,8 @@ describe('what-if drags (M-05)', () => {
     let overlay = new Map(baseline.map((p) => [p.id, { ...p }]))
     overlay = drop(baseline, overlay, 'A', 3)
     overlay = drop(baseline, overlay, 'B', 2)
-    assert.equal(overlay.get('A')!.startSlot, 3)
-    assert.equal(overlay.get('B')!.startSlot, 7)
+    assert.equal(overlay.get('A')!.startMonth, 3)
+    assert.equal(overlay.get('B')!.startMonth, 7)
   })
 
   test('a plain click (delta 0) changes nothing and is a no-op', () => {
@@ -80,7 +80,7 @@ describe('what-if drags (M-05)', () => {
     overlay = drop(baseline, overlay, 'A', 3)
     const after = drop(baseline, overlay, 'B', 0)
     assert.equal(after, overlay, 'no new overlay is built for a no-op drop')
-    assert.equal(after.get('A')!.startSlot, 3)
+    assert.equal(after.get('A')!.startMonth, 3)
   })
 
   test('dragging the same bar twice measures from its what-if position', () => {
@@ -88,43 +88,43 @@ describe('what-if drags (M-05)', () => {
     let overlay = new Map(baseline.map((p) => [p.id, { ...p }]))
     overlay = drop(baseline, overlay, 'A', 2)
     overlay = drop(baseline, overlay, 'A', 2)
-    assert.equal(overlay.get('A')!.startSlot, 4)
+    assert.equal(overlay.get('A')!.startMonth, 4)
   })
 
   test('only changed ids are touched; other overlay entries are the same objects', () => {
     const baseline = [P('A', 0), P('B', 5)]
-    const overlay = new Map(baseline.map((p) => [p.id, { ...p, startSlot: p.startSlot + 1 }]))
-    const next = mergeDropIntoOverlay(overlay, [{ id: 'A', startSlot: 4, durationSlots: 1 }], () =>
+    const overlay = new Map(baseline.map((p) => [p.id, { ...p, startMonth: p.startMonth + 1 }]))
+    const next = mergeDropIntoOverlay(overlay, [{ id: 'A', startMonth: 4, durationMonths: 1 }], () =>
       undefined
     )
     assert.notEqual(next, overlay)
     assert.equal(next.get('B'), overlay.get('B'))
-    assert.equal(next.get('A')!.startSlot, 4)
+    assert.equal(next.get('A')!.startMonth, 4)
   })
 
   test('propagation is applied when supplied and skipped when not', () => {
     const eff = [P('A', 0), P('B', 1)]
     const push = (rows: Row[]) =>
-      new Map(rows.map((r) => [r.id, { startSlot: r.id === 'B' ? Math.max(r.startSlot, rows[0].startSlot + 1) : r.startSlot }]))
-    const withPush = changedPhasesForDrop(eff, 'A', { startSlot: 3, durationSlots: 1 }, push)
-    assert.deepEqual(withPush.map((r) => [r.id, r.startSlot]), [['A', 3], ['B', 4]])
-    const without = changedPhasesForDrop(eff, 'A', { startSlot: 3, durationSlots: 1 })
-    assert.deepEqual(without.map((r) => [r.id, r.startSlot]), [['A', 3]])
+      new Map(rows.map((r) => [r.id, { startMonth: r.id === 'B' ? Math.max(r.startMonth, rows[0].startMonth + 1) : r.startMonth }]))
+    const withPush = changedPhasesForDrop(eff, 'A', { startMonth: 3, durationMonths: 1 }, push)
+    assert.deepEqual(withPush.map((r) => [r.id, r.startMonth]), [['A', 3], ['B', 4]])
+    const without = changedPhasesForDrop(eff, 'A', { startMonth: 3, durationMonths: 1 })
+    assert.deepEqual(without.map((r) => [r.id, r.startMonth]), [['A', 3]])
   })
 })
 
 describe('resize clamp (M-27)', () => {
-  const origin = (mode: DragOrigin['mode'], startSlot: number, durationSlots: number) => ({
+  const origin = (mode: DragOrigin['mode'], startMonth: number, durationMonths: number) => ({
     phaseId: 'A',
     mode,
-    startSlot,
-    durationSlots,
+    startMonth,
+    durationMonths,
   })
 
   test('resize-end never produces duration < 1', () => {
     for (const delta of [-50, -3, -1, 0, 1, 50]) {
       const p = placementForDelta(origin('resize-end', 9, 1), delta, 10)
-      assert.ok(p.durationSlots >= 1, `delta ${delta} -> ${p.durationSlots}`)
+      assert.ok(p.durationMonths >= 1, `delta ${delta} -> ${p.durationMonths}`)
     }
   })
 
@@ -134,19 +134,19 @@ describe('resize clamp (M-27)', () => {
     assert.equal(canStartDrag(origin('move', 12, 2), 10), true)
     // Moving it brings it back inside the timeline.
     assert.deepEqual(placementForDelta(origin('move', 12, 2), 0, 10), {
-      startSlot: 8,
-      durationSlots: 2,
+      startMonth: 8,
+      durationMonths: 2,
     })
   })
 
   test('resize-start keeps start >= 0 and duration >= 1', () => {
     assert.deepEqual(placementForDelta(origin('resize-start', 2, 3), -9, 10), {
-      startSlot: 0,
-      durationSlots: 5,
+      startMonth: 0,
+      durationMonths: 5,
     })
     assert.deepEqual(placementForDelta(origin('resize-start', 2, 3), 9, 10), {
-      startSlot: 4,
-      durationSlots: 1,
+      startMonth: 4,
+      durationMonths: 1,
     })
   })
 })

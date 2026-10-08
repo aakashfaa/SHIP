@@ -25,6 +25,7 @@ import {
   escalationFactor,
   fiscalYearForSlot,
   findDependencyViolations,
+  monthsPerSlot,
   phaseYearsOut,
   propagateDependencies,
   slotToYears,
@@ -40,6 +41,11 @@ import {
 } from '../../lib/cost-model.ts'
 
 /* ------------------------------------------------------------- fixtures -- */
+
+/** Months in a year. Phases are stored in MONTHS (D-1, migration 0020);
+ *  these tests were written in years at Year zoom, so `3 * Y` reads as
+ *  "year 3" and is the same calendar position the old `startSlot: 3` was. */
+const Y = 12
 
 const GEOMETRY: TimelineGeometry = {
   interval: 'yearly',
@@ -65,8 +71,8 @@ function phase(overrides: Partial<Phase> & { id: string }): Phase {
     kind: 'construction',
     sortOrder: 0,
     pctOfTpc: 100,
-    startSlot: 0,
-    durationSlots: 1,
+    startMonth: 0,
+    durationMonths: Y,
     durationLocked: false,
     ...overrides,
   }
@@ -82,7 +88,7 @@ function dep(
     predecessorPhaseId,
     successorPhaseId,
     depType: 'FS',
-    lagSlots: 0,
+    lagMonths: 0,
     ...overrides,
   }
 }
@@ -113,6 +119,15 @@ describe('slot geometry', () => {
     assert.equal(yearsPerSlot('monthly'), 1 / 12)
     assert.equal(yearsPerSlot('yearly'), 1)
     assert.equal(yearsPerSlot('5-yearly'), 5)
+  })
+
+  test('monthsPerSlot is exact integers -- the 0020 conversion factors', () => {
+    assert.deepEqual(
+      (['monthly', 'quarterly', 'yearly', 'bi-yearly', '3-yearly', '5-yearly'] as const).map(
+        monthsPerSlot
+      ),
+      [1, 3, 12, 24, 36, 60]
+    )
   })
 })
 
@@ -192,7 +207,7 @@ describe('escalation', () => {
 })
 
 describe('escalation basis', () => {
-  const p = phase({ id: 'p', startSlot: 2, durationSlots: 4 })
+  const p = phase({ id: 'p', startMonth: 2 * Y, durationMonths: 4 * Y })
 
   test('midpoint reads the clock half a duration later than start', () => {
     const atStart = phaseYearsOut(p, { ...SETTINGS, escalationBasis: 'start' }, GEOMETRY)
@@ -200,7 +215,7 @@ describe('escalation basis', () => {
 
     assert.equal(atStart, 2)
     assert.equal(atMid, 4)
-    assert.equal(atMid - atStart, p.durationSlots / 2)
+    assert.equal(atMid - atStart, p.durationMonths / 2 / Y)
   })
 
   test('midpoint prices a multi-year build higher than start — the whole reason it is the default', () => {
@@ -215,7 +230,7 @@ describe('escalation basis', () => {
     // An estimate priced in 2026 used on a plan anchored at 2028 already
     // carries two years before anything is dragged.
     const anchored: TimelineGeometry = { ...GEOMETRY, startCalendarYear: 2028 }
-    const atSlotZero = phase({ id: 'z', startSlot: 0, durationSlots: 0 })
+    const atSlotZero = phase({ id: 'z', startMonth: 0, durationMonths: 0 })
 
     assert.equal(phaseYearsOut(atSlotZero, SETTINGS, anchored), 2)
     assert.equal(phaseYearsOut(atSlotZero, SETTINGS, GEOMETRY), 0)
@@ -226,7 +241,7 @@ describe('escalation basis', () => {
 
 describe('phase cost', () => {
   test('a phase at the base year costs exactly its share of TPC', () => {
-    const p = phase({ id: 'p', pctOfTpc: 90, startSlot: 0, durationSlots: 0 })
+    const p = phase({ id: 'p', pctOfTpc: 90, startMonth: 0, durationMonths: 0 })
     const cost = computePhaseCost(p, 1_000_000, SETTINGS, GEOMETRY)
 
     assertMoney(cost.baseCost, 900_000)
@@ -238,16 +253,17 @@ describe('phase cost', () => {
     // "Costs for each phase were amortized over the duration of each phase so
     // that the total value of each phase were divided by the number of months
     // in duration."
-    const p = phase({ id: 'p', pctOfTpc: 100, startSlot: 0, durationSlots: 4 })
+    const p = phase({ id: 'p', pctOfTpc: 100, startMonth: 0, durationMonths: 4 * Y })
     const cost = computePhaseCost(p, 1_000_000, { ...SETTINGS, escalationAnnualPercent: 0 }, GEOMETRY)
 
-    assertMoney(cost.costPerSlot, 250_000)
-    assertMoney(cost.costPerSlot * p.durationSlots, cost.escalatedCost)
+    // Per MONTH since D-1: $1M over 48 months.
+    assertMoney(cost.costPerMonth, 1_000_000 / 48)
+    assertMoney(cost.costPerMonth * p.durationMonths, cost.escalatedCost)
   })
 
   test('flags phases past the confidence horizon', () => {
-    const near = computePhaseCost(phase({ id: 'n', startSlot: 1, durationSlots: 1 }), 1e6, SETTINGS, GEOMETRY)
-    const far = computePhaseCost(phase({ id: 'f', startSlot: 8, durationSlots: 2 }), 1e6, SETTINGS, GEOMETRY)
+    const near = computePhaseCost(phase({ id: 'n', startMonth: 1 * Y, durationMonths: 1 * Y }), 1e6, SETTINGS, GEOMETRY)
+    const far = computePhaseCost(phase({ id: 'f', startMonth: 8 * Y, durationMonths: 2 * Y }), 1e6, SETTINGS, GEOMETRY)
 
     assert.equal(near.beyondConfidenceHorizon, false)
     assert.equal(far.beyondConfidenceHorizon, true)
@@ -267,9 +283,9 @@ describe('package summary', () => {
   }
 
   const dcammPhases = [
-    phase({ id: 'study', kind: 'study', sortOrder: 0, pctOfTpc: 1, startSlot: 0, durationSlots: 1 }),
-    phase({ id: 'design', kind: 'design', sortOrder: 1, pctOfTpc: 9, startSlot: 1, durationSlots: 2 }),
-    phase({ id: 'build', kind: 'construction', sortOrder: 2, pctOfTpc: 90, startSlot: 3, durationSlots: 4 }),
+    phase({ id: 'study', kind: 'study', sortOrder: 0, pctOfTpc: 1, startMonth: 0, durationMonths: 1 * Y }),
+    phase({ id: 'design', kind: 'design', sortOrder: 1, pctOfTpc: 9, startMonth: 1 * Y, durationMonths: 2 * Y }),
+    phase({ id: 'build', kind: 'construction', sortOrder: 2, pctOfTpc: 90, startMonth: 3 * Y, durationMonths: 4 * Y }),
   ]
 
   test('applies the TPC factor to the ECC', () => {
@@ -304,12 +320,12 @@ describe('package summary', () => {
 
   test('energy onset is the end of the last construction phase, not design', () => {
     const summary = summarisePackage(input, dcammPhases, SETTINGS, GEOMETRY)
-    assert.equal(summary.energyOnsetSlot, 7) // build starts at 3, runs 4
+    assert.equal(summary.energyOnsetMonth, 7 * Y) // build starts year 3, runs 4 years
   })
 
   test('a package with no construction phase never delivers savings', () => {
     const designOnly = [dcammPhases[0], dcammPhases[1]]
-    assert.equal(summarisePackage(input, designOnly, SETTINGS, GEOMETRY).energyOnsetSlot, null)
+    assert.equal(summarisePackage(input, designOnly, SETTINGS, GEOMETRY).energyOnsetMonth, null)
   })
 })
 
@@ -330,7 +346,7 @@ describe('slot costs', () => {
   test('column totals equal the sum of the bars above them', () => {
     // This is the invariant that makes the header row trustworthy. If it ever
     // fails, the tool is reporting a different number than it is drawing.
-    const phases = [phase({ id: 'p', pctOfTpc: 100, startSlot: 1, durationSlots: 4 })]
+    const phases = [phase({ id: 'p', pctOfTpc: 100, startMonth: 1 * Y, durationMonths: 4 * Y })]
     const summary = summarisePackage(input, phases, noEscalation, GEOMETRY)
     const slots = computeSlotCosts([summary], GEOMETRY)
 
@@ -339,7 +355,7 @@ describe('slot costs', () => {
   })
 
   test('spreads evenly and lands in exactly the covered slots', () => {
-    const phases = [phase({ id: 'p', pctOfTpc: 100, startSlot: 2, durationSlots: 4 })]
+    const phases = [phase({ id: 'p', pctOfTpc: 100, startMonth: 2 * Y, durationMonths: 4 * Y })]
     const slots = computeSlotCosts([summarisePackage(input, phases, noEscalation, GEOMETRY)], GEOMETRY)
 
     assertMoney(slots[0].escalatedTotal, 0)
@@ -349,9 +365,9 @@ describe('slot costs', () => {
   })
 
   test('handles fractional placement by interval overlap, not integer rounding', () => {
-    // A bar dragged at quarter zoom and viewed at year zoom sits on a
-    // fractional boundary. Half in slot 1, half in slot 2.
-    const phases = [phase({ id: 'p', pctOfTpc: 100, startSlot: 1.5, durationSlots: 1 })]
+    // A phase that starts mid-year, viewed at year zoom, sits on a
+    // fractional column boundary. Half in column 1, half in column 2.
+    const phases = [phase({ id: 'p', pctOfTpc: 100, startMonth: 1.5 * Y, durationMonths: 1 * Y })]
     const slots = computeSlotCosts([summarisePackage(input, phases, noEscalation, GEOMETRY)], GEOMETRY)
 
     assertMoney(slots[1].escalatedTotal, 200_000)
@@ -360,7 +376,7 @@ describe('slot costs', () => {
   })
 
   test('escalation shows up as the gap between base and escalated totals', () => {
-    const phases = [phase({ id: 'p', pctOfTpc: 100, startSlot: 4, durationSlots: 2 })]
+    const phases = [phase({ id: 'p', pctOfTpc: 100, startMonth: 4 * Y, durationMonths: 2 * Y })]
     const slots = computeSlotCosts([summarisePackage(input, phases, SETTINGS, GEOMETRY)], GEOMETRY)
 
     const base = slots.reduce((s, x) => s + x.baseTotal, 0)
@@ -372,9 +388,10 @@ describe('slot costs', () => {
   })
 
   test('fiscal-year totals partition the slot totals with nothing lost', () => {
-    const phases = [phase({ id: 'p', pctOfTpc: 100, startSlot: 0, durationSlots: 6 })]
-    const slots = computeSlotCosts([summarisePackage(input, phases, SETTINGS, GEOMETRY)], GEOMETRY)
-    const byYear = computeFiscalYearTotals(slots)
+    const phases = [phase({ id: 'p', pctOfTpc: 100, startMonth: 0, durationMonths: 6 * Y })]
+    const summaries = [summarisePackage(input, phases, SETTINGS, GEOMETRY)]
+    const slots = computeSlotCosts(summaries, GEOMETRY)
+    const byYear = computeFiscalYearTotals(summaries, GEOMETRY)
 
     assertMoney(
       byYear.reduce((s, y) => s + y.escalatedTotal, 0),
@@ -403,14 +420,15 @@ describe('energy series', () => {
         annualCostSavings: 0,
       },
       [
-        phase({ id: `${id}-d`, kind: 'design', sortOrder: 0, pctOfTpc: 10, startSlot: 0, durationSlots: 1 }),
+        phase({ id: `${id}-d`, kind: 'design', sortOrder: 0, pctOfTpc: 10, startMonth: 0, durationMonths: 1 * Y }),
         phase({
           id: `${id}-c`,
           kind: 'construction',
           sortOrder: 1,
           pctOfTpc: 90,
-          startSlot: buildStart,
-          durationSlots: buildDuration,
+          // Arguments are in years, at the yearly GEOMETRY these tests use.
+          startMonth: buildStart * Y,
+          durationMonths: buildDuration * Y,
         }),
       ],
       SETTINGS,
@@ -519,79 +537,79 @@ describe('topological order', () => {
 describe('dependency propagation', () => {
   test('pushes a violating successor forward', () => {
     const phases = [
-      phase({ id: 'a', startSlot: 0, durationSlots: 3 }),
-      phase({ id: 'b', startSlot: 1, durationSlots: 2 }),
+      phase({ id: 'a', startMonth: 0, durationMonths: 3 }),
+      phase({ id: 'b', startMonth: 1, durationMonths: 2 }),
     ]
     const result = propagateDependencies(phases, [dep('a', 'b')])
 
-    assert.equal(result.get('b')!.startSlot, 3)
+    assert.equal(result.get('b')!.startMonth, 3)
   })
 
   test('cascades transitively', () => {
     // Jeff's question: "if you push out the wings project, will it
     // automatically push out the bulfinch?"
     const phases = [
-      phase({ id: 'a', startSlot: 5, durationSlots: 2 }),
-      phase({ id: 'b', startSlot: 0, durationSlots: 2 }),
-      phase({ id: 'c', startSlot: 0, durationSlots: 2 }),
+      phase({ id: 'a', startMonth: 5, durationMonths: 2 }),
+      phase({ id: 'b', startMonth: 0, durationMonths: 2 }),
+      phase({ id: 'c', startMonth: 0, durationMonths: 2 }),
     ]
     const result = propagateDependencies(phases, [dep('a', 'b'), dep('b', 'c')])
 
-    assert.equal(result.get('b')!.startSlot, 7)
-    assert.equal(result.get('c')!.startSlot, 9)
+    assert.equal(result.get('b')!.startMonth, 7)
+    assert.equal(result.get('c')!.startMonth, 9)
   })
 
   test('preserves slack — it never pulls a successor earlier', () => {
     // Planners leave gaps on purpose: "we're going to put this on the shelf...
     // because we already have a couple other projects in the pipeline".
     const phases = [
-      phase({ id: 'a', startSlot: 0, durationSlots: 2 }),
-      phase({ id: 'b', startSlot: 8, durationSlots: 2 }),
+      phase({ id: 'a', startMonth: 0, durationMonths: 2 }),
+      phase({ id: 'b', startMonth: 8, durationMonths: 2 }),
     ]
     const result = propagateDependencies(phases, [dep('a', 'b')])
 
-    assert.equal(result.get('b')!.startSlot, 8)
+    assert.equal(result.get('b')!.startMonth, 8)
   })
 
   test('moves a locked phase without stretching it', () => {
     // "Fixed duration" means the bar's length is constant, not that it cannot
     // be rescheduled.
     const phases = [
-      phase({ id: 'a', startSlot: 4, durationSlots: 2 }),
-      phase({ id: 'b', startSlot: 0, durationSlots: 3, durationLocked: true }),
+      phase({ id: 'a', startMonth: 4, durationMonths: 2 }),
+      phase({ id: 'b', startMonth: 0, durationMonths: 3, durationLocked: true }),
     ]
     const result = propagateDependencies(phases, [dep('a', 'b')])
 
-    assert.equal(result.get('b')!.startSlot, 6)
-    assert.equal(result.get('b')!.durationSlots, 3)
+    assert.equal(result.get('b')!.startMonth, 6)
+    assert.equal(result.get('b')!.durationMonths, 3)
   })
 
   test('honours lag when pushing', () => {
     const phases = [
-      phase({ id: 'a', startSlot: 0, durationSlots: 2 }),
-      phase({ id: 'b', startSlot: 0, durationSlots: 1 }),
+      phase({ id: 'a', startMonth: 0, durationMonths: 2 }),
+      phase({ id: 'b', startMonth: 0, durationMonths: 1 }),
     ]
-    const result = propagateDependencies(phases, [dep('a', 'b', { lagSlots: 3 })])
+    const result = propagateDependencies(phases, [dep('a', 'b', { lagMonths: 3 })])
 
-    assert.equal(result.get('b')!.startSlot, 5)
+    assert.equal(result.get('b')!.startMonth, 5)
   })
 
   test('does not mutate its input', () => {
     const phases = [
-      phase({ id: 'a', startSlot: 0, durationSlots: 3 }),
-      phase({ id: 'b', startSlot: 0, durationSlots: 1 }),
+      phase({ id: 'a', startMonth: 0, durationMonths: 3 }),
+      phase({ id: 'b', startMonth: 0, durationMonths: 1 }),
     ]
     propagateDependencies(phases, [dep('a', 'b')])
 
-    assert.equal(phases[1].startSlot, 0)
+    assert.equal(phases[1].startMonth, 0)
   })
 })
 
 describe('violations', () => {
   test('reports an unsatisfied link', () => {
     const phases = [
-      phase({ id: 'a', startSlot: 0, durationSlots: 4 }),
-      phase({ id: 'b', startSlot: 1, durationSlots: 1 }),
+      phase({ id: 'a', startMonth: 0, durationMonths: 4 }),
+      phase({ id: 'b', startMonth: 1, durationMonths: 1 }),
     ]
     const violations = findDependencyViolations(phases, [dep('a', 'b')])
 
@@ -602,19 +620,19 @@ describe('violations', () => {
 
   test('a satisfied link is silent, including one with slack', () => {
     const phases = [
-      phase({ id: 'a', startSlot: 0, durationSlots: 2 }),
-      phase({ id: 'b', startSlot: 6, durationSlots: 1 }),
+      phase({ id: 'a', startMonth: 0, durationMonths: 2 }),
+      phase({ id: 'b', startMonth: 6, durationMonths: 1 }),
     ]
     assert.equal(findDependencyViolations(phases, [dep('a', 'b')]).length, 0)
   })
 
   test('propagation leaves no violations behind', () => {
     const phases = [
-      phase({ id: 'a', startSlot: 3, durationSlots: 2 }),
-      phase({ id: 'b', startSlot: 0, durationSlots: 2 }),
-      phase({ id: 'c', startSlot: 0, durationSlots: 2 }),
+      phase({ id: 'a', startMonth: 3, durationMonths: 2 }),
+      phase({ id: 'b', startMonth: 0, durationMonths: 2 }),
+      phase({ id: 'c', startMonth: 0, durationMonths: 2 }),
     ]
-    const deps = [dep('a', 'b'), dep('b', 'c', { lagSlots: 1 })]
+    const deps = [dep('a', 'b'), dep('b', 'c', { lagMonths: 1 })]
     const settled = [...propagateDependencies(phases, deps).values()]
 
     assert.deepEqual(findDependencyViolations(settled, deps), [])
@@ -666,16 +684,16 @@ describe('applyScenarioOverlay (M-24)', () => {
       kind: 'construction',
       sortOrder: 0,
       pctOfTpc: 1,
-      startSlot: 0,
-      durationSlots: 1,
+      startMonth: 0,
+      durationMonths: 1,
       durationLocked: false,
     }
     const [moved] = applyScenarioOverlay([live], [
-      { id: 'p', startSlot: 3, durationSlots: 2, pctOfTpc: 1, durationLocked: false },
+      { id: 'p', startMonth: 3 * Y, durationMonths: 2 * Y, pctOfTpc: 1, durationLocked: false },
     ])
     assert.deepEqual(
       computePhaseCost(moved, 1_000_000, SETTINGS, GEOMETRY),
-      computePhaseCost({ ...live, startSlot: 3, durationSlots: 2 }, 1_000_000, SETTINGS, GEOMETRY)
+      computePhaseCost({ ...live, startMonth: 3 * Y, durationMonths: 2 * Y }, 1_000_000, SETTINGS, GEOMETRY)
     )
   })
 })

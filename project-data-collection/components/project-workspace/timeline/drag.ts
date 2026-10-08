@@ -21,11 +21,11 @@ export type DragMode = 'move' | 'resize-start' | 'resize-end'
 export type DragOrigin = {
   phaseId: string
   mode: DragMode
-  startSlot: number
-  durationSlots: number
+  startMonth: number
+  durationMonths: number
 }
 
-export type Placement = { startSlot: number; durationSlots: number }
+export type Placement = { startMonth: number; durationMonths: number }
 
 /**
  * May this drag start at all?
@@ -37,44 +37,49 @@ export type Placement = { startSlot: number; durationSlots: number }
  * the jsonb payload and then fails the whole publish (M-27). Moving such a phase
  * is still allowed, because moving it is how you bring it back into range.
  */
-export function canStartDrag(origin: DragOrigin, slotCount: number): boolean {
-  if (slotCount <= 0) return false
+export function canStartDrag(origin: DragOrigin, horizonMonths: number): boolean {
+  if (horizonMonths <= 0) return false
   if (origin.mode === 'move') return true
-  return origin.startSlot < slotCount
+  return origin.startMonth < horizonMonths
 }
 
 /**
- * Where the bar sits after the pointer has moved `deltaSlots` columns.
+ * Where the bar sits after the pointer has moved `deltaMonths`.
  *
- * Every branch guarantees `startSlot >= 0` and `durationSlots >= 1`, which are
- * exactly the two invariants the database (and the scenario payload RPC)
+ * Everything here is in MONTHS (D-1). The caller snaps the pointer to whole
+ * columns of the current zoom and converts -- one column at Year zoom is a
+ * 12-month delta -- so a drag moves in the zoom's unit while what gets stored
+ * is months, and a phase that sits mid-column keeps its offset.
+ *
+ * Every branch guarantees `startMonth >= 0` and `durationMonths >= 1`, which
+ * are exactly the two invariants the database (and the scenario payload RPC)
  * enforce. The final `Math.max(1, …)` on resize-end is the M-27 clamp: without
  * it a phase whose start is past the last column ends up with duration <= 0.
  */
 export function placementForDelta(
   origin: DragOrigin,
-  deltaSlots: number,
-  slotCount: number
+  deltaMonths: number,
+  horizonMonths: number
 ): Placement {
   if (origin.mode === 'move') {
-    const maxStart = Math.max(0, slotCount - origin.durationSlots)
+    const maxStart = Math.max(0, horizonMonths - origin.durationMonths)
     return {
-      startSlot: Math.min(Math.max(origin.startSlot + deltaSlots, 0), maxStart),
-      durationSlots: origin.durationSlots,
+      startMonth: Math.min(Math.max(origin.startMonth + deltaMonths, 0), maxStart),
+      durationMonths: origin.durationMonths,
     }
   }
 
   if (origin.mode === 'resize-start') {
-    const end = origin.startSlot + origin.durationSlots
-    const nextStart = Math.min(Math.max(origin.startSlot + deltaSlots, 0), end - 1)
-    return { startSlot: nextStart, durationSlots: Math.max(1, end - nextStart) }
+    const end = origin.startMonth + origin.durationMonths
+    const nextStart = Math.min(Math.max(origin.startMonth + deltaMonths, 0), end - 1)
+    return { startMonth: nextStart, durationMonths: Math.max(1, end - nextStart) }
   }
 
   const nextDuration = Math.max(
     1,
-    Math.min(Math.max(origin.durationSlots + deltaSlots, 1), slotCount - origin.startSlot)
+    Math.min(Math.max(origin.durationMonths + deltaMonths, 1), horizonMonths - origin.startMonth)
   )
-  return { startSlot: origin.startSlot, durationSlots: nextDuration }
+  return { startMonth: origin.startMonth, durationMonths: nextDuration }
 }
 
 /** True when a drop put the bar back exactly where it started -- a click, or a
@@ -82,11 +87,11 @@ export function placementForDelta(
  *  the old code treated a plain click as a full re-save of the overlay. */
 export function isNoOpDrop(origin: DragOrigin, placement: Placement): boolean {
   return (
-    placement.startSlot === origin.startSlot && placement.durationSlots === origin.durationSlots
+    placement.startMonth === origin.startMonth && placement.durationMonths === origin.durationMonths
   )
 }
 
-type PhaseLike = Pick<ChunkPhase, 'id' | 'startSlot' | 'durationSlots'>
+type PhaseLike = Pick<ChunkPhase, 'id' | 'startMonth' | 'durationMonths'>
 
 /**
  * The rows a drop changes, measured against the phases the user was LOOKING
@@ -101,7 +106,7 @@ export function changedPhasesForDrop<P extends PhaseLike>(
   effective: P[],
   phaseId: string,
   placement: Placement,
-  propagate?: (phases: P[]) => Map<string, { startSlot: number }>
+  propagate?: (phases: P[]) => Map<string, { startMonth: number }>
 ): P[] {
   const dropped = effective.map((phase) =>
     phase.id === phaseId ? { ...phase, ...placement } : phase
@@ -111,15 +116,15 @@ export function changedPhasesForDrop<P extends PhaseLike>(
   const next = propagated
     ? dropped.map((phase) => {
         const moved = propagated.get(phase.id)
-        if (!moved || moved.startSlot === phase.startSlot) return phase
-        return { ...phase, startSlot: moved.startSlot }
+        if (!moved || moved.startMonth === phase.startMonth) return phase
+        return { ...phase, startMonth: moved.startMonth }
       })
     : dropped
 
   return next.filter((phase, index) => {
     const before = effective[index]
     return (
-      phase.startSlot !== before.startSlot || phase.durationSlots !== before.durationSlots
+      phase.startMonth !== before.startMonth || phase.durationMonths !== before.durationMonths
     )
   })
 }
@@ -138,7 +143,7 @@ export function changedPhasesForDrop<P extends PhaseLike>(
  */
 export function mergeDropIntoOverlay(
   overlay: ReadonlyMap<string, ScenarioPhase>,
-  changed: Array<Pick<ChunkPhase, 'id' | 'startSlot' | 'durationSlots'>>,
+  changed: Array<Pick<ChunkPhase, 'id' | 'startMonth' | 'durationMonths'>>,
   fallback: (id: string) => ScenarioPhase | undefined
 ): Map<string, ScenarioPhase> {
   const next = new Map(overlay)
@@ -147,8 +152,8 @@ export function mergeDropIntoOverlay(
     if (!existing) continue
     next.set(row.id, {
       ...existing,
-      startSlot: Math.max(0, Math.round(row.startSlot)),
-      durationSlots: Math.max(1, Math.round(row.durationSlots)),
+      startMonth: Math.max(0, Math.round(row.startMonth)),
+      durationMonths: Math.max(1, Math.round(row.durationMonths)),
     })
   }
   return next
@@ -170,13 +175,13 @@ export type RebaseSummary = {
 
 type Comparable = Pick<
   ScenarioPhase,
-  'id' | 'name' | 'startSlot' | 'durationSlots' | 'pctOfTpc' | 'durationLocked'
+  'id' | 'name' | 'startMonth' | 'durationMonths' | 'pctOfTpc' | 'durationLocked'
 >
 
 function samePlacement(a: Comparable, b: Comparable): boolean {
   return (
-    a.startSlot === b.startSlot &&
-    a.durationSlots === b.durationSlots &&
+    a.startMonth === b.startMonth &&
+    a.durationMonths === b.durationMonths &&
     a.pctOfTpc === b.pctOfTpc &&
     a.durationLocked === b.durationLocked
   )

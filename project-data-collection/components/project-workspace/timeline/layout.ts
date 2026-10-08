@@ -57,10 +57,36 @@ export function xForSlot(slot: number): number {
   return slot * CELL_WIDTH
 }
 
-/** Pixel rect for a phase bar within its row. */
-export function barRect(startSlot: number, durationSlots: number, rowHeight: number) {
-  const left = xForSlot(startSlot) + BAR_INSET
-  const width = Math.max(xForSlot(durationSlots) - BAR_INSET * 2, CELL_WIDTH - BAR_INSET * 2)
+/** Left edge of a MONTH (D-1: schedules are stored in months) at a zoom whose
+ *  columns are `monthsPerSlot` months wide. A phase that doesn't start on a
+ *  column boundary at a coarse zoom lands part-way into its column. */
+export function xForMonth(month: number, monthsPerSlot: number): number {
+  return (month / monthsPerSlot) * CELL_WIDTH
+}
+
+/** The narrowest a bar is drawn, so a one-month phase at 5-year zoom (1.5px
+ *  of true width) can still be seen and grabbed. Only the drawing is padded;
+ *  every number comes from months. */
+export const MIN_BAR_WIDTH = 14
+
+/**
+ * Pixel rect for a phase bar within its row, from its months.
+ *
+ * Proportional at every zoom: a 6-month phase at Year zoom is half a column
+ * wide. The old version floored every bar at one full column, which at a
+ * coarse zoom drew a short phase as if it lasted the whole column.
+ */
+export function barRect(
+  startMonth: number,
+  durationMonths: number,
+  rowHeight: number,
+  monthsPerSlot: number
+) {
+  const left = xForMonth(startMonth, monthsPerSlot) + BAR_INSET
+  const width = Math.max(
+    xForMonth(durationMonths, monthsPerSlot) - BAR_INSET * 2,
+    MIN_BAR_WIDTH
+  )
   return {
     left,
     width,

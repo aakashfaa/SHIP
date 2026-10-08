@@ -48,6 +48,22 @@ function clampNonNegativeNumber(value: string, fallback: number) {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback
 }
 
+/**
+ * "2 yrs", "1.5 yrs", "8 mo" -- a duration in months read back in the unit
+ * people plan in. Durations are stored in months (D-1); this used to be a
+ * bare "slots" number whose meaning changed with the Timeline zoom.
+ */
+function describeMonths(months: number): string {
+  if (!Number.isFinite(months) || months <= 0) return ''
+  if (months < 12) return `${Math.round(months * 10) / 10} mo`
+  const years = Math.round((months / 12) * 100) / 100
+  return `${years} yr${years === 1 ? '' : 's'}`
+}
+
+/** A new phase starts at the plan's first month and lasts a year -- the
+ *  same as the one-slot default used to mean at the default Year zoom. */
+const NEW_PHASE_DURATION_MONTHS = 12
+
 export default function PhaseEditor({
   chunkProjectId,
   phases,
@@ -180,8 +196,8 @@ export default function PhaseEditor({
         kind: 'construction',
         sortOrder: phases.length,
         pctOfTpc: 0,
-        startSlot: 0,
-        durationSlots: 1,
+        startMonth: 0,
+        durationMonths: NEW_PHASE_DURATION_MONTHS,
         durationLocked: false,
       })
       if (!isMountedRef.current) return
@@ -352,7 +368,7 @@ export default function PhaseEditor({
                     % of TPC
                   </th>
                   <th className="px-3 py-3 text-[11px] font-semibold uppercase tracking-[0.18em] text-white/70">
-                    Duration (slots)
+                    Duration (months)
                   </th>
                   <th className="px-3 py-3 text-[11px] font-semibold uppercase tracking-[0.18em] text-white/70">
                     Locked
@@ -469,7 +485,7 @@ export default function PhaseEditor({
                       </td>
                       <td className="px-3 py-3 align-top">
                         <label htmlFor={`phase-duration-${phase.id}`} className="sr-only">
-                          Duration in timeline slots
+                          Duration in months
                         </label>
                         <input
                           id={`phase-duration-${phase.id}`}
@@ -478,24 +494,31 @@ export default function PhaseEditor({
                           step={1}
                           value={getDraft(
                             phase.id,
-                            'durationSlots',
-                            String(phase.durationSlots)
+                            'durationMonths',
+                            String(phase.durationMonths)
                           )}
                           onChange={(e) =>
                             handleDebouncedFieldChange(
                               phase.id,
-                              'durationSlots',
+                              'durationMonths',
                               e.target.value,
                               (v) => ({
-                                durationSlots: Math.max(
+                                durationMonths: Math.max(
                                   1,
-                                  clampNonNegativeNumber(v, phase.durationSlots)
+                                  clampNonNegativeNumber(v, phase.durationMonths)
                                 ),
                               })
                             )
                           }
+                          aria-describedby={`phase-duration-years-${phase.id}`}
                           className="w-20 rounded-[0.95rem] border border-slate-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-teal-500 focus:ring-2 focus:ring-teal-100"
                         />
+                        <div
+                          id={`phase-duration-years-${phase.id}`}
+                          className="mt-1 text-[11px] text-slate-500"
+                        >
+                          {describeMonths(phase.durationMonths)}
+                        </div>
                       </td>
                       <td className="px-3 py-3 align-top">
                         <label className="inline-flex cursor-pointer items-center gap-2">

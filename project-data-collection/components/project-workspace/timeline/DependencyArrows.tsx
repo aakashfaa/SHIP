@@ -28,7 +28,8 @@ export type ArrowRect = {
 export type ArrowLink = {
   id: string
   depType: DependencyType
-  lagSlots: number
+  /** Months (D-1), shown as "+12 mo". */
+  lagMonths: number
   predecessor: ArrowRect
   successor: ArrowRect
   /** Drawn in the violation colour and given a title the user can read. */
@@ -217,7 +218,11 @@ export default function DependencyArrows({ links, width, height, onSelectLink }:
         const d = linkPath(link)
         const stroke = link.violated ? '#e11d48' : '#475569'
         const lagSuffix =
-          link.lagSlots === 0 ? '' : link.lagSlots > 0 ? ` +${link.lagSlots}` : ` ${link.lagSlots}`
+          link.lagMonths === 0
+            ? ''
+            : link.lagMonths > 0
+              ? ` +${link.lagMonths} mo`
+              : ` ${link.lagMonths} mo`
 
         return (
           <g key={link.id}>

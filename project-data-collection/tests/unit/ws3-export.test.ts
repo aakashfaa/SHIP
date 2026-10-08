@@ -165,8 +165,9 @@ function baseTables(): Tables {
         kind: 'construction',
         sort_order: 0,
         pct_of_tpc: 1,
+        // Months since migration 0020: Jan-Dec 2026.
         start_slot: 0,
-        duration_slots: 1,
+        duration_slots: 12,
         duration_locked: false,
         created_at: '2026-01-01T00:00:00Z',
       },
@@ -246,7 +247,9 @@ function stubClient(tables: Tables) {
 
 const PROJECT = { id: PROJECT_ID, name: 'WS3 Test' } as never
 
-function scenarioRow(startSlot: number) {
+/** `startMonth`: months from Jan 2026 (D-1); the payload key is still
+ *  `start_slot` because the scenario RPCs read it by name. */
+function scenarioRow(startMonth: number) {
   return {
     id: SCENARIO_ID,
     project_id: PROJECT_ID,
@@ -263,8 +266,8 @@ function scenarioRow(startSlot: number) {
           kind: 'construction',
           sort_order: 0,
           pct_of_tpc: 1,
-          start_slot: startSlot,
-          duration_slots: 1,
+          start_slot: startMonth,
+          duration_slots: 12,
           duration_locked: false,
         },
       ],
@@ -284,7 +287,7 @@ const total = (rows: Array<{ totalCost: number }>) => rows.reduce((s, r) => s + 
 describe('M-24: the export prices the active what-if', () => {
   test('scenario overlay moves the money exactly as the engine would', async () => {
     const live = await report.buildProjectReportData(stubClient(baseTables()), PROJECT)
-    const tables = { ...baseTables(), scenarios: [scenarioRow(5)] }
+    const tables = { ...baseTables(), scenarios: [scenarioRow(5 * 12)] }
     const what = await report.buildProjectReportData(stubClient(tables), PROJECT, {
       scenarioId: SCENARIO_ID,
     })
@@ -325,15 +328,15 @@ describe('M-24: the export prices the active what-if', () => {
       kind: 'construction' as const,
       sortOrder: 0,
       pctOfTpc: 1,
-      startSlot: 5,
-      durationSlots: 1,
+      startMonth: 5 * 12,
+      durationMonths: 12,
       durationLocked: false,
     }
     const expected = engine.summarisePackage(input, [phase], settings, geometry).totalEscalatedCost
     assert.ok(Math.abs(total(what.packages) - expected) < 1e-6)
 
     // Phase sheet and annual summary follow the scenario too.
-    // Slot 5 starts Jan 2031, inside the July-June FY that ends in 2031.
+    // Month 60 is Jan 2031, inside the July-June FY that ends in 2031.
     assert.equal(what.phases[0].startFiscalYear, 'FY31')
     const annual = what.annualCostSummary.reduce((s, r) => s + r.escalatedTotal, 0)
     assert.ok(Math.abs(annual - expected) < 1e-6)
@@ -358,25 +361,25 @@ describe('M-24: the export prices the active what-if', () => {
 
   test('applyScenarioOverlay leaves phases the scenario does not mention alone', () => {
     const phases = [
-      { id: 'a', startSlot: 0, durationSlots: 2, pctOfTpc: 0.5, durationLocked: false, name: 'A' },
-      { id: 'b', startSlot: 2, durationSlots: 2, pctOfTpc: 0.5, durationLocked: false, name: 'B' },
+      { id: 'a', startMonth: 0, durationMonths: 2, pctOfTpc: 0.5, durationLocked: false, name: 'A' },
+      { id: 'b', startMonth: 2, durationMonths: 2, pctOfTpc: 0.5, durationLocked: false, name: 'B' },
     ]
     const out = engine.applyScenarioOverlay(phases, [
-      { id: 'b', startSlot: 6, durationSlots: 3, pctOfTpc: 0.4, durationLocked: true },
-      { id: 'gone', startSlot: 1, durationSlots: 1, pctOfTpc: 1, durationLocked: false },
+      { id: 'b', startMonth: 6, durationMonths: 3, pctOfTpc: 0.4, durationLocked: true },
+      { id: 'gone', startMonth: 1, durationMonths: 1, pctOfTpc: 1, durationLocked: false },
     ])
     assert.deepEqual(out[0], phases[0])
     assert.deepEqual(out[1], {
       id: 'b',
-      startSlot: 6,
-      durationSlots: 3,
+      startMonth: 6,
+      durationMonths: 3,
       pctOfTpc: 0.4,
       durationLocked: true,
       name: 'B',
     })
     assert.equal(out.length, 2)
     // The input is not mutated.
-    assert.equal(phases[1].startSlot, 2)
+    assert.equal(phases[1].startMonth, 2)
   })
 })
 
