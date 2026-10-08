@@ -8,9 +8,15 @@ import {
   useState,
   type PointerEvent as ReactPointerEvent,
 } from 'react'
-import { formatCurrency, parseCostInput, parseQuantityInput } from '@/lib/costs'
+import {
+  formatCurrency,
+  isUnreadableCost,
+  parseCostInput,
+  parseQuantityInput,
+} from '@/lib/costs'
 import {
   DEFAULT_COST_SETTINGS,
+  applyScenarioOverlay,
   DEFAULT_ENERGY_SETTINGS,
   computeEnergySeries,
   computeFiscalYearTotals,
@@ -57,6 +63,7 @@ import type {
   ProjectTimelineSettings,
   Scenario,
   ScenarioPayload,
+  ScenarioPhase,
   TimelineInterval,
 } from '@/lib/types'
 import TimelineGrid, {
@@ -71,12 +78,38 @@ import SandboxBar from './timeline/SandboxBar'
 import {
   BAR_HEIGHT,
   CELL_WIDTH,
+  DEPENDENCY_LINKS_ENABLED,
   PACKAGE_ROW_HEIGHT,
   PHASE_ROW_HEIGHT,
   barRect,
 } from './timeline/layout'
+import {
+  canStartDrag,
+  changedPhasesForDrop,
+  isNoOpDrop,
+  mergeDropIntoOverlay,
+  placementForDelta,
+  summariseRebase,
+  type DragOrigin,
+  type Placement,
+} from './timeline/drag'
 
 const SETTINGS_PERSIST_DEBOUNCE_MS = 400
+
+/**
+ * Zoom is LOCKED for now (M-01, interim).
+ *
+ * Phases are stored in "slots", and a slot means whatever the project's zoom
+ * says it means -- a year at Year zoom, a month at Month zoom. Moving the
+ * slider therefore did not zoom anything: it reinterpreted every stored phase,
+ * re-priced the whole plan (about -24% going Year -> Month on a test plan) and
+ * saved that for every user and for the Excel export. Until schedules are
+ * stored in one fixed unit (the months conversion, a coordinated later wave),
+ * the slider is disabled and `handleZoomChange` refuses to write, so
+ * `interval_unit` cannot change from this screen. The code path stays so that
+ * wave only has to flip this flag and add the conversion.
+ */
+const ZOOM_LOCKED = true
 
 const ZOOM_LEVELS: Array<{ level: number; interval: TimelineInterval; label: string }> = [
   { level: 1, interval: '5-yearly', label: '5 year' },
@@ -139,11 +172,17 @@ function toEngineDependency(dep: PhaseDependency): EnginePhaseDependency {
   }
 }
 
-function toCostSettings(row: ProjectCostSettings | null): CostSettings {
+/** `fallbackBaseYear` is only used when the row's base year is missing
+ *  (null, M-25). That state is shown as a warning on screen rather than
+ *  quietly priced as if it were real -- see `missingYears` below. */
+function toCostSettings(
+  row: ProjectCostSettings | null,
+  fallbackBaseYear: number
+): CostSettings {
   if (!row) return DEFAULT_COST_SETTINGS
   return {
     tpcFactor: row.tpcFactor,
-    baseYear: row.baseYear,
+    baseYear: row.baseYear ?? fallbackBaseYear,
     escalationMode: row.escalationMode,
     escalationAnnualPercent: row.escalationAnnualPercent,
     escalationStepYears: row.escalationStepYears,
@@ -162,6 +201,26 @@ function toEnergySettings(row: ProjectEnergySettings | null): EnergySettings {
   }
 }
 
+/** Up to four names, then "and N more" -- a rebase can touch dozens of phases
+ *  and the banner must stay a sentence, not a report. */
+function listNames(names: string[]): string {
+  const shown = names.slice(0, 4).join(', ')
+  return names.length > 4 ? `${shown} and ${names.length - 4} more` : shown
+}
+
+function describeRebase(pulledIn: string[], kept: string[]): string {
+  const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`
+  const pulled =
+    pulledIn.length === 0
+      ? 'Nothing in the live plan needed pulling in.'
+      : `Pulled in the live plan’s newer values for ${plural(pulledIn.length, 'phase')}: ${listNames(pulledIn)}.`
+  const yours =
+    kept.length === 0
+      ? 'None of your moves differ from the live plan any more.'
+      : `Kept your ${plural(kept.length, 'move')}: ${listNames(kept)}.`
+  return `${pulled} ${yours} You can publish now.`
+}
+
 type Props = {
   project: Project
   /** Resolved by the shell so the whole workspace agrees on one answer and
@@ -169,11 +228,25 @@ type Props = {
   permissions: ProjectPermissions
 }
 
-type ActiveDrag = {
-  phaseId: string
-  mode: DragMode
-  startSlot: number
-  durationSlots: number
+/** The bar being dragged right now and where it currently sits. Applied on
+ *  top of everything else in `effectivePhases`, so the bar follows the cursor
+ *  in every mode -- including inside a what-if, where it used to sit still
+ *  until the drop because the drag was written to the baseline rows that the
+ *  overlay then covered up (M-05). */
+type DragPreview = { phaseId: string } & Placement
+
+function toScenarioPhase(phase: ChunkPhase): ScenarioPhase {
+  return {
+    id: phase.id,
+    chunkProjectId: phase.chunkProjectId,
+    name: phase.name,
+    kind: phase.kind,
+    sortOrder: phase.sortOrder,
+    pctOfTpc: phase.pctOfTpc,
+    startSlot: phase.startSlot,
+    durationSlots: phase.durationSlots,
+    durationLocked: phase.durationLocked,
+  }
 }
 
 const DEFAULT_TIMELINE_SETTINGS: Omit<ProjectTimelineSettings, 'projectId'> = {
@@ -182,7 +255,8 @@ const DEFAULT_TIMELINE_SETTINGS: Omit<ProjectTimelineSettings, 'projectId'> = {
   zoomLevel: 3,
   escalationPercent: 0,
   escalationEveryYears: 1,
-  startCalendarYear: new Date().getUTCFullYear(),
+  // Placeholder until the row loads. Null, not "this year" (M-25).
+  startCalendarYear: null,
   fiscalYearStartMonth: 7,
   fiscalYearLabelsBy: 'end_year',
 }
@@ -213,6 +287,7 @@ export default function TimelineTab({ project, permissions }: Props) {
   const {
     data: timelineSettings,
     setData: setTimelineSettings,
+    loading: timelineSettingsLoading,
     error: timelineSettingsError,
   } = useAsyncData<ProjectTimelineSettings>(
     () => getTimelineSettingsForProject(project.id),
@@ -220,7 +295,11 @@ export default function TimelineTab({ project, permissions }: Props) {
     { projectId: project.id, ...DEFAULT_TIMELINE_SETTINGS }
   )
 
-  const { data: costSettingsRow, error: costSettingsError } =
+  const {
+    data: costSettingsRow,
+    loading: costSettingsLoading,
+    error: costSettingsError,
+  } =
     useAsyncData<ProjectCostSettings | null>(
       () => getCostSettingsForProject(project.id),
       [project.id],
@@ -281,6 +360,8 @@ export default function TimelineTab({ project, permissions }: Props) {
   )
   const [sandboxBusy, setSandboxBusy] = useState(false)
   const [conflict, setConflict] = useState<string | null>(null)
+  const [rebaseNotice, setRebaseNotice] = useState<string | null>(null)
+  const [dragPreview, setDragPreview] = useState<DragPreview | null>(null)
 
   const phasesRef = useRef(phases)
   const isMountedRef = useRef(true)
@@ -301,18 +382,29 @@ export default function TimelineTab({ project, permissions }: Props) {
 
   /* ------------------------------------------------------- derived state -- */
 
-  const costSettings = useMemo(() => toCostSettings(costSettingsRow), [costSettingsRow])
+  // Base year and start year are each allowed to be missing (null) now that
+  // the mappers stop inventing "this year" for them (M-25). The engine needs
+  // numbers, so each borrows the other, and the screen says so (missingYears)
+  // instead of presenting a stand-in as the project's real setting.
+  const standInYear =
+    timelineSettings.startCalendarYear ??
+    costSettingsRow?.baseYear ??
+    DEFAULT_COST_SETTINGS.baseYear
+  const costSettings = useMemo(
+    () => toCostSettings(costSettingsRow, standInYear),
+    [costSettingsRow, standInYear]
+  )
   const energySettings = useMemo(() => toEnergySettings(energySettingsRow), [energySettingsRow])
 
   const geometry: TimelineGeometry = useMemo(
     () => ({
       interval: intervalForZoom(timelineSettings.zoomLevel),
       years: timelineSettings.years,
-      startCalendarYear: timelineSettings.startCalendarYear,
+      startCalendarYear: timelineSettings.startCalendarYear ?? standInYear,
       fiscalYearStartMonth: timelineSettings.fiscalYearStartMonth,
       fiscalYearLabelsBy: timelineSettings.fiscalYearLabelsBy,
     }),
-    [timelineSettings]
+    [timelineSettings, standInYear]
   )
 
   const slotCount = useMemo(
@@ -345,8 +437,9 @@ export default function TimelineTab({ project, permissions }: Props) {
           const unitCost = item.eccAmount || parseCostInput(item.estimatedFirstCost)
 
           eccBase += unitCost * quantity
-          energySavingsAnnual += item.annualEnergySavings * quantity
-          annualCostSavings += item.annualCostSavings * quantity
+          // Blank (null) is "not answered" (D-9); for a sum it contributes nothing.
+          energySavingsAnnual += (item.annualEnergySavings ?? 0) * quantity
+          annualCostSavings += (item.annualCostSavings ?? 0) * quantity
         }
 
         return {
@@ -360,6 +453,19 @@ export default function TimelineTab({ project, permissions }: Props) {
       }),
     [chunkProjects, lineItemMap]
   )
+
+  /**
+   * Line items in a package whose cost text can't be read. Since the strict
+   * parser (M-09) these are NULL rather than a silently-wrong number, and
+   * every total on this screen counts them as $0 -- which has to be said out
+   * loud, or a $0 looks like an answer.
+   */
+  const unreadableCostCount = useMemo(() => {
+    const used = new Set(chunkProjects.flatMap((c) => c.itemLinks.map((l) => l.lineItemId)))
+    return lineItems.filter(
+      (item) => used.has(item.id) && isUnreadableCost(item.estimatedFirstCost)
+    ).length
+  }, [chunkProjects, lineItems])
 
   const activeScenario = useMemo(
     () => scenarios.find((s) => s.id === activeScenarioId) ?? null,
@@ -377,19 +483,22 @@ export default function TimelineTab({ project, permissions }: Props) {
    * preview of one.
    */
   const effectivePhases = useMemo<ChunkPhase[]>(() => {
-    if (!overlay) return phases
-    return phases.map((phase) => {
-      const moved = overlay.get(phase.id)
-      if (!moved) return phase
-      return {
-        ...phase,
-        startSlot: moved.startSlot,
-        durationSlots: moved.durationSlots,
-        pctOfTpc: moved.pctOfTpc,
-        durationLocked: moved.durationLocked,
-      }
-    })
-  }, [phases, overlay])
+    // The same overlay rule the server-side export uses (lib/cost-model), so
+    // the screen and the Excel of a what-if price identical schedules.
+    const overlaid = overlay ? applyScenarioOverlay(phases, [...overlay.values()]) : phases
+    // The in-flight drag goes on LAST, after the overlay, so it is what the
+    // user sees whichever plan they are on.
+    if (!dragPreview) return overlaid
+    return overlaid.map((phase) =>
+      phase.id === dragPreview.phaseId
+        ? {
+            ...phase,
+            startSlot: dragPreview.startSlot,
+            durationSlots: dragPreview.durationSlots,
+          }
+        : phase
+    )
+  }, [phases, overlay, dragPreview])
 
   const phasesByChunk = useMemo(() => {
     const map = new Map<string, ChunkPhase[]>()
@@ -428,8 +537,14 @@ export default function TimelineTab({ project, permissions }: Props) {
     [dependencies]
   )
 
+  // With links switched off (D-14) there is nothing on screen to explain a
+  // "dependency not satisfied" warning, and no way to act on it, so it goes
+  // with the arrows.
   const violations = useMemo(
-    () => findDependencyViolations(enginePhases, engineDependencies),
+    () =>
+      DEPENDENCY_LINKS_ENABLED
+        ? findDependencyViolations(enginePhases, engineDependencies)
+        : [],
     [enginePhases, engineDependencies]
   )
   const violatedLinkIds = useMemo(
@@ -440,30 +555,25 @@ export default function TimelineTab({ project, permissions }: Props) {
   /* -------------------------------------------------------- row geometry -- */
 
   const rows = useMemo<RowLayout[]>(() => {
+    const sorted = summaries.slice().sort((a, b) => {
+      const aStart = phasesByChunk.get(a.input.chunkProjectId)?.[0]?.startSlot ?? 0
+      const bStart = phasesByChunk.get(b.input.chunkProjectId)?.[0]?.startSlot ?? 0
+      if (aStart !== bStart) return aStart - bStart
+      return a.input.chunkNumber.localeCompare(b.input.chunkNumber)
+    })
+    // A plain loop rather than a `top` captured and mutated inside `.map`,
+    // which the React compiler lint rejects as a post-render reassignment.
+    const laidOut: RowLayout[] = []
     let top = 0
-    return summaries
-      .slice()
-      .sort((a, b) => {
-        const aStart = phasesByChunk.get(a.input.chunkProjectId)?.[0]?.startSlot ?? 0
-        const bStart = phasesByChunk.get(b.input.chunkProjectId)?.[0]?.startSlot ?? 0
-        if (aStart !== bStart) return aStart - bStart
-        return a.input.chunkNumber.localeCompare(b.input.chunkNumber)
-      })
-      .map((summary) => {
-        const chunkPhases = phasesByChunk.get(summary.input.chunkProjectId) ?? []
-        const isExpanded = expanded.has(summary.input.chunkProjectId)
-        const height =
-          PACKAGE_ROW_HEIGHT + (isExpanded ? chunkPhases.length * PHASE_ROW_HEIGHT : 0)
-        const row: RowLayout = {
-          summary,
-          phases: chunkPhases,
-          expanded: isExpanded,
-          top,
-          height,
-        }
-        top += height
-        return row
-      })
+    for (const summary of sorted) {
+      const chunkPhases = phasesByChunk.get(summary.input.chunkProjectId) ?? []
+      const isExpanded = expanded.has(summary.input.chunkProjectId)
+      const height =
+        PACKAGE_ROW_HEIGHT + (isExpanded ? chunkPhases.length * PHASE_ROW_HEIGHT : 0)
+      laidOut.push({ summary, phases: chunkPhases, expanded: isExpanded, top, height })
+      top += height
+    }
+    return laidOut
   }, [summaries, phasesByChunk, expanded])
 
   const bodyHeight = rows.reduce((sum, row) => sum + row.height, 0)
@@ -510,7 +620,7 @@ export default function TimelineTab({ project, permissions }: Props) {
 
   const links = useMemo<ArrowLink[]>(
     () =>
-      dependencies.flatMap((dep) => {
+      (DEPENDENCY_LINKS_ENABLED ? dependencies : []).flatMap((dep) => {
         const predecessor = phaseRects.get(dep.predecessorPhaseId)
         const successor = phaseRects.get(dep.successorPhaseId)
         if (!predecessor || !successor) return []
@@ -535,7 +645,8 @@ export default function TimelineTab({ project, permissions }: Props) {
   const activeScenarioIdRef = useRef(activeScenarioId)
   const overlayRef = useRef(overlay)
   const baselinePhasesRef = useRef(phases)
-  const activeScenarioRef = useRef<Scenario | null>(null)
+  const effectivePhasesRef = useRef(effectivePhases)
+  const scenariosRef = useRef(scenarios)
 
   useEffect(() => {
     activeScenarioIdRef.current = activeScenarioId
@@ -544,31 +655,82 @@ export default function TimelineTab({ project, permissions }: Props) {
     overlayRef.current = overlay
   }, [overlay])
   useEffect(() => {
-    activeScenarioRef.current = activeScenario
-  }, [activeScenario])
+    effectivePhasesRef.current = effectivePhases
+  }, [effectivePhases])
   useEffect(() => {
-    // Only track the baseline while we are on it; inside a scenario `phases`
-    // is transiently the dragged state and must not overwrite the saved
-    // baseline snapshot.
+    scenariosRef.current = scenarios
+  }, [scenarios])
+  useEffect(() => {
+    // Only track the baseline while we are on it. Drags no longer write to
+    // `phases` mid-gesture (they go through `dragPreview`), but a what-if's
+    // placements must still never become the "live plan" snapshot.
     if (!activeScenarioId) baselinePhasesRef.current = phases
   }, [phases, activeScenarioId])
 
+  /**
+   * What-if saves, one at a time and in order.
+   *
+   * Each drop is fire-and-forget from the drag's point of view, so two quick
+   * drops would otherwise race: if the first save's response landed second it
+   * would put the older payload back. Chaining them makes the server see the
+   * drops in the order the user made them, and lets Publish wait for the last
+   * one instead of publishing a payload that is one move behind.
+   */
+  const saveChainRef = useRef<Promise<void>>(Promise.resolve())
+  const saveSeqRef = useRef(new Map<string, number>())
+
   const persistOverlay = useCallback(
-    async (next: Map<string, ScenarioPayload['phases'][number]>) => {
-      const scenarioId = activeScenarioIdRef.current
-      if (!scenarioId) return
-      try {
-        await saveScenarioPayload(scenarioId, {
-          phases: [...next.values()],
-          dependencies: activeScenarioRef.current?.payload.dependencies ?? [],
-        })
-        if (isMountedRef.current) setSaveError(null)
-      } catch (err) {
-        if (!isMountedRef.current) return
-        setSaveError(err instanceof Error ? err.message : 'Failed to save the what-if.')
+    (scenarioId: string, next: Map<string, ScenarioPhase>) => {
+      const phasesPayload = [...next.values()]
+      const seq = (saveSeqRef.current.get(scenarioId) ?? 0) + 1
+      saveSeqRef.current.set(scenarioId, seq)
+
+      // M-30: keep `scenarios` in step with what is on screen, optimistically
+      // and before the round trip. "Back to live plan" then "Resume…" rebuilds
+      // the overlay from this list; when it still held the page-load payload,
+      // resuming showed none of the moves and the next drag saved that stale
+      // copy over the real one.
+      setScenarios((prev) =>
+        prev.map((s) =>
+          s.id === scenarioId ? { ...s, payload: { ...s.payload, phases: phasesPayload } } : s
+        )
+      )
+
+      const run = async () => {
+        const dependencies =
+          scenariosRef.current.find((s) => s.id === scenarioId)?.payload.dependencies ?? []
+        try {
+          // Through the store, which calls ship.save_scenario_payload (owner
+          // only, server-side merge that keeps cost_settings, validates ids
+          // and ranges) rather than a raw UPDATE of the jsonb.
+          const saved = await saveScenarioPayload(scenarioId, phasesPayload, dependencies)
+          if (!isMountedRef.current) return
+          // A write that matched no row is a refusal, not a success: the old
+          // code dropped the returned row on the floor and carried on.
+          if (!saved) {
+            setSaveError(
+              "This what-if couldn't be saved. Only the person who started it can change it."
+            )
+            return
+          }
+          setSaveError(null)
+          // Adopt the server's row only if no newer save for this what-if has
+          // been queued since; otherwise it would briefly undo the optimistic
+          // update above.
+          if (saveSeqRef.current.get(scenarioId) === seq) {
+            setScenarios((prev) => prev.map((s) => (s.id === saved.id ? saved : s)))
+          }
+        } catch (err) {
+          if (!isMountedRef.current) return
+          setSaveError(err instanceof Error ? err.message : 'Failed to save the what-if.')
+        }
       }
+
+      const chained = saveChainRef.current.then(run)
+      saveChainRef.current = chained
+      return chained
     },
-    []
+    [setScenarios]
   )
 
   const persistPhases = useCallback(async (changed: ChunkPhase[]) => {
@@ -594,6 +756,13 @@ export default function TimelineTab({ project, permissions }: Props) {
     return new Map(scenario.payload.phases.map((phase) => [phase.id, phase]))
   }
 
+  /** Swaps the overlay in state AND in its ref, so a drop that lands before
+   *  the next render already builds on the right overlay. */
+  function replaceOverlay(next: Map<string, ScenarioPhase> | null) {
+    overlayRef.current = next
+    setOverlay(next)
+  }
+
   async function handleBranch(name: string) {
     // Consultants may branch -- modelling an idea privately is the point of
     // having them on the project. Viewers may not: migration 0011 refuses it,
@@ -601,11 +770,12 @@ export default function TimelineTab({ project, permissions }: Props) {
     if (!permissions.canContribute) return
     setSandboxBusy(true)
     setConflict(null)
+    setRebaseNotice(null)
     try {
       const scenario = await createScenario(project.id, name)
       setScenarios((prev) => [scenario, ...prev])
       setActiveScenarioId(scenario.id)
-      setOverlay(overlayFromScenario(scenario))
+      replaceOverlay(overlayFromScenario(scenario))
       setSaveError(null)
     } catch (err) {
       setSaveError(err instanceof Error ? err.message : 'Could not start the what-if.')
@@ -615,19 +785,24 @@ export default function TimelineTab({ project, permissions }: Props) {
   }
 
   function handleEnterScenario(scenarioId: string) {
+    // Reads the list that `persistOverlay` keeps current (M-30), so resuming
+    // shows the latest saved moves rather than the page-load copy.
     const scenario = scenarios.find((s) => s.id === scenarioId)
     if (!scenario) return
     setConflict(null)
+    setRebaseNotice(null)
     setActiveScenarioId(scenario.id)
-    setOverlay(overlayFromScenario(scenario))
+    replaceOverlay(overlayFromScenario(scenario))
   }
 
   /** Leaves the branch without touching it. The baseline was never modified,
    *  so this is purely dropping the overlay. */
   function handleExitScenario() {
     setActiveScenarioId(null)
-    setOverlay(null)
+    replaceOverlay(null)
     setConflict(null)
+    setRebaseNotice(null)
+    setDragPreview(null)
     setPhases(baselinePhasesRef.current)
   }
 
@@ -645,12 +820,16 @@ export default function TimelineTab({ project, permissions }: Props) {
     if (!canEditBaseline) return
     setSandboxBusy(true)
     setConflict(null)
+    setRebaseNotice(null)
     try {
+      // The last drop's save may still be in flight; publishing before it
+      // lands would publish the what-if one move behind what is on screen.
+      await saveChainRef.current
       const result = await publishScenario(activeScenarioId)
       if (!result.ok) {
         if (result.reason === 'conflict') {
           setConflict(
-            'Someone edited the plan while you were exploring. Pull their changes in, keeping yours on top, then publish again.'
+            'Someone changed the live plan while you were exploring. Pull in the latest plan: your moves stay where you put them, and everything you did not move takes the live plan’s newer values. Then publish again.'
           )
         } else {
           setSaveError(result.message)
@@ -661,7 +840,7 @@ export default function TimelineTab({ project, permissions }: Props) {
       // than assuming what landed — publish_scenario() reports how many rows
       // it touched precisely because that can differ from what was sent.
       setActiveScenarioId(null)
-      setOverlay(null)
+      replaceOverlay(null)
       await reloadScenarios()
       setPhases(await getChunkPhasesForProject(project.id))
     } catch (err) {
@@ -674,8 +853,11 @@ export default function TimelineTab({ project, permissions }: Props) {
   async function handleDiscard() {
     if (!activeScenarioId) return
     if (!permissions.canContribute) return
+    // SandboxBar only calls this from its inline "Yes, delete this what-if"
+    // confirm (M-23); there is no one-click path here any more.
     setSandboxBusy(true)
     try {
+      await saveChainRef.current
       await deleteScenario(activeScenarioId)
       setScenarios((prev) => prev.filter((s) => s.id !== activeScenarioId))
       handleExitScenario()
@@ -686,18 +868,43 @@ export default function TimelineTab({ project, permissions }: Props) {
     }
   }
 
+  /**
+   * "Pull in the latest plan and keep my moves" (M-07).
+   *
+   * The server does a real 3-way merge now (migration 0015): a phase keeps the
+   * what-if's value only where the user changed it since branching, and takes
+   * the live plan's value everywhere else -- dependencies included. The old
+   * rebase kept the what-if's copy of EVERY phase, so publishing afterwards
+   * silently reverted colleagues' edits.
+   *
+   * Afterwards we say what happened, by comparing the what-if before and after
+   * against the freshly loaded live plan. A rebase whose outcome you have to
+   * guess at is one people stop trusting.
+   */
   async function handleRebase() {
     if (!activeScenarioId) return
     if (!permissions.canContribute) return
     setSandboxBusy(true)
+    setRebaseNotice(null)
     try {
+      await saveChainRef.current
+      const before = [...(overlayRef.current?.values() ?? [])]
       const rebased = await rebaseScenario(activeScenarioId)
+      const live = await getChunkPhasesForProject(project.id)
       setScenarios((prev) => prev.map((s) => (s.id === rebased.id ? rebased : s)))
-      setOverlay(overlayFromScenario(rebased))
-      setPhases(await getChunkPhasesForProject(project.id))
+      replaceOverlay(overlayFromScenario(rebased))
+      setPhases(live)
       setConflict(null)
+
+      const chunkNames = new Map(chunkProjects.map((c) => [c.id, c.name]))
+      const phaseChunk = new Map(live.map((p) => [p.id, p.chunkProjectId]))
+      const summary = summariseRebase(before, rebased.payload.phases, live, (phase) => {
+        const chunkName = chunkNames.get(phaseChunk.get(phase.id) ?? '')
+        return chunkName ? `${chunkName} – ${phase.name}` : phase.name
+      })
+      setRebaseNotice(describeRebase(summary.pulledIn, summary.kept))
     } catch (err) {
-      setSaveError(err instanceof Error ? err.message : 'Could not pull in the changes.')
+      setSaveError(err instanceof Error ? err.message : 'Could not pull in the latest plan.')
     } finally {
       setSandboxBusy(false)
     }
@@ -722,22 +929,25 @@ export default function TimelineTab({ project, permissions }: Props) {
   /**
    * Drag / resize a phase bar.
    *
-   * Local state updates on every pointermove so the bar tracks the cursor at
-   * 60fps; the network write happens exactly once, on pointerup. That is the
-   * pattern v1 established and it is the right one — a write per pointer event
-   * would put hundreds of round trips behind a single drag.
+   * During the drag only `dragPreview` changes, and it is applied on top of
+   * the overlay, so the bar tracks the cursor whether you are on the live plan
+   * or inside a what-if. The network write happens exactly once, on pointerup
+   * -- a write per pointer event would put hundreds of round trips behind a
+   * single drag -- and not at all when the bar ends where it started.
    *
-   * Dependency propagation also runs once, on drop rather than during the
-   * drag. Cascading every frame makes downstream bars twitch while the user is
-   * still deciding where to put this one.
+   * Everything is measured against the schedule the user is LOOKING AT
+   * (`effectivePhases`), never the baseline rows. Inside a what-if that is the
+   * difference between "move this bar" and "move this bar and quietly put
+   * every other bar back where the live plan has it" (M-05).
+   *
+   * Dependency propagation runs once, on drop, and only while dependency links
+   * are switched on (D-14, `DEPENDENCY_LINKS_ENABLED`).
    */
   function handlePhasePointerDown(
     event: ReactPointerEvent<HTMLDivElement>,
     phase: ChunkPhase,
     mode: DragMode
   ) {
-    if (slotCount <= 0) return
-
     // Belt and braces with the `readOnly` prop below: the grid stops
     // rendering the handles, and this refuses the drag even if something
     // else dispatches one.
@@ -748,124 +958,99 @@ export default function TimelineTab({ project, permissions }: Props) {
     // else dispatched it — refuse rather than silently stretching the bar.
     if (phase.durationLocked && mode !== 'move') return
 
-    event.preventDefault()
-    event.stopPropagation()
-
-    const origin: ActiveDrag = {
+    const origin: DragOrigin = {
       phaseId: phase.id,
       mode,
       startSlot: phase.startSlot,
       durationSlots: phase.durationSlots,
     }
+    // Refuses a resize of a phase that starts past the last column (M-27).
+    if (!canStartDrag(origin, slotCount)) return
+
+    event.preventDefault()
+    event.stopPropagation()
+
     const originX = event.clientX
+    let latest: Placement = { startSlot: origin.startSlot, durationSlots: origin.durationSlots }
 
     const onMove = (moveEvent: PointerEvent) => {
       const deltaSlots = Math.round((moveEvent.clientX - originX) / CELL_WIDTH)
-
-      setPhases((prev) =>
-        prev.map((candidate) => {
-          if (candidate.id !== origin.phaseId) return candidate
-
-          if (origin.mode === 'move') {
-            const maxStart = Math.max(0, slotCount - origin.durationSlots)
-            return {
-              ...candidate,
-              startSlot: Math.min(Math.max(origin.startSlot + deltaSlots, 0), maxStart),
-            }
-          }
-
-          if (origin.mode === 'resize-start') {
-            const nextStart = Math.min(
-              Math.max(origin.startSlot + deltaSlots, 0),
-              origin.startSlot + origin.durationSlots - 1
-            )
-            return {
-              ...candidate,
-              startSlot: nextStart,
-              durationSlots: origin.startSlot + origin.durationSlots - nextStart,
-            }
-          }
-
-          const nextDuration = Math.min(
-            Math.max(origin.durationSlots + deltaSlots, 1),
-            slotCount - origin.startSlot
-          )
-          return { ...candidate, durationSlots: nextDuration }
-        })
-      )
+      const next = placementForDelta(origin, deltaSlots, slotCount)
+      // Most pointermoves land in the same column; skip the re-render.
+      if (next.startSlot === latest.startSlot && next.durationSlots === latest.durationSlots) {
+        return
+      }
+      latest = next
+      setDragPreview({ phaseId: origin.phaseId, ...next })
     }
 
     const onUp = () => {
       window.removeEventListener('pointermove', onMove)
       window.removeEventListener('pointerup', onUp)
+      setDragPreview(null)
 
-      const current = phasesRef.current
-      const dragged = current.find((p) => p.id === origin.phaseId)
-      if (!dragged) return
+      // A click, or a drag that came back to where it began. Nothing to save
+      // -- in a what-if, a plain click used to re-save the whole overlay.
+      if (isNoOpDrop(origin, latest)) return
+
+      // The schedule on screen just before this drag: the effective phases
+      // with the dragged bar put back at its origin (the ref also carries the
+      // live preview, which is not "before").
+      const before = effectivePhasesRef.current.map((row) =>
+        row.id === origin.phaseId
+          ? { ...row, startSlot: origin.startSlot, durationSlots: origin.durationSlots }
+          : row
+      )
 
       // Push any successor the move has left in violation. Never pulls one
       // earlier — slack is a decision the planner made.
-      const propagated = propagateDependencies(
-        current.map(toEnginePhase),
-        dependencies.map(toEngineDependency)
-      )
+      const propagate = DEPENDENCY_LINKS_ENABLED
+        ? (rows: ChunkPhase[]) =>
+            propagateDependencies(
+              rows.map(toEnginePhase),
+              dependencies.map(toEngineDependency)
+            )
+        : undefined
 
-      const next = current.map((phaseRow) => {
-        const moved = propagated.get(phaseRow.id)
-        if (!moved) return phaseRow
-        if (moved.startSlot === phaseRow.startSlot) return phaseRow
-        return { ...phaseRow, startSlot: moved.startSlot }
-      })
+      const changed = changedPhasesForDrop(before, origin.phaseId, latest, propagate)
+      if (changed.length === 0) return
 
-      const changed = next.filter((phaseRow, index) => {
-        const before = current[index]
-        return (
-          phaseRow.startSlot !== before.startSlot ||
-          phaseRow.durationSlots !== before.durationSlots
+      const scenarioId = activeScenarioIdRef.current
+      if (scenarioId) {
+        // Inside a scenario the drag must NOT reach chunk_phases. Only the rows
+        // this drop changed are written, into a COPY of the existing overlay,
+        // so every earlier move in the what-if survives. Saved to the scenario
+        // row, never the live plan -- that separation is the whole feature.
+        const nextOverlay = mergeDropIntoOverlay(
+          overlayRef.current ?? new Map(),
+          changed,
+          (id) => {
+            const row = phasesRef.current.find((p) => p.id === id)
+            return row ? toScenarioPhase(row) : undefined
+          }
         )
-      })
-
-      setPhases(next)
-
-      // Inside a scenario the drag must NOT reach chunk_phases. It updates the
-      // in-memory overlay and is saved to the scenario row instead — that
-      // separation is the whole feature, and getting it wrong means a
-      // "what-if" silently rewrites the live plan in front of a client.
-      // A viewer's sandbox is local and stays local. Returning before either
-      // persist path is what makes "nothing is saved" true rather than
-      // aspirational -- migration 0011 refuses the writes as well, but the UI
-      // should never be the thing that gets refused.
-      if (isEphemeral) return
-
-      if (activeScenarioIdRef.current) {
-        const nextOverlay = new Map(overlayRef.current ?? [])
-        for (const phaseRow of next) {
-          nextOverlay.set(phaseRow.id, {
-            id: phaseRow.id,
-            chunkProjectId: phaseRow.chunkProjectId,
-            name: phaseRow.name,
-            kind: phaseRow.kind,
-            sortOrder: phaseRow.sortOrder,
-            pctOfTpc: phaseRow.pctOfTpc,
-            startSlot: phaseRow.startSlot,
-            durationSlots: phaseRow.durationSlots,
-            durationLocked: phaseRow.durationLocked,
-          })
-        }
-        setOverlay(nextOverlay)
-        // Restore the baseline rows we just mutated locally: `setPhases` above
-        // is what makes the bar follow the cursor, but `phases` is the
-        // BASELINE, and leaving a scenario's placement in it would make
-        // "Back to live plan" show the scenario's schedule.
-        setPhases(baselinePhasesRef.current)
-        void persistOverlay(nextOverlay)
+        replaceOverlay(nextOverlay)
+        void persistOverlay(scenarioId, nextOverlay)
         return
       }
 
-      // `dragged` is always persisted even when propagation moved nothing,
-      // because the drag itself is the change the user made.
-      const toPersist = changed.length > 0 ? changed : [dragged]
-      void persistPhases(toPersist)
+      const changedById = new Map(changed.map((row) => [row.id, row]))
+      setPhases((prev) =>
+        prev.map((row) => {
+          const moved = changedById.get(row.id)
+          return moved
+            ? { ...row, startSlot: moved.startSlot, durationSlots: moved.durationSlots }
+            : row
+        })
+      )
+
+      // A viewer's sandbox is local and stays local. Returning before the
+      // persist is what makes "nothing is saved" true rather than aspirational
+      // -- migration 0011 refuses the writes as well, but the UI should never
+      // be the thing that gets refused.
+      if (isEphemeral) return
+
+      void persistPhases(changed)
     }
 
     window.addEventListener('pointermove', onMove)
@@ -905,6 +1090,9 @@ export default function TimelineTab({ project, permissions }: Props) {
   }
 
   function handleZoomChange(zoomLevel: number) {
+    // M-01 interim: never write a new zoom while slots still mean "whatever
+    // the zoom says". See ZOOM_LOCKED.
+    if (ZOOM_LOCKED) return
     const interval = intervalForZoom(zoomLevel)
     setTimelineSettings((prev) => ({ ...prev, zoomLevel, interval }))
     scheduleSettingsPersist({ zoomLevel, interval })
@@ -953,7 +1141,15 @@ export default function TimelineTab({ project, permissions }: Props) {
             {/* R8.4: a viewer does not get the deliverables. They are being
                 shown the plan, not handed a copy of it to pass on. */}
             {permissions.isViewer ? null : (
-              <ExportBar project={project} className="no-print" />
+              <ExportBar
+                project={project}
+                // M-24: while a what-if is open, Excel exports THAT schedule,
+                // matching the screen and the PDF.
+                scenario={
+                  activeScenario ? { id: activeScenario.id, name: activeScenario.name } : null
+                }
+                className="no-print"
+              />
             )}
             <div className="rounded-[1rem] border border-slate-200 bg-slate-50 px-4 py-2">
               <div className="text-[10px] font-semibold uppercase tracking-[0.18em] text-slate-500">
@@ -980,6 +1176,7 @@ export default function TimelineTab({ project, permissions }: Props) {
           activeScenario={activeScenario}
           busy={sandboxBusy}
           conflict={conflict}
+          rebaseNotice={rebaseNotice}
           onBranch={(name) => void handleBranch(name)}
           onEnter={handleEnterScenario}
           onExit={isEphemeral ? handleResetEphemeral : handleExitScenario}
@@ -987,6 +1184,34 @@ export default function TimelineTab({ project, permissions }: Props) {
           onDiscard={() => void handleDiscard()}
           onRebase={() => void handleRebase()}
         />
+
+        {unreadableCostCount > 0 ? (
+          <div
+            role="alert"
+            className="rounded-[1.25rem] border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900"
+          >
+            {unreadableCostCount} item{unreadableCostCount === 1 ? ' has' : 's have'} an
+            unreadable cost &mdash; {unreadableCostCount === 1 ? 'it counts' : 'they count'} as
+            $0 until fixed in Master View.
+          </div>
+        ) : null}
+
+        {/* M-25: a missing year is shown, never silently replaced. */}
+        {!timelineSettingsLoading &&
+        !costSettingsLoading &&
+        (timelineSettings.startCalendarYear === null || costSettingsRow?.baseYear === null) ? (
+          <div
+            role="alert"
+            className="rounded-[1.25rem] border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900"
+          >
+            {timelineSettings.startCalendarYear === null
+              ? 'Timeline start year not set. '
+              : ''}
+            {costSettingsRow?.baseYear === null ? 'Cost base year not set. ' : ''}
+            Fiscal years and escalation below use {standInYear} as a stand-in, so treat these
+            totals as provisional until it is set.
+          </div>
+        ) : null}
 
         {loadError || saveError ? (
           <div className="rounded-[1.25rem] border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
@@ -1034,14 +1259,21 @@ export default function TimelineTab({ project, permissions }: Props) {
               step={1}
               value={timelineSettings.zoomLevel}
               onChange={(e) => handleZoomChange(Number(e.target.value))}
-              disabled={!canEditBaseline}
-              className="mt-4 w-full accent-slate-900"
+              disabled={ZOOM_LOCKED || !canEditBaseline}
+              aria-describedby={ZOOM_LOCKED ? 'timeline-zoom-locked' : undefined}
+              className="mt-4 w-full accent-slate-900 disabled:cursor-not-allowed disabled:opacity-60"
             />
             <div className="mt-3 grid grid-cols-5 text-center text-[10px] font-medium text-slate-500">
               {ZOOM_LEVELS.map((z) => (
                 <span key={z.level}>{z.label}</span>
               ))}
             </div>
+            {ZOOM_LOCKED ? (
+              <p id="timeline-zoom-locked" className="mt-3 text-[11px] text-slate-500">
+                Zoom is temporarily fixed. Changing it would move every phase and change the
+                totals; it comes back once schedules are stored in months.
+              </p>
+            ) : null}
           </div>
 
           {/* Escalation is READ-ONLY here and edited on the Cost Model tab.

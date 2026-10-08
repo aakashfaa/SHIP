@@ -34,6 +34,9 @@ type Props = {
   ephemeral?: boolean
   busy?: boolean
   conflict?: string | null
+  /** What the last "Pull in the latest plan" did, in words. Shown until the
+   *  user leaves the what-if, so the outcome of a rebase is never a guess. */
+  rebaseNotice?: string | null
   onBranch: (name: string) => void
   onEnter: (scenarioId: string) => void
   onExit: () => void
@@ -48,6 +51,7 @@ export default function SandboxBar({
   ephemeral = false,
   busy = false,
   conflict = null,
+  rebaseNotice = null,
   onBranch,
   onEnter,
   onExit,
@@ -57,6 +61,23 @@ export default function SandboxBar({
 }: Props) {
   const [isNaming, setIsNaming] = useState(false)
   const [draftName, setDraftName] = useState('')
+
+  /**
+   * Discard is a hard DELETE with no undo (D-15: confirm-only, no soft
+   * delete), and it sits one button away from "Back to live plan". So it takes
+   * two clicks: the first only swaps the buttons for an inline question that
+   * names the what-if being thrown away. No `window.confirm` -- it blocks the
+   * page, looks like a browser error, and can be suppressed by the browser.
+   */
+  //
+  // The armed confirm is keyed by scenario id: it belongs to ONE what-if, so
+  // switching or leaving can never carry an armed "Yes, delete" over to a
+  // different one.
+  const [confirmingDiscardFor, setConfirmingDiscardFor] = useState<string | null>(null)
+  const confirmingDiscard =
+    activeScenario !== null && confirmingDiscardFor === activeScenario.id
+  const setConfirmingDiscard = (on: boolean) =>
+    setConfirmingDiscardFor(on && activeScenario ? activeScenario.id : null)
 
   const openScenarios = scenarios.filter((s) => s.publishedAt === null)
 
@@ -121,8 +142,9 @@ export default function SandboxBar({
             </button>
             <button
               type="button"
-              onClick={onDiscard}
-              disabled={busy}
+              onClick={() => setConfirmingDiscard(true)}
+              disabled={busy || confirmingDiscard}
+              aria-expanded={confirmingDiscard}
               className="rounded-[0.95rem] border border-rose-200 bg-white px-4 py-2 text-sm font-medium text-rose-700 transition hover:bg-rose-50 disabled:opacity-50"
             >
               Discard
@@ -137,6 +159,50 @@ export default function SandboxBar({
             </button>
           </div>
         </div>
+
+        {confirmingDiscard ? (
+          <div
+            role="alertdialog"
+            aria-label="Confirm discard"
+            className="mt-3 flex flex-wrap items-center justify-between gap-3 rounded-[1rem] border border-rose-300 bg-rose-50 px-4 py-3"
+          >
+            <p className="text-sm text-rose-900">
+              Discard <span className="font-semibold">&lsquo;{activeScenario.name}&rsquo;</span>?
+              Every move in it is deleted. This can&apos;t be undone.
+            </p>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => setConfirmingDiscard(false)}
+                disabled={busy}
+                autoFocus
+                className="rounded-[0.9rem] border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 transition hover:bg-slate-100 disabled:opacity-50"
+              >
+                Keep it
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setConfirmingDiscard(false)
+                  onDiscard()
+                }}
+                disabled={busy}
+                className="rounded-[0.9rem] bg-rose-700 px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-rose-800 disabled:opacity-50"
+              >
+                Yes, delete this what-if
+              </button>
+            </div>
+          </div>
+        ) : null}
+
+        {rebaseNotice ? (
+          <div
+            role="status"
+            className="mt-3 rounded-[1rem] border border-emerald-300 bg-emerald-50 px-4 py-3 text-xs text-emerald-900"
+          >
+            {rebaseNotice}
+          </div>
+        ) : null}
 
         {/* The conflict is the Revit sync-with-central moment. It gets its own
             explanation and its own action, because "it failed, try again" is
@@ -153,7 +219,7 @@ export default function SandboxBar({
               disabled={busy}
               className="mt-2 rounded-[0.9rem] border border-rose-300 bg-white px-3 py-1.5 text-xs font-medium text-rose-800 transition hover:bg-rose-100 disabled:opacity-50"
             >
-              Pull in the changes and keep mine
+              {busy ? 'Pulling in the latest plan…' : 'Pull in the latest plan and keep my moves'}
             </button>
           </div>
         ) : null}

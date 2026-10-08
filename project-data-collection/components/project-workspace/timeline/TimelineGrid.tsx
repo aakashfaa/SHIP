@@ -7,6 +7,7 @@ import type { ChunkPhase } from '@/lib/types'
 import {
   BAR_HEIGHT,
   CELL_WIDTH,
+  DEPENDENCY_LINKS_ENABLED,
   LABEL_COLUMN_WIDTH,
   PACKAGE_ROW_HEIGHT,
   PHASE_ROW_HEIGHT,
@@ -342,6 +343,13 @@ export default function TimelineGrid({
                               readOnly ? 'cursor-default' : 'cursor-grab'
                             }`}
                             style={{ ...rect, height: BAR_HEIGHT }}
+                            // Stable hooks for the what-if browser spec, which
+                            // has to find "this bar" again after a reload and
+                            // read where it landed.
+                            data-phase-id={phase.id}
+                            data-chunk-id={phase.chunkProjectId}
+                            data-start-slot={phase.startSlot}
+                            data-duration-slots={phase.durationSlots}
                             onPointerDown={
                               readOnly
                                 ? undefined
@@ -404,17 +412,21 @@ export default function TimelineGrid({
             the same layout arithmetic rather than measured from the DOM —
             measuring would need a layout pass per drag frame and would be
             wrong for one frame after every re-render. */}
-        <div
-          className="pointer-events-none absolute top-0"
-          style={{ left: LABEL_COLUMN_WIDTH, width, height: bodyHeight }}
-        >
-          <DependencyArrows
-            links={links}
-            width={width}
-            height={bodyHeight}
-            onSelectLink={readOnly ? undefined : onSelectLink}
-          />
-        </div>
+        {/* Not rendered at all while dependency links are switched off
+            (D-14, see layout.ts) -- no arrows and no selectable hit-paths. */}
+        {DEPENDENCY_LINKS_ENABLED ? (
+          <div
+            className="pointer-events-none absolute top-0"
+            style={{ left: LABEL_COLUMN_WIDTH, width, height: bodyHeight }}
+          >
+            <DependencyArrows
+              links={links}
+              width={width}
+              height={bodyHeight}
+              onSelectLink={readOnly ? undefined : onSelectLink}
+            />
+          </div>
+        ) : null}
       </div>
     </div>
   )

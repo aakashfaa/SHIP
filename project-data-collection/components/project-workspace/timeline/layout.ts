@@ -14,6 +14,19 @@
  * is how charts end up half a column out of register.
  */
 
+/**
+ * Dependency links are switched OFF for launch (owner decision D-14).
+ *
+ * There is no UI to create, edit or delete a link -- they only ever came from
+ * seeds or SQL -- so the arrows were wiring the user could see but never
+ * change, and the drag auto-push moved bars the user had not touched for
+ * reasons the screen could not explain. This one constant turns off BOTH:
+ * the arrows (and their clickable hit-paths) and `propagateDependencies` on
+ * drop. Nothing is deleted; flipping it back to `true` restores the previous
+ * behaviour exactly, which is the plan once a link editor exists.
+ */
+export const DEPENDENCY_LINKS_ENABLED = false
+
 export const CELL_WIDTH = 92
 export const LABEL_COLUMN_WIDTH = 300
 
