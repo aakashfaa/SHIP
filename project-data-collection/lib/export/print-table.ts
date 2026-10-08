@@ -60,6 +60,7 @@ export function printTable(table: PrintableTable): boolean {
     tr { break-inside: avoid; }
     th, td { border: 1px solid #dbe1ea; padding: 4px 5px; vertical-align: top; word-break: break-word; text-align: left; }
     th { background: #e2e8f0; text-transform: uppercase; letter-spacing: .04em; font-size: 8px; }
+    td.multi { white-space: pre-line; }
     td.num { text-align: right; white-space: nowrap; }
   `
   doc.head.appendChild(style)
@@ -89,7 +90,9 @@ export function printTable(table: PrintableTable): boolean {
     table.columns.forEach((column, index) => {
       const td = doc.createElement('td')
       const value = row[index]
+      // A grouped cell's lines (Op / User / Public) stay on their own lines.
       if (typeof value === 'number') td.className = 'num'
+      else if (column.wrap) td.className = 'multi'
       td.textContent = cellText(column, value)
       tr.appendChild(td)
     })

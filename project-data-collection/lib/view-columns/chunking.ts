@@ -3,7 +3,7 @@ import { orderedVisibleFields } from '@/lib/form-values'
 import type { ViewColumn } from '@/lib/view-settings'
 
 /**
- * Every column/field the Phasing view can show for a line item, in display
+ * Every column/field the Packaging view can show for a line item, in display
  * order. Settings lists this catalog so a project admin can hide columns;
  * Chunking renders
  * visibleColumns(getChunkingColumns(fields), settings.chunking.hiddenColumns).

@@ -34,7 +34,7 @@ export default function EditableCell({ field, value, onChange, error, disabled, 
     title: error,
   }
   // Text-like controls go read-only rather than disabled while saving: a
-  // disabled input drops focus, so a save landing mid-typing (Phasing saves
+  // disabled input drops focus, so a save landing mid-typing (Packaging saves
   // a cell as soon as focus leaves it) would kick the cursor out.
   const typing = {
     ...common,

@@ -62,6 +62,8 @@ type Props = {
   onSaved?: () => void
   /** Every change in save state, including ones after unmount. */
   onStatus?: (status: CostModelSaveStatus) => void
+  /** Focus the Annual baseline input once the editor has loaded. */
+  focusBaseline?: boolean
 }
 
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
@@ -78,7 +80,13 @@ const INPUT_CLASS =
 
 const SECTION_CLASS = 'rounded-[1.25rem] border border-slate-200 bg-white p-4'
 
-export default function CostModelEditor({ projectId, readOnly, onSaved, onStatus }: Props) {
+export default function CostModelEditor({
+  projectId,
+  readOnly,
+  onSaved,
+  onStatus,
+  focusBaseline = false,
+}: Props) {
   const {
     data: costRow,
     setData: setCostRow,
@@ -783,6 +791,9 @@ export default function CostModelEditor({ projectId, readOnly, onSaved, onStatus
                 })
               }
               placeholder="Not set"
+              // Mounts only once the rows have loaded, so autoFocus lands
+              // after the popup is up.
+              autoFocus={focusBaseline && !readOnly}
               className={INPUT_CLASS}
             />
           </Field>

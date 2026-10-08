@@ -70,7 +70,7 @@ test('form builder: field reorder persists and survives a reload', async ({ page
 })
 
 /**
- * A package card on the Phasing tab. The `:not(...)` clauses because the
+ * A package card on the Packaging tab. The `:not(...)` clauses because the
  * workspace frame (root and box) that holds every tab is overflow-hidden too, and it
  * contains every card's text.
  */
@@ -78,11 +78,11 @@ function packageCard(page: Page, name: string) {
   return page.locator('div.overflow-hidden:not([data-workspace-root]):not([data-workspace-box])', { hasText: name }).first()
 }
 
-test('phasing: a new package gets the project template phases; quantity is validated; delete needs a second click', async ({
+test('packaging: a new package gets the project template phases; quantity is validated; delete needs a second click', async ({
   page,
 }) => {
   const name = `WS7 temp ${Date.now()}`
-  await page.goto(`/projects/${PROJECT}?tab=phasing`)
+  await page.goto(`/projects/${PROJECT}?tab=packaging`)
   await settle(page)
 
   async function deleteTempPackageIfAny() {

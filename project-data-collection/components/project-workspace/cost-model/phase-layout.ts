@@ -4,7 +4,7 @@
  * Every package gets its phases from the project template
  * (project_cost_settings.default_phase_template_id) -- per-package phase
  * structures are gone (owner's decision). Used when a package is created
- * (Phasing) and when the project template changes (Cost model popup), which
+ * (Packaging) and when the project template changes (Cost model popup), which
  * re-applies it to every package.
  *
  * Layout: the first phase starts at `startMonth`, each later phase starts

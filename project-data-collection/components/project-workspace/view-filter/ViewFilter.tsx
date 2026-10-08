@@ -3,7 +3,7 @@
 import { ReactNode, useEffect, useRef, useState } from 'react'
 
 /**
- * The "Filter" button every view (Master View, Phasing, Timeline) puts in its
+ * The "Filter" button every view (Master View, Packaging, Timeline) puts in its
  * header, and the popover it opens. The view supplies the controls; this
  * supplies the shell: a badge with how much is hidden, "Reset to project
  * default" when this person has their own filter, and -- for project

@@ -212,6 +212,8 @@ type Props = {
   /** Resolved by the shell so the whole workspace agrees on one answer and
    *  the role RPC is not re-issued on every tab switch. */
   permissions: ProjectPermissions
+  /** Switches the workspace to the Master View tab. Supplied by the shell. */
+  onOpenMasterView?: () => void
 }
 
 /** The bar being dragged right now and where it currently sits. Applied on
@@ -260,7 +262,9 @@ const DEFAULT_TIMELINE_SETTINGS: Omit<ProjectTimelineSettings, 'projectId'> = {
   fiscalYearLabelsBy: 'end_year',
 }
 
-export default function TimelineTab({ project, permissions }: Props) {
+export default function TimelineTab({ project, permissions, onOpenMasterView }: Props) {
+  // Bumped by the energy chart's empty state to open the Cost model popup.
+  const [costModelOpenRequest, setCostModelOpenRequest] = useState(0)
   const { data: chunkProjects, loading: chunksLoading, error: chunksError } = useAsyncData<
     ChunkProject[]
   >(() => getChunkProjectsForProject(project.id), [project.id], [])
@@ -1356,6 +1360,7 @@ export default function TimelineTab({ project, permissions }: Props) {
             costRow={costSettingsRow}
             energyRow={energySettingsRow}
             onChanged={handleCostModelChanged}
+            openRequest={costModelOpenRequest}
           />
         </div>
       </div>
@@ -1437,6 +1442,10 @@ export default function TimelineTab({ project, permissions }: Props) {
                 series={energySeries}
                 slotCount={slotCount}
                 hoveredSlot={hoveredSlot}
+                onOpenCostModel={
+                  canEditBaseline ? () => setCostModelOpenRequest((n) => n + 1) : undefined
+                }
+                onOpenMasterView={permissions.canContribute ? onOpenMasterView : undefined}
               />
             ) : null}
           </div>

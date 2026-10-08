@@ -42,17 +42,9 @@
  */
 
 import type { ShipSupabaseClient } from '../supabase/client'
-import {
-  ECC_COLUMN,
-  UNREADABLE_CELL,
-  eccCell,
-  fieldCell,
-  fieldColumn,
-  type ReportCellValue,
-  type ReportColumn,
-} from './line-item-cells'
+import { UNREADABLE_CELL, type ReportCellValue, type ReportColumn } from './line-item-cells'
+import { getMasterViewColumnDefs, masterExportCell, masterExportColumn } from '../view-columns/master'
 import { parseCostAmount, parseCostInput, parseQuantity, parseQuantityInput } from '../costs'
-import { orderedVisibleFields } from '../form-values'
 import {
   DEFAULT_ENERGY_SETTINGS,
   applyScenarioOverlay,
@@ -436,42 +428,27 @@ export type BuildReportOptions = {
 export { UNREADABLE_CELL }
 
 /**
- * The Line Items sheet, built from the project's VISIBLE form fields in form
- * order, with their current labels -- custom fields included, hidden ones
- * left out (M-28). Before this it was a hardcoded list of fifteen built-ins
- * with hardcoded labels: custom fields never reached the client and a field
- * an admin had hidden still did.
+ * The Line Items sheet: the same columns, headers and grouping as Master
+ * View (lib/view-columns/master.ts), built from the project's VISIBLE form
+ * fields -- custom fields included, hidden ones left out (M-28). Before M-28
+ * it was a hardcoded list of fifteen built-ins with hardcoded labels: custom
+ * fields never reached the client and a field an admin had hidden still did.
  *
- * Three system columns lead (they are not form fields, they are who/what
- * the row is), and "ECC Amount" -- the parsed per-unit cost every total is
- * built from -- sits right after the estimated-cost field, or at the end if
- * that field is hidden. D-4: nothing else is added or removed.
+ * Grouped columns (Name / Description, Strategy, Location, Impacts) are one
+ * newline-separated text cell; ECC and the numeric fields stay numbers.
+ * "Submitted By" (the submitter's email) is the one Master View column left
+ * out: who typed a row is not part of the deliverable (D-4). The per-project
+ * hidden-column display setting does not apply here either -- the workbook
+ * is the full record.
  */
 export function buildLineItemTable(
   lineItems: readonly LineItem[],
   formFields: readonly FormField[]
 ): ReportTable {
-  type Spec = { column: ReportColumn; value: (item: LineItem) => ReportCellValue }
-
-  const specs: Spec[] = [
-    { column: { header: 'Item #', width: 10 }, value: (item) => item.itemNumber },
-    { column: { header: 'Discipline', width: 18 }, value: (item) => item.discipline },
-    { column: { header: 'Company', width: 20 }, value: (item) => item.companyName },
-  ]
-
-  let eccPlaced = false
-  for (const field of orderedVisibleFields(formFields)) {
-    specs.push({ column: fieldColumn(field), value: (item) => fieldCell(item, field) })
-    if (field.key === 'estimated_first_cost') {
-      specs.push({ column: ECC_COLUMN, value: eccCell })
-      eccPlaced = true
-    }
-  }
-  if (!eccPlaced) specs.push({ column: ECC_COLUMN, value: eccCell })
-
+  const defs = getMasterViewColumnDefs(formFields).filter((def) => def.kind !== 'submittedBy')
   return {
-    columns: specs.map((spec) => spec.column),
-    rows: lineItems.map((item) => specs.map((spec) => spec.value(item))),
+    columns: defs.map(masterExportColumn),
+    rows: lineItems.map((item) => defs.map((def) => masterExportCell(def, item))),
   }
 }
 

@@ -169,7 +169,7 @@ test('add data: numbers keep what is typed, costs preview and validate, delete n
   }
 })
 
-test('master view: scrolls horizontally in its own box with sticky Item # and Name', async ({ page }) => {
+test('master view: scrolls horizontally in its own box with sticky # and Name / Description', async ({ page }) => {
   await page.setViewportSize({ width: 1280, height: 800 })
   await signIn(page, 'admin@gmail.com')
   await page.goto(`/projects/${PROJECT}?tab=master-view`)
@@ -186,9 +186,9 @@ test('master view: scrolls horizontally in its own box with sticky Item # and Na
   }))
   expect(dims.scroll).toBeGreaterThan(dims.client)
 
-  const numberHeader = table.locator('th', { hasText: /^Item #/ })
-  const nameHeader = table.locator('th', { hasText: /^Item name/ })
-  const lastHeader = table.locator('th', { hasText: /^Submitted by/i })
+  const numberHeader = table.locator('th', { hasText: /^#/ })
+  const nameHeader = table.locator('th', { hasText: /^Name \/ Description/ })
+  const lastHeader = table.locator('th', { hasText: /^Submitted By/i })
   const before = (await numberHeader.boundingBox())!.x
   const nameBefore = (await nameHeader.boundingBox())!.x
 
@@ -197,7 +197,7 @@ test('master view: scrolls horizontally in its own box with sticky Item # and Na
   const wrapBox = (await wrapper.boundingBox())!
   const lastBox = (await lastHeader.boundingBox())!
   expect(lastBox.x + lastBox.width).toBeLessThanOrEqual(wrapBox.x + wrapBox.width + 1)
-  // ...while Item # and the item's name stayed pinned where they were.
+  // ...while # and Name / Description stayed pinned where they were.
   expect(Math.abs((await numberHeader.boundingBox())!.x - before)).toBeLessThan(2)
   expect(Math.abs((await nameHeader.boundingBox())!.x - nameBefore)).toBeLessThan(2)
   await expect(numberHeader).toBeInViewport()

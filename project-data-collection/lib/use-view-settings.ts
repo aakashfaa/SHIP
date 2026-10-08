@@ -12,7 +12,7 @@ import { DEFAULT_VIEW_SETTINGS, ProjectViewSettings, normalizeViewSettings } fro
  * `save` is project-admin only (the database refuses anyone else and `save`
  * rejects with that error); every other member just reads. It takes only the
  * view(s) being changed -- the database merges them into the stored object
- * (0021), so saving Master View can never overwrite Phasing or Timeline, even
+ * (0021), so saving Master View can never overwrite Packaging or Timeline, even
  * if this client's copy is stale or still loading. After a successful
  * save, every mounted consumer of this hook for the same project sees the new
  * value: the settings live in a small module-level cache keyed by project id,

@@ -5,7 +5,7 @@ import path from 'node:path'
 import { settle } from '../helpers/settle'
 
 /**
- * The per-view Filter (Master View, Phasing): a personal filter hides a
+ * The per-view Filter (Master View, Packaging): a personal filter hides a
  * column for this browser only, and a column the project admin hid for
  * everyone cannot be brought back by anyone else.
  *
@@ -63,9 +63,9 @@ function columnToggle(page: Page, label: string) {
   return filterDialog(page).getByRole('checkbox', { name: new RegExp(`^${label}`) })
 }
 
-test('phasing: a personal filter hides a column, and Reset brings it back', async ({ page }) => {
+test('packaging: a personal filter hides a column, and Reset brings it back', async ({ page }) => {
   await signIn(page, ADMIN.email)
-  await page.goto(`/projects/${PROJECT}?tab=phasing`)
+  await page.goto(`/projects/${PROJECT}?tab=packaging`)
   await settle(page)
 
   const header = page.getByRole('columnheader', { name: 'Discipline', exact: true })
@@ -103,15 +103,15 @@ test('master view: a column the admin hid for everyone cannot be un-hidden by a 
   const adminContext = await browser.newContext({ storageState: { cookies: [], origins: [] } })
   const viewerContext = await browser.newContext({ storageState: { cookies: [], origins: [] } })
   try {
-    // Admin hides Category and saves it as the default for everyone.
+    // Admin hides Strategy (Category + Timeline priority) and saves it as the default for everyone.
     const page = await adminContext.newPage()
     await signIn(page, ADMIN.email)
     await page.goto(`/projects/${PROJECT}?tab=master-view`)
     await settle(page)
-    const adminHeader = page.getByRole('columnheader', { name: 'Category' })
+    const adminHeader = page.getByRole('columnheader', { name: 'Strategy' })
     await expect(adminHeader).toBeVisible()
     await page.getByTestId('view-filter-button').click()
-    await columnToggle(page, 'Category').uncheck()
+    await columnToggle(page, 'Strategy').uncheck()
     await filterDialog(page).getByRole('button', { name: 'Save as default for everyone' }).click()
     // Saved: the personal layer is dropped, so the default now IS the hidden state.
     await expect(filterDialog(page).getByRole('button', { name: 'Reset to project default' })).toHaveCount(0)
@@ -122,9 +122,9 @@ test('master view: a column the admin hid for everyone cannot be un-hidden by a 
     await signIn(viewer, VIEWER)
     await viewer.goto(`/projects/${PROJECT}?tab=master-view`)
     await settle(viewer)
-    await expect(viewer.getByRole('columnheader', { name: 'Category' })).toHaveCount(0)
+    await expect(viewer.getByRole('columnheader', { name: 'Strategy' })).toHaveCount(0)
     await viewer.getByTestId('view-filter-button').click()
-    const toggle = columnToggle(viewer, 'Category')
+    const toggle = columnToggle(viewer, 'Strategy')
     await expect(toggle).toBeDisabled()
     await expect(toggle).not.toBeChecked()
     await expect(filterDialog(viewer).getByText('Hidden by admin')).toBeVisible()
@@ -133,7 +133,7 @@ test('master view: a column the admin hid for everyone cannot be un-hidden by a 
 
     // "Show all" only touches what the viewer may change.
     await filterDialog(viewer).getByRole('button', { name: /Show all|Hide all/ }).click()
-    await expect(viewer.getByRole('columnheader', { name: 'Category' })).toHaveCount(0)
+    await expect(viewer.getByRole('columnheader', { name: 'Strategy' })).toHaveCount(0)
   } finally {
     await adminContext.close()
     await viewerContext.close()

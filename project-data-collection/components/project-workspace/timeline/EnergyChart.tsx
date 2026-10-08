@@ -10,6 +10,7 @@ import {
   LABEL_COLUMN_WIDTH,
   xForSlot,
 } from './layout'
+import { energyEmptyHints } from './energy-empty-state'
 
 /**
  * The energy reduction chart that sits under the timeline.
@@ -40,6 +41,11 @@ type Props = {
   slotCount: number
   /** Highlighted when the user hovers a column in the grid above. */
   hoveredSlot?: number | null
+  /** Opens the Cost model popup at the energy baseline. Omit when the user
+   *  cannot edit; the empty state then explains without linking. */
+  onOpenCostModel?: () => void
+  /** Switches to the Master View tab. Omit when the user cannot edit line items. */
+  onOpenMasterView?: () => void
 }
 
 function formatCompact(value: number): string {
@@ -49,7 +55,16 @@ function formatCompact(value: number): string {
   }).format(value)
 }
 
-export default function EnergyChart({ series, slotCount, hoveredSlot }: Props) {
+const LINK_CLASS =
+  'rounded-sm font-medium text-teal-700 underline underline-offset-2 transition hover:text-teal-900 focus:outline-none focus-visible:ring-2 focus-visible:ring-teal-500'
+
+export default function EnergyChart({
+  series,
+  slotCount,
+  hoveredSlot,
+  onOpenCostModel,
+  onOpenMasterView,
+}: Props) {
   const plotHeight =
     ENERGY_CHART_HEIGHT - ENERGY_CHART_PADDING_TOP - ENERGY_CHART_PADDING_BOTTOM
   const width = Math.max(slotCount * CELL_WIDTH, CELL_WIDTH)
@@ -254,8 +269,30 @@ export default function EnergyChart({ series, slotCount, hoveredSlot }: Props) {
             })}
           </svg>
         ) : (
-          <div className="flex h-full items-center justify-center text-xs text-slate-400">
-            No energy savings
+          <div className="flex h-full flex-col items-center justify-center gap-1 text-xs text-slate-400">
+            <span>No energy savings</span>
+            {energyEmptyHints(series).map((hint) => {
+              const onClick = hint.kind === 'baseline' ? onOpenCostModel : onOpenMasterView
+              const testId =
+                hint.kind === 'baseline'
+                  ? 'energy-empty-baseline-link'
+                  : 'energy-empty-savings-link'
+              return onClick ? (
+                <button
+                  key={hint.kind}
+                  type="button"
+                  onClick={onClick}
+                  data-testid={testId}
+                  className={LINK_CLASS}
+                >
+                  {hint.linkText}
+                </button>
+              ) : (
+                <span key={hint.kind} data-testid={testId.replace('-link', '-hint')}>
+                  {hint.plainText}
+                </span>
+              )
+            })}
           </div>
         )}
       </div>

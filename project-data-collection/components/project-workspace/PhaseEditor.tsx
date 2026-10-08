@@ -5,7 +5,7 @@ import type { ChunkPhase } from '@/lib/types'
 import { PHASE_STYLES } from '@/components/project-workspace/timeline/layout'
 
 /**
- * A package's phases in Phasing, read-only.
+ * A package's phases in Packaging, read-only.
  *
  * Phase STRUCTURE is one project-level choice now: the phase template in the
  * Cost model, applied to every package (owner's decision -- per-package

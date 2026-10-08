@@ -119,7 +119,7 @@ export function orderedVisibleFields<T extends Pick<FormField, 'isHidden' | 'sor
 
 /**
  * What every on-screen surface shows for a skipped answer (Add Data rows,
- * Master View, Phasing). Exports keep a truly blank cell (formatFieldValue's
+ * Master View, Packaging). Exports keep a truly blank cell (formatFieldValue's
  * default ''), so this is opt-in via `{ empty: EMPTY_FIELD_TEXT }`.
  */
 export const EMPTY_FIELD_TEXT = '-'

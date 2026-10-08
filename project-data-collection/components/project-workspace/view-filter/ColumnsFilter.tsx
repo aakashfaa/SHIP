@@ -5,7 +5,7 @@ import type { ViewColumn } from '@/lib/view-settings'
 import ViewFilter from './ViewFilter'
 
 /**
- * Column checklist filter for a table view (Master View, Phasing). Locked
+ * Column checklist filter for a table view (Master View, Packaging). Locked
  * columns are listed but can't be unticked; for non-admins, a column the
  * project default hides is listed, disabled, as "Hidden by admin".
  *

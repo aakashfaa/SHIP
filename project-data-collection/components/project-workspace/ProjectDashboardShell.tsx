@@ -19,7 +19,7 @@ type ProjectDashboardShellProps = {
   project: Project
 }
 
-type TabKey = 'settings' | 'add-data' | 'master-view' | 'phasing' | 'timeline'
+type TabKey = 'settings' | 'add-data' | 'master-view' | 'packaging' | 'timeline'
 
 /**
  * Tabs that have since been folded into another one, mapped to where they
@@ -28,13 +28,14 @@ type TabKey = 'settings' | 'add-data' | 'master-view' | 'phasing' | 'timeline'
  */
 const RETIRED_TABS: Record<string, TabKey> = {
   'cost-model': 'timeline',
-  // Chunking was renamed Phasing.
-  chunking: 'phasing',
+  // Chunking was renamed Phasing, then Packaging; old links keep working.
+  chunking: 'packaging',
+  phasing: 'packaging',
 }
 
 /** Views that want every pixel (wide matrices, the Gantt) vs. forms that read
  *  better in a centred column. */
-const FULL_WIDTH_TABS: TabKey[] = ['settings', 'master-view', 'phasing', 'timeline']
+const FULL_WIDTH_TABS: TabKey[] = ['settings', 'master-view', 'packaging', 'timeline']
 
 export default function ProjectDashboardShell({
   user,
@@ -68,7 +69,7 @@ export default function ProjectDashboardShell({
     ...(canContribute ? [{ key: 'add-data' as const, label: 'Add Data' }] : []),
     // Read-only surfaces: everyone who can open the project at all.
     { key: 'master-view', label: 'Master View' },
-    { key: 'phasing', label: 'Phasing' },
+    { key: 'packaging', label: 'Packaging' },
     // Cost parameters now open from here as a popup rather than a tab.
     { key: 'timeline', label: 'Timeline' },
   ]
@@ -82,7 +83,7 @@ export default function ProjectDashboardShell({
    * the Timeline is the whole point and an accidental reload takes it away.
    *
    * Putting it in the query string also makes a tab linkable, so "here's the
-   * phasing schedule" can be a URL rather than a set of instructions.
+   * packaging schedule" can be a URL rather than a set of instructions.
    *
    * An unknown or absent `?tab=` falls back to Add Data, and a tab the user's
    * role cannot see falls back too — otherwise a link shared with a consultant
@@ -169,10 +170,16 @@ export default function ProjectDashboardShell({
         ) : null
       case 'master-view':
         return <MasterViewTab project={project} permissions={permissions} />
-      case 'phasing':
+      case 'packaging':
         return <ChunkingTab project={project} permissions={permissions} />
       case 'timeline':
-        return <TimelineTab project={project} permissions={permissions} />
+        return (
+          <TimelineTab
+            project={project}
+            permissions={permissions}
+            onOpenMasterView={() => setActiveTab('master-view')}
+          />
+        )
       default:
         return null
     }

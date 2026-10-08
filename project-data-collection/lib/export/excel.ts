@@ -41,6 +41,8 @@ type ColumnSpec<T> = {
   header: string
   width: number
   currency?: boolean
+  /** Wrap text (multi-line grouped cells, long notes). */
+  wrap?: boolean
   value: (row: T) => string | number | boolean
 }
 
@@ -95,6 +97,9 @@ function addSheet<T>(
       if (col.currency && typeof values[index] === 'number') {
         addedRow.getCell(index + 1).numFmt = CURRENCY_FORMAT
       }
+      if (col.wrap) {
+        addedRow.getCell(index + 1).alignment = { wrapText: true, vertical: 'top' }
+      }
     })
   }
 }
@@ -109,8 +114,9 @@ export function buildExcelWorkbook(data: ProjectReportData): ExcelJS.Workbook {
 
   const banner = bannerText(data)
 
-  // Columns come from the project's form definition (M-28) -- see
-  // buildLineItemTable in report-data.ts. Each row is already in column order.
+  // Columns come from the project's form definition (M-28), laid out like
+  // Master View -- see buildLineItemTable in report-data.ts. Each row is
+  // already in column order; grouped cells are newline-separated text.
   addSheet<ReportCellValue[]>(
     workbook,
     'Line Items',
@@ -118,6 +124,7 @@ export function buildExcelWorkbook(data: ProjectReportData): ExcelJS.Workbook {
       header: column.header,
       width: column.width,
       currency: column.format === 'currency',
+      wrap: column.wrap,
       value: (row) => row[index] ?? '',
     })),
     data.lineItems.rows,
@@ -250,6 +257,7 @@ export function buildPlainTableWorkbook(table: PlainTable): ExcelJS.Workbook {
       header: column.header,
       width: column.width,
       currency: column.format === 'currency',
+      wrap: column.wrap,
       value: (row) => row[index] ?? '',
     })),
     table.rows,

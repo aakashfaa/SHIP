@@ -1,5 +1,5 @@
 /**
- * Tri-state Yes/No (0023) in the shared inline cell editor (Master View, Phasing).
+ * Tri-state Yes/No (0023) in the shared inline cell editor (Master View, Packaging).
  *
  * Same extensionless-import resolve hook as ws3-export.test.ts.
  */

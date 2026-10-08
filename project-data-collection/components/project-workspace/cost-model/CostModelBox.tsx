@@ -33,6 +33,9 @@ type Props = {
   energyRow: ProjectEnergySettings | null
   /** A cost or energy setting was written; re-read and re-price. */
   onChanged: () => void
+  /** Bump to open the popup from outside (e.g. the energy chart's empty
+   *  state). The editor then focuses the Annual baseline input. */
+  openRequest?: number
 }
 
 function formatCompact(value: number): string {
@@ -78,8 +81,17 @@ function SummaryItem({
   )
 }
 
-export default function CostModelBox({ projectId, canEdit, costRow, energyRow, onChanged }: Props) {
+export default function CostModelBox({
+  projectId,
+  canEdit,
+  costRow,
+  energyRow,
+  onChanged,
+  openRequest = 0,
+}: Props) {
   const [open, setOpen] = useState(false)
+  const [focusBaseline, setFocusBaseline] = useState(false)
+  const [handledRequest, setHandledRequest] = useState(openRequest)
   const [status, setStatus] = useState<CostModelSaveStatus>({ state: 'idle' })
 
   // The project's one phase template; every package's phases come from it.
@@ -92,7 +104,16 @@ export default function CostModelBox({ projectId, canEdit, costRow, energyRow, o
     ? (templates.find((t) => t.id === costRow.defaultPhaseTemplateId)?.name ?? '…')
     : 'Not set'
 
+  // An external open request (state adjusted during render, not in an effect).
+  if (openRequest !== handledRequest) {
+    setHandledRequest(openRequest)
+    setStatus({ state: 'idle' })
+    setFocusBaseline(true)
+    setOpen(true)
+  }
+
   function openEditor() {
+    setFocusBaseline(false)
     // A fresh editor starts with a clean slate; the old failure is shown
     // again only if a write in this session fails too.
     setStatus({ state: 'idle' })
@@ -210,6 +231,7 @@ export default function CostModelBox({ projectId, canEdit, costRow, energyRow, o
             readOnly={!canEdit}
             onSaved={onChanged}
             onStatus={setStatus}
+            focusBaseline={focusBaseline}
           />
         ) : null}
       </Modal>

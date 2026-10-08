@@ -415,44 +415,42 @@ describe('M-25: no invented base year', () => {
 })
 
 describe('M-28: Line Items columns come from the form definition', () => {
-  test('visible fields, in order, with their labels, custom fields included, hidden ones not', async () => {
+  test('Master View layout: grouped, then other visible fields in form order, hidden ones not', async () => {
     const data = await report.buildProjectReportData(stubClient(baseTables()), PROJECT)
     assert.deepEqual(
       data.lineItems.columns.map((c) => c.header),
       [
-        'Item #',
+        '#',
         'Discipline',
-        'Company',
-        'What is it?',
+        'Organization',
+        'Name / Description',
+        'ECC',
+        'Deferred Maintenance',
+        // Not placed by the layout: their own column, form label, form order.
         'Estimated first cost',
-        'ECC Amount',
         'Utility saving',
-        'Deferred maintenance',
         'Warranty (years)',
       ]
     )
     const [first] = data.lineItems.rows
-    assert.deepEqual(first, [
-      'A1',
-      'Architecture',
-      'FAA',
-      'Item A1',
-      '$1,000,000',
-      1_000_000,
-      1500,
-      'Yes',
-      7,
-    ])
-    assert.equal(data.lineItems.columns[6].format, 'currency')
+    assert.deepEqual(first, ['A1', 'Architecture', 'FAA', 'Item A1', 1_000_000, 'Yes', '$1,000,000', 1500, 7])
+    assert.equal(data.lineItems.columns[3].wrap, true)
+    assert.equal(data.lineItems.columns[4].format, 'currency')
+    assert.equal(data.lineItems.columns[7].format, 'currency')
     assert.equal(data.lineItems.columns[8].format, 'number')
+    // Who typed the row is not part of the deliverable.
+    assert.ok(!data.lineItems.columns.some((c) => c.header === 'Submitted By'))
   })
 
-  test('ECC Amount still appears when the cost field is hidden', () => {
+  test('ECC still appears when the cost field is hidden', () => {
     const fields = [
       { key: 'name', label: 'Name', inputType: 'text', storage: 'column', sortOrder: 1, isHidden: false, options: [] },
     ] as never
     const table = report.buildLineItemTable([], fields)
-    assert.equal(table.columns.at(-1)?.header, 'ECC Amount')
+    assert.deepEqual(
+      table.columns.map((c) => c.header),
+      ['#', 'Discipline', 'Organization', 'Name / Description', 'ECC']
+    )
   })
 })
 
@@ -463,7 +461,7 @@ describe('M-09 / M-10: unreadable input is flagged, not a silent zero', () => {
     assert.equal(data.unreadableQuantityLinks, 1)
     assert.ok(data.notices.some((n) => /1 line item has an unreadable cost \(A2\)/.test(n)))
     assert.ok(data.notices.some((n) => /unreadable quantity/.test(n)))
-    assert.equal(data.lineItems.rows[1][5], report.UNREADABLE_CELL)
+    assert.equal(data.lineItems.rows[1][4], report.UNREADABLE_CELL)
     // A2 contributes nothing; A1 alone is the package's base.
     assert.ok(total(data.packages) > 0)
   })
@@ -484,7 +482,7 @@ describe('M-09 / M-10: unreadable input is flagged, not a silent zero', () => {
       )
     }
     const lineItems = workbook.getWorksheet('Line Items')!
-    assert.equal(lineItems.getRow(2).getCell(6).value, 'ECC Amount')
+    assert.equal(lineItems.getRow(2).getCell(5).value, 'ECC')
   })
 
   test('a clean live export has no banner row', async () => {

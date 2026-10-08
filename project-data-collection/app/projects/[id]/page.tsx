@@ -15,7 +15,7 @@ export default function ProjectDashboardPage() {
   const { user, loading: authLoading } = useAuth()
 
   // Signed out (or the session ended): go to sign-in, but remember where they
-  // were going. A link emailed to a client ("here's the phasing schedule")
+  // were going. A link emailed to a client ("here's the packaging schedule")
   // used to drop them on the project list after sign-in (UX-8); `/` honours
   // `?next=` once the profile has loaded.
   useEffect(() => {

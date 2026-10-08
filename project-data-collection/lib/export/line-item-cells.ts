@@ -18,6 +18,9 @@ export type ReportColumn = {
   width: number
   /** Excel number format hint; text columns leave it unset. */
   format?: 'currency' | 'number'
+  /** Multi-line text (a grouped Master View cell, long notes): Excel wraps
+   *  it and the PDF keeps its line breaks. */
+  wrap?: boolean
 }
 
 /** Line items whose cost text is present but unreadable get this in the ECC

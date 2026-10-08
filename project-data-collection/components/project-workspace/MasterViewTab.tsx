@@ -1,6 +1,7 @@
 'use client'
 
-import { useDeferredValue, useMemo, useState } from 'react'
+import { useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
+import type { PointerEvent as ReactPointerEvent } from 'react'
 import Modal from '@/components/ui/Modal'
 import ExportBar from './ExportBar'
 import EditableCell from './master-view/EditableCell'
@@ -24,11 +25,18 @@ import {
   masterCellText,
   masterExportCell,
   masterExportColumn,
+  masterGroupLineText,
   sortMasterRows,
   type MasterColumnDef,
   type MasterSort,
 } from '@/lib/view-columns/master'
 import { FormField, LineItem, Project } from '@/lib/types'
+import {
+  clampColumnWidth,
+  columnWidthsStorageKey,
+  parseColumnWidths,
+  type ColumnWidths,
+} from '@/lib/column-widths'
 
 type Props = {
   project: Project
@@ -38,8 +46,9 @@ type Props = {
 }
 
 /*
- * Columns come from lib/view-columns/master.ts (every visible form field,
- * custom ones included, plus the system columns), minus the hidden ones:
+ * Columns come from lib/view-columns/master.ts (the client's State House
+ * layout: every visible form field, custom ones included, some grouped into
+ * one stacked cell, plus the system columns), minus the hidden ones:
  * the project default an admin set for everyone, or this person's own
  * choice from the Filter button (lib/use-effective-view-settings.ts). The
  * exports take the same visible columns.
@@ -81,13 +90,14 @@ function getDisciplineColor(value: LineItem['discipline']) {
   return DISCIPLINE_COLORS[key] || '#94A3B8'
 }
 
-/** Sticky left offsets (px): 8px colour stripe, then Item # (72px), then
- *  Name. Both are locked columns, so the offsets never shift. */
+/** Sticky left offsets (px): 8px colour stripe, then # (72px), then
+ *  Name / Description. Both are locked columns, so the offsets never shift. */
 const STRIPE_WIDTH = 8
 const NUMBER_WIDTH = 72
-const NAME_WIDTH = 200
+const NAME_WIDTH = 240
 
 function columnWidthClass(def: MasterColumnDef): string {
+  if (def.kind === 'group') return 'min-w-[160px]'
   if (def.kind !== 'field') return def.kind === 'submittedBy' ? 'min-w-[160px]' : 'min-w-[120px]'
   switch (def.field.inputType) {
     case 'textarea':
@@ -139,7 +149,8 @@ export default function MasterViewTab({ project, permissions }: Props) {
   }, [allDefs, hiddenColumns])
 
   const fieldByKey = useMemo(() => new Map(formFields.map((f) => [f.key, f])), [formFields])
-  const formNotSeeded = !fieldsLoading && !allDefs.some((def) => def.kind === 'field')
+  const formNotSeeded =
+    !fieldsLoading && !allDefs.some((def) => def.kind === 'field' || def.kind === 'group')
 
   const lineItems = useMemo(
     () =>
@@ -291,10 +302,112 @@ export default function MasterViewTab({ project, permissions }: Props) {
 
   const canEditRows = permissions.isAdmin && !lineItemsLoading && !lineItemsError && !formNotSeeded
 
+  // Personal column widths (localStorage, per project). # stays fixed;
+  // every other column, Name / Description included, can be dragged.
+  const [colWidths, setColWidths] = useState<ColumnWidths>({})
+  const colWidthsRef = useRef<ColumnWidths>({})
+  const dragRef = useRef<{ key: string; startX: number; startWidth: number } | null>(null)
+  const storageKey = columnWidthsStorageKey(project.id)
+
+  useEffect(() => {
+    let stored: ColumnWidths = {}
+    try {
+      stored = parseColumnWidths(window.localStorage.getItem(storageKey))
+    } catch {
+      // Storage unavailable: default widths.
+    }
+    colWidthsRef.current = stored
+    setColWidths(stored)
+  }, [storageKey])
+
+  function applyWidths(next: ColumnWidths) {
+    colWidthsRef.current = next
+    setColWidths(next)
+  }
+
+  function saveWidths() {
+    try {
+      const current = colWidthsRef.current
+      if (Object.keys(current).length === 0) window.localStorage.removeItem(storageKey)
+      else window.localStorage.setItem(storageKey, JSON.stringify(current))
+    } catch {
+      // Storage unavailable: the width still applies for this visit.
+    }
+  }
+
+  function startResize(e: ReactPointerEvent<HTMLElement>, key: string) {
+    e.preventDefault()
+    e.stopPropagation()
+    const th = e.currentTarget.parentElement
+    const startWidth = colWidthsRef.current[key] ?? th?.getBoundingClientRect().width ?? 0
+    dragRef.current = { key, startX: e.clientX, startWidth }
+    e.currentTarget.setPointerCapture(e.pointerId)
+  }
+
+  function moveResize(e: ReactPointerEvent<HTMLElement>) {
+    const drag = dragRef.current
+    if (!drag) return
+    applyWidths({
+      ...colWidthsRef.current,
+      [drag.key]: clampColumnWidth(drag.startWidth + e.clientX - drag.startX),
+    })
+  }
+
+  function endResize(e: ReactPointerEvent<HTMLElement>) {
+    if (!dragRef.current) return
+    dragRef.current = null
+    if (e.currentTarget.hasPointerCapture(e.pointerId)) e.currentTarget.releasePointerCapture(e.pointerId)
+    saveWidths()
+  }
+
+  function resetWidth(key: string) {
+    const next = { ...colWidthsRef.current }
+    delete next[key]
+    applyWidths(next)
+    saveWidths()
+  }
+
+  /** The width a column is pinned to, or undefined to let it size itself. */
+  function widthOf(def: MasterColumnDef): number | undefined {
+    if (def.key === MASTER_COLUMN_KEYS.itemNumber) return NUMBER_WIDTH
+    const custom = colWidths[def.key]
+    if (custom !== undefined) return custom
+    return def.key === MASTER_COLUMN_KEYS.nameDescription ? NAME_WIDTH : undefined
+  }
+
+  // # and Name / Description are the only sticky columns and # is fixed, so
+  // Name's offset never moves; Name's own width does not affect any offset.
   function stickyLeft(def: MasterColumnDef): number | undefined {
     if (def.key === MASTER_COLUMN_KEYS.itemNumber) return STRIPE_WIDTH
-    if (def.kind === 'field' && def.key === MASTER_COLUMN_KEYS.name) return STRIPE_WIDTH + NUMBER_WIDTH
+    if (def.key === MASTER_COLUMN_KEYS.nameDescription) return STRIPE_WIDTH + NUMBER_WIDTH
     return undefined
+  }
+
+  /** One field's edit control (shared by single-field and grouped cells). */
+  function fieldEditor(
+    item: LineItem,
+    raw: LineItem,
+    draft: RowDraft | undefined,
+    status: RowStatus,
+    base: FormField
+  ) {
+    const field = fieldByKey.get(base.key) ?? base
+    const value = draft && field.key in draft ? draft[field.key] : initialCellValue(field, raw)
+    return (
+      <>
+        <EditableCell
+          field={field}
+          value={value}
+          onChange={(next) => setCell(item, field, next)}
+          error={status.fieldErrors?.[field.key]}
+          disabled={status.saving}
+          synergyOptions={synergyOptions.filter((t) => t !== item.discipline)}
+        />
+        {status.fieldErrors?.[field.key] ? (
+          <p className="mt-1 max-w-[220px] text-[10px] text-rose-600">{status.fieldErrors[field.key]}</p>
+        ) : null}
+      </>
+    )
   }
 
   return (
@@ -403,8 +516,8 @@ export default function MasterViewTab({ project, permissions }: Props) {
                 />
                 {defs.map((def) => {
                   const left = stickyLeft(def)
-                  const width =
-                    def.key === MASTER_COLUMN_KEYS.itemNumber ? NUMBER_WIDTH : left !== undefined ? NAME_WIDTH : undefined
+                  const width = widthOf(def)
+                  const resizable = def.key !== MASTER_COLUMN_KEYS.itemNumber
                   const active = sort.key === def.key
                   return (
                     <th
@@ -425,6 +538,24 @@ export default function MasterViewTab({ project, permissions }: Props) {
                           {active ? (sort.direction === 'desc' ? '↓' : '↑') : null}
                         </span>
                       </button>
+                      {resizable ? (
+                        <span
+                          role="separator"
+                          aria-orientation="vertical"
+                          aria-label={`Resize ${def.label} column`}
+                          title="Drag to resize, double-click to reset"
+                          onPointerDown={(e) => startResize(e, def.key)}
+                          onPointerMove={moveResize}
+                          onPointerUp={endResize}
+                          onPointerCancel={endResize}
+                          onClick={(e) => e.stopPropagation()}
+                          onDoubleClick={(e) => {
+                            e.stopPropagation()
+                            resetWidth(def.key)
+                          }}
+                          className="absolute right-0 top-0 z-10 h-full w-2 cursor-col-resize touch-none select-none bg-slate-400/0 transition-colors hover:bg-slate-400/60 active:bg-slate-500/70"
+                        />
+                      ) : null}
                     </th>
                   )
                 })}
@@ -466,18 +597,22 @@ export default function MasterViewTab({ project, permissions }: Props) {
                     />
                     {defs.map((def) => {
                       const left = stickyLeft(def)
+                      const w = widthOf(def)
+                      const widthStyle = w !== undefined ? { width: w, minWidth: w, maxWidth: w } : undefined
                       const stickyStyle =
                         left !== undefined
                           ? {
                               left,
+                              ...widthStyle,
                               // Opaque, or the cells scrolling under it show through.
                               backgroundImage: `linear-gradient(${tint}, ${tint})`,
                               backgroundColor: '#fff',
                             }
-                          : undefined
+                          : widthStyle
+                      // A pinned width wraps long text instead of widening the column.
                       const cellClass = `border-b border-r border-slate-200 px-2 py-2 align-top ${
                         left !== undefined ? 'sticky z-10' : ''
-                      }`
+                      } ${w !== undefined ? '[overflow-wrap:anywhere]' : ''}`
 
                       if (def.kind === 'itemNumber') {
                         return (
@@ -493,28 +628,65 @@ export default function MasterViewTab({ project, permissions }: Props) {
                       }
 
                       if (def.kind === 'field' && editing) {
-                        const field = fieldByKey.get(def.key) ?? def.field
-                        const value =
-                          draft && def.key in draft ? draft[def.key] : initialCellValue(field, raw)
                         return (
                           <td
                             key={def.key}
                             style={stickyStyle}
                             className={`${cellClass} ${draft && def.key in draft ? 'bg-amber-50/70' : ''}`}
                           >
-                            <EditableCell
-                              field={field}
-                              value={value}
-                              onChange={(next) => setCell(item, field, next)}
-                              error={status.fieldErrors?.[def.key]}
-                              disabled={status.saving}
-                              synergyOptions={synergyOptions.filter((t) => t !== item.discipline)}
-                            />
-                            {status.fieldErrors?.[def.key] ? (
-                              <p className="mt-1 max-w-[220px] text-[10px] text-rose-600">
-                                {status.fieldErrors[def.key]}
-                              </p>
-                            ) : null}
+                            {fieldEditor(item, raw, draft, status, def.field)}
+                          </td>
+                        )
+                      }
+
+                      if (def.kind === 'group' && editing) {
+                        // One edit control per member field, stacked; each
+                        // drafts and validates under its own field key.
+                        const changed = Boolean(draft && def.lines.some((line) => line.field.key in draft))
+                        return (
+                          <td
+                            key={def.key}
+                            style={stickyStyle}
+                            className={`${cellClass} ${changed ? 'bg-amber-50/70' : ''}`}
+                          >
+                            <div className="space-y-1.5">
+                              {def.lines.map((line) => (
+                                <div key={line.field.key}>
+                                  {line.prefix ? (
+                                    <span className="mb-0.5 block text-[10px] font-medium text-slate-500">
+                                      {line.prefix}
+                                    </span>
+                                  ) : null}
+                                  {fieldEditor(item, raw, draft, status, line.field)}
+                                </div>
+                              ))}
+                            </div>
+                          </td>
+                        )
+                      }
+
+                      if (def.kind === 'group') {
+                        const lines = def.lines
+                          .map((line, index) => ({
+                            key: line.field.key,
+                            text: masterGroupLineText(line, item),
+                            bold: def.emphasizeFirst === true && index === 0,
+                          }))
+                          .filter((line) => line.text !== '')
+                        return (
+                          <td key={def.key} style={stickyStyle} className={cellClass}>
+                            {lines.length === 0
+                              ? '-'
+                              : lines.map((line) => (
+                                  <div
+                                    key={line.key}
+                                    className={`whitespace-pre-line ${
+                                      line.bold ? 'font-semibold text-slate-900' : ''
+                                    }`}
+                                  >
+                                    {line.text}
+                                  </div>
+                                ))}
                           </td>
                         )
                       }

@@ -2,10 +2,10 @@ import { test, expect, type Page } from '@playwright/test'
 import { settle } from '../helpers/settle'
 
 /**
- * The per-package phase summary in Phasing.
+ * The per-package phase summary in Packaging.
  *
  * Phase STRUCTURE is one project-level choice (the phase template in the
- * Timeline's cost model) and timing is moved on the Timeline, so Phasing shows
+ * Timeline's cost model) and timing is moved on the Timeline, so Packaging shows
  * each package's phases read-only: what each phase costs as a share of TPC,
  * its duration, and whether the shares add up to 100%.
  */
@@ -13,15 +13,15 @@ import { settle } from '../helpers/settle'
 test.describe.configure({ mode: 'serial' })
 
 
-async function openPhasingPackage(page: Page, chunkNumber: string) {
-  await page.goto('/projects/federal-campus-master-plan?tab=phasing')
+async function openPackagingPackage(page: Page, chunkNumber: string) {
+  await page.goto('/projects/federal-campus-master-plan?tab=packaging')
   await settle(page)
   await page.getByRole('button', { name: `Edit package ${chunkNumber}` }).click()
   await settle(page)
 }
 
 test('a package shows its phases with costs and a running allocation', async ({ page }) => {
-  await openPhasingPackage(page, 'PP10')
+  await openPackagingPackage(page, 'PP10')
 
   // The editor lives below the line-item table inside the expanded card.
   const editor = page.getByText('Phases', { exact: true }).first()
@@ -41,7 +41,7 @@ test('a package shows its phases with costs and a running allocation', async ({ 
 })
 
 test('an incomplete allocation is surfaced on the package that has one', async ({ page }) => {
-  await openPhasingPackage(page, 'PP14')
+  await openPackagingPackage(page, 'PP14')
   // PP14's construction phase is seeded at 80%, so the package sits at 90%.
   await expect(page.getByRole('status').filter({ hasText: '90.0% of TPC allocated' })).toBeVisible()
 })

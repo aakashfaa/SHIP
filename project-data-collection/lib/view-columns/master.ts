@@ -5,78 +5,193 @@ import type { FormField, LineItem } from '../types'
 import type { ViewColumn } from '../view-settings'
 
 /**
- * Every column the Master View table can show, in display order. Settings
- * lists this catalog so a project admin can hide columns; Master View renders
+ * Every column the Master View table can show, in display order. The column
+ * picker lists this catalog so a column can be hidden; Master View renders
  * visibleColumns(getMasterViewColumns(fields), settings.masterView.hiddenColumns).
+ * Master View's own Excel/PDF export and the server workbook's Line Items
+ * sheet (lib/export/report-data.ts) take the same columns, headers and
+ * grouping.
  *
- * Order: item #, name, discipline, organization, then every visible form
- * field (custom ones included) in form order with ECC right after the
- * estimated-cost field, then submitted-by. Same shape as the server export's
- * Line Items sheet (lib/export/report-data.ts).
+ * Layout follows the client's State House Master View (MASTER_LAYOUT below):
+ *   #, Discipline, Organization, Name / Description, Strategy, Location,
+ *   Impacts, Cost, ECC, Energy, Annual energy saving, the five Yes/No flags,
+ *   Synergies, Notes, then every OTHER visible form field (custom ones and
+ *   unclaimed built-ins) in form order, then Submitted By.
  *
- * Keys: a form field column's key IS the form field's `key`, so hiding
- * "Funding source" survives a relabel. The system columns use a leading
- * underscore, which a form field key can never have (the DB requires
- * ^[a-z][a-z0-9_]*$), so a custom field labelled "Discipline" can't collide.
+ * Some columns GROUP several form fields into one cell, stacked one per line
+ * (Name / Description, Strategy, Location, Impacts). Membership is by field
+ * KEY, never by label. A group shows only its members that are visible on
+ * the input form; a group with no visible member is dropped. Single-field
+ * layout columns (Cost, Energy, ...) carry a fixed header; the other form
+ * fields keep their form label. Nothing visible on the form is left out.
  *
- * Fields hidden on the input form itself are not listed: there is nothing to
- * show for a question nobody is asked.
+ * Keys: a single-field column's key IS the form field's `key`, so hiding
+ * "Funding source" survives a relabel. System and group columns use a
+ * leading underscore (`_item_number`, `_name_description`, `_strategy`, ...),
+ * which a form field key can never have (the DB requires ^[a-z][a-z0-9_]*$),
+ * so nothing collides. A saved hidden-column key that is no longer in the
+ * catalog (e.g. 'category', now part of `_strategy`) is simply ignored.
+ *
+ * Fields hidden (or removed) on the input form are not listed: there is
+ * nothing to show for a question nobody is asked.
  */
 
 export const MASTER_COLUMN_KEYS = {
   itemNumber: '_item_number',
   discipline: '_discipline',
   organization: '_organization',
+  nameDescription: '_name_description',
+  strategy: '_strategy',
+  location: '_location',
+  impacts: '_impacts',
   ecc: '_ecc',
   submittedBy: '_submitted_by',
-  /** The built-in name field's own key. */
-  name: 'name',
 } as const
 
+type SystemKind = 'itemNumber' | 'discipline' | 'organization' | 'ecc' | 'submittedBy'
+
+/** One form field inside a grouped cell; `prefix` labels its line ("Op"). */
+export type MasterGroupLine = { field: FormField; prefix?: string }
+
+export type MasterGroupColumnDef = ViewColumn & {
+  kind: 'group'
+  /** Visible members only, in layout order; the first is the sort key. */
+  lines: MasterGroupLine[]
+  /** Show the first line bold (Name / Description). */
+  emphasizeFirst?: boolean
+  /** Export column width. */
+  width: number
+}
+
 export type MasterColumnDef = ViewColumn &
-  (
-    | { kind: 'field'; field: FormField }
-    | { kind: 'itemNumber' | 'discipline' | 'organization' | 'ecc' | 'submittedBy' }
+  ({ kind: 'field'; field: FormField } | MasterGroupColumnDef | { kind: SystemKind })
+
+type LayoutEntry =
+  | { type: 'system'; kind: SystemKind; key: string; label: string; locked?: boolean }
+  | {
+      type: 'group'
+      key: string
+      label: string
+      members: { key: string; prefix?: string }[]
+      locked?: boolean
+      emphasizeFirst?: boolean
+      width: number
+    }
+  | { type: 'field'; fieldKey: string; label: string }
+  | { type: 'rest' }
+
+/** The State House column layout. */
+const MASTER_LAYOUT: readonly LayoutEntry[] = [
+  { type: 'system', kind: 'itemNumber', key: MASTER_COLUMN_KEYS.itemNumber, label: '#', locked: true },
+  { type: 'system', kind: 'discipline', key: MASTER_COLUMN_KEYS.discipline, label: 'Discipline' },
+  { type: 'system', kind: 'organization', key: MASTER_COLUMN_KEYS.organization, label: 'Organization' },
+  {
+    type: 'group',
+    key: MASTER_COLUMN_KEYS.nameDescription,
+    label: 'Name / Description',
+    members: [{ key: 'name' }, { key: 'short_description' }],
+    locked: true,
+    emphasizeFirst: true,
+    width: 40,
+  },
+  {
+    type: 'group',
+    key: MASTER_COLUMN_KEYS.strategy,
+    label: 'Strategy',
+    members: [{ key: 'category' }, { key: 'timeline_priority' }],
+    width: 22,
+  },
+  {
+    type: 'group',
+    key: MASTER_COLUMN_KEYS.location,
+    label: 'Location',
+    members: [{ key: 'building_area_impacted' }, { key: 'building_level_impacted' }],
+    width: 22,
+  },
+  {
+    type: 'group',
+    key: MASTER_COLUMN_KEYS.impacts,
+    label: 'Impacts',
+    members: [
+      { key: 'operational_impact', prefix: 'Op' },
+      { key: 'benefit_to_users', prefix: 'User' },
+      { key: 'benefit_to_public', prefix: 'Public' },
+    ],
+    width: 26,
+  },
+  { type: 'field', fieldKey: 'relative_first_cost', label: 'Cost' },
+  { type: 'system', kind: 'ecc', key: MASTER_COLUMN_KEYS.ecc, label: 'ECC' },
+  { type: 'field', fieldKey: 'relative_operational_energy_usage', label: 'Energy' },
+  { type: 'field', fieldKey: 'annual_energy_savings', label: 'Annual energy saving' },
+  { type: 'field', fieldKey: 'addressing_resiliency_sustainability', label: 'Resiliency / Sustainability' },
+  { type: 'field', fieldKey: 'addressing_deferred_maintenance', label: 'Deferred Maintenance' },
+  { type: 'field', fieldKey: 'code_life_safety_improvement', label: 'Code / Life-Safety' },
+  { type: 'field', fieldKey: 'accessibility_improvement', label: 'Accessibility Improvement' },
+  { type: 'field', fieldKey: 'historic_impact', label: 'Historic Impact' },
+  { type: 'field', fieldKey: 'potential_synergies', label: 'Synergies' },
+  { type: 'field', fieldKey: 'supporting_notes', label: 'Notes' },
+  { type: 'rest' },
+  { type: 'system', kind: 'submittedBy', key: MASTER_COLUMN_KEYS.submittedBy, label: 'Submitted By' },
+]
+
+/** Every field key the layout places by name (so 'rest' skips them). */
+const CLAIMED_KEYS = new Set(
+  MASTER_LAYOUT.flatMap((entry) =>
+    entry.type === 'group' ? entry.members.map((m) => m.key) : entry.type === 'field' ? [entry.fieldKey] : []
   )
+)
 
 export function getMasterViewColumnDefs(fields: readonly FormField[]): MasterColumnDef[] {
   const visible = orderedVisibleFields(fields)
-  const nameField = visible.find((f) => f.storage === 'column' && f.key === MASTER_COLUMN_KEYS.name)
+  const byKey = new Map(visible.map((f) => [f.key, f]))
+  const defs: MasterColumnDef[] = []
 
-  const defs: MasterColumnDef[] = [
-    { key: MASTER_COLUMN_KEYS.itemNumber, label: 'Item #', locked: true, kind: 'itemNumber' },
-  ]
-  if (nameField) {
-    defs.push({
-      key: nameField.key,
-      label: nameField.label.trim() || 'Name',
-      locked: true,
-      kind: 'field',
-      field: nameField,
-    })
-  }
-  defs.push(
-    { key: MASTER_COLUMN_KEYS.discipline, label: 'Discipline', kind: 'discipline' },
-    { key: MASTER_COLUMN_KEYS.organization, label: 'Organization', kind: 'organization' }
-  )
-
-  let eccPlaced = false
-  for (const field of visible) {
-    if (field === nameField) continue
-    defs.push({ key: field.key, label: field.label.trim() || field.key, kind: 'field', field })
-    if (field.key === 'estimated_first_cost') {
-      defs.push({ key: MASTER_COLUMN_KEYS.ecc, label: 'ECC', kind: 'ecc' })
-      eccPlaced = true
+  for (const entry of MASTER_LAYOUT) {
+    switch (entry.type) {
+      case 'system':
+        defs.push(
+          entry.locked
+            ? { key: entry.key, label: entry.label, locked: true, kind: entry.kind }
+            : { key: entry.key, label: entry.label, kind: entry.kind }
+        )
+        break
+      case 'group': {
+        const lines: MasterGroupLine[] = []
+        for (const member of entry.members) {
+          const field = byKey.get(member.key)
+          if (field) lines.push(member.prefix ? { field, prefix: member.prefix } : { field })
+        }
+        if (lines.length === 0) break
+        const def: MasterGroupColumnDef = {
+          key: entry.key,
+          label: entry.label,
+          kind: 'group',
+          lines,
+          width: entry.width,
+        }
+        if (entry.locked) def.locked = true
+        if (entry.emphasizeFirst) def.emphasizeFirst = true
+        defs.push(def)
+        break
+      }
+      case 'field': {
+        const field = byKey.get(entry.fieldKey)
+        if (field) defs.push({ key: field.key, label: entry.label, kind: 'field', field })
+        break
+      }
+      case 'rest':
+        for (const field of visible) {
+          if (CLAIMED_KEYS.has(field.key)) continue
+          defs.push({ key: field.key, label: field.label.trim() || field.key, kind: 'field', field })
+        }
+        break
     }
   }
-  if (!eccPlaced) defs.push({ key: MASTER_COLUMN_KEYS.ecc, label: 'ECC', kind: 'ecc' })
-
-  defs.push({ key: MASTER_COLUMN_KEYS.submittedBy, label: 'Submitted by', kind: 'submittedBy' })
   return defs
 }
 
-/** The catalog as plain ViewColumns, for the Settings column picker. */
-export function getMasterViewColumns(fields: FormField[]): ViewColumn[] {
+/** The catalog as plain ViewColumns, for the column picker. */
+export function getMasterViewColumns(fields: readonly FormField[]): ViewColumn[] {
   return getMasterViewColumnDefs(fields).map(({ key, label, locked }) =>
     locked ? { key, label, locked } : { key, label }
   )
@@ -88,7 +203,15 @@ const MONEY_FORMAT = new Intl.NumberFormat('en-US', {
   maximumFractionDigits: 0,
 })
 
-/** What the on-screen cell shows. */
+/** One grouped line as text: "Op: High", or just the value. '' when unanswered. */
+export function masterGroupLineText(line: MasterGroupLine, item: LineItem): string {
+  const text = formatFieldValue(line.field, getFieldValue(item, line.field))
+  if (text === '') return ''
+  return line.prefix ? `${line.prefix}: ${text}` : text
+}
+
+/** What the on-screen cell shows (and what search matches). A grouped cell
+ *  is its answered lines, newline separated. */
 export function masterCellText(def: MasterColumnDef, item: LineItem): string {
   switch (def.kind) {
     case 'itemNumber':
@@ -103,6 +226,11 @@ export function masterCellText(def: MasterColumnDef, item: LineItem): string {
       const cell = eccCell(item)
       return typeof cell === 'number' ? MONEY_FORMAT.format(cell) : cell
     }
+    case 'group':
+      return def.lines
+        .map((line) => masterGroupLineText(line, item))
+        .filter((text) => text !== '')
+        .join('\n')
     case 'field':
       return formatFieldValue(def.field, getFieldValue(item, def.field))
   }
@@ -121,12 +249,19 @@ export function masterExportColumn(def: MasterColumnDef): ReportColumn {
       return { header: def.label, width: 28 }
     case 'ecc':
       return { ...ECC_COLUMN, header: def.label }
-    case 'field':
-      return { ...fieldColumn(def.field), header: def.label }
+    case 'group':
+      return { header: def.label, width: def.width, wrap: true }
+    case 'field': {
+      const column: ReportColumn = { ...fieldColumn(def.field), header: def.label }
+      // Long free text can carry line breaks of its own.
+      if (def.field.inputType === 'textarea') column.wrap = true
+      return column
+    }
   }
 }
 
-/** The export cell: numbers stay numbers, everything else is display text. */
+/** The export cell: numbers stay numbers, a grouped cell is multi-line text,
+ *  everything else is display text. */
 export function masterExportCell(def: MasterColumnDef, item: LineItem): ReportCellValue {
   switch (def.kind) {
     case 'ecc':
@@ -138,9 +273,10 @@ export function masterExportCell(def: MasterColumnDef, item: LineItem): ReportCe
   }
 }
 
-/** Sort key: numbers for numeric columns (blank sorts last), text otherwise. */
+/** Sort key: numbers for numeric columns (blank sorts last), text otherwise.
+ *  A grouped column sorts by its first (primary) field. */
 export function masterSortValue(def: MasterColumnDef, item: LineItem): string | number | null {
-  const cell = masterExportCell(def, item)
+  const cell = def.kind === 'group' ? fieldCell(item, def.lines[0].field) : masterExportCell(def, item)
   if (typeof cell === 'number') return cell
   return cell === '' ? null : cell.toLowerCase()
 }

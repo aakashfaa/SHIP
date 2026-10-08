@@ -283,7 +283,7 @@ the request's Host header. Routes:
 **UI.** Deletes (line items, packages, phases, what-ifs) are a two-step inline
 confirm. Number fields keep what was typed and parse on blur; cost fields take
 `$`, thousands separators and k / M / B shorthand with a live "= $1,200,000"
-preview. Master View scrolls horizontally with #, Discipline and Item name
+preview. Master View scrolls horizontally with # and Name / Description
 pinned, and its PDF export no longer runs a project name as HTML. What-if drags
 no longer wipe earlier moves, and the Excel export follows the open what-if.
 

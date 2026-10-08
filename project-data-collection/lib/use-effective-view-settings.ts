@@ -15,7 +15,7 @@ import {
 import type { ProjectViewSettings } from '@/lib/view-settings'
 
 /**
- * What one view (Master View, Phasing, Timeline) actually shows for the
+ * What one view (Master View, Packaging, Timeline) actually shows for the
  * current person: the project default (`ship.projects.view_settings`, set by
  * a project admin for everyone -- see lib/use-view-settings.ts) with this
  * person's own filter layered on top.
