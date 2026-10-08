@@ -1,12 +1,19 @@
 'use client'
 
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useState } from 'react'
 import Link from 'next/link'
 import { useRouter } from 'next/navigation'
+import Modal from '@/components/ui/Modal'
 import { useAuth } from '@/lib/auth-context'
-import { CONSULTANT_TYPES } from '@/lib/constants'
+import {
+  CONSULTANT_TYPES,
+  MAX_DISCIPLINE_LENGTH,
+  customDisciplineError,
+  isKnownConsultantType,
+  normalizeDisciplineName,
+} from '@/lib/constants'
 import { createProject } from '@/lib/store'
-import { ConsultantType, Project, ProjectConsultant } from '@/lib/types'
+import { ConsultantType, KnownConsultantType, ProjectConsultant, SafeUser } from '@/lib/types'
 
 type ConsultantDraft = ProjectConsultant & {
   emailInput: string
@@ -37,16 +44,18 @@ const createConsultantDraft = (
 // real authority; this just catches typos before they are stored and invited.
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
 
-const CONSULTANT_THEME: Record<
-  ConsultantType,
-  {
-    selectedChip: string
-    card: string
-    badge: string
-    button: string
-    chip: string
-  }
-> = {
+// Architecture is FAA's own discipline: always on the project.
+const OWN_DISCIPLINE: KnownConsultantType = 'Architecture'
+
+type Theme = {
+  selectedChip: string
+  card: string
+  badge: string
+  button: string
+  chip: string
+}
+
+const CONSULTANT_THEME: Record<KnownConsultantType, Theme> = {
   Architecture: {
     selectedChip: 'bg-amber-500 text-white',
     card: 'border-amber-200 bg-amber-50/70',
@@ -147,26 +156,29 @@ const CONSULTANT_THEME: Record<
   },
 }
 
-function getConsultantTheme(type: ConsultantType) {
-  return CONSULTANT_THEME[type]
+// Custom ("Other") disciplines share one neutral look.
+const CUSTOM_THEME: Theme = {
+  selectedChip: 'bg-slate-900 text-white',
+  card: 'border-slate-200 bg-white/80',
+  badge: 'text-slate-950',
+  button: 'bg-slate-900 text-white',
+  chip: 'bg-slate-100 text-slate-900',
 }
+
+function getConsultantTheme(type: ConsultantType): Theme {
+  return isKnownConsultantType(type) ? CONSULTANT_THEME[type] : CUSTOM_THEME
+}
+
+const INPUT =
+  'w-full rounded-2xl border border-slate-200 bg-white/95 px-4 py-3 text-sm outline-none transition focus:border-teal-600 focus:ring-2 focus:ring-teal-100'
+const CARD =
+  'rounded-[2rem] border border-white/70 bg-white/76 p-5 shadow-[0_24px_90px_rgba(15,23,42,0.12)] backdrop-blur-2xl'
+const IDLE_CHIP =
+  'border border-slate-300 bg-white/95 text-slate-700 hover:-translate-y-[1px] hover:border-slate-400'
 
 export default function NewProjectPage() {
   const router = useRouter()
   const { user, loading: authLoading } = useAuth()
-  const [projectName, setProjectName] = useState('')
-  const [formError, setFormError] = useState<string | null>(null)
-  const [submitting, setSubmitting] = useState(false)
-  const [consultants, setConsultants] = useState<ConsultantDraft[]>([
-    createConsultantDraft('Architecture', 'FAA'),
-  ])
-
-  const [createdProject, setCreatedProject] = useState<Project | null>(null)
-  const [invitedEmails, setInvitedEmails] = useState<string[]>([])
-  const [inviteLoading, setInviteLoading] = useState(false)
-  const [inviteError, setInviteError] = useState<string | null>(null)
-  const [inviteResults, setInviteResults] = useState<InviteResult[] | null>(null)
-  const [copiedEmail, setCopiedEmail] = useState<string | null>(null)
 
   useEffect(() => {
     if (authLoading) return
@@ -181,11 +193,6 @@ export default function NewProjectPage() {
     }
   }, [user, authLoading, router])
 
-  const selectedTypes = useMemo(
-    () => consultants.map((consultant) => consultant.type),
-    [consultants]
-  )
-
   if (authLoading || !user || user.role !== 'admin') {
     return (
       <main className="flex min-h-screen items-center justify-center">
@@ -193,6 +200,38 @@ export default function NewProjectPage() {
       </main>
     )
   }
+
+  // Mounted only once the user is known, so the form can start with their
+  // email already on Architecture.
+  return <NewProjectForm user={user} />
+}
+
+function NewProjectForm({ user }: { user: SafeUser }) {
+  const router = useRouter()
+  const [projectName, setProjectName] = useState('')
+  const [formError, setFormError] = useState<string | null>(null)
+  const [submitting, setSubmitting] = useState(false)
+  const [consultants, setConsultants] = useState<ConsultantDraft[]>(() => [
+    createConsultantDraft(OWN_DISCIPLINE, 'FAA', user.email ? [user.email.toLowerCase()] : []),
+  ])
+
+  // "Other" discipline entry.
+  const [otherOpen, setOtherOpen] = useState(false)
+  const [otherName, setOtherName] = useState('')
+  const [otherError, setOtherError] = useState<string | null>(null)
+
+  // Discipline awaiting "Are you sure?" before it is dropped.
+  const [confirmRemove, setConfirmRemove] = useState<ConsultantType | null>(null)
+
+  // Set only when the project was created but some invites need attention;
+  // otherwise the admin goes straight to the new project's Settings.
+  const [createdProjectId, setCreatedProjectId] = useState<string | null>(null)
+  const [inviteError, setInviteError] = useState<string | null>(null)
+  const [inviteResults, setInviteResults] = useState<InviteResult[] | null>(null)
+  const [copiedEmail, setCopiedEmail] = useState<string | null>(null)
+
+  const selectedTypes = consultants.map((consultant) => consultant.type)
+  const customTypes = selectedTypes.filter((type) => !isKnownConsultantType(type))
 
   function updateConsultant(
     type: ConsultantType,
@@ -212,10 +251,37 @@ export default function NewProjectPage() {
   }
 
   function removeConsultant(type: ConsultantType) {
-    if (type === 'Architecture') return
-    setConsultants((prev) =>
-      prev.filter((consultant) => consultant.type !== type)
-    )
+    if (type === OWN_DISCIPLINE) return
+    setConsultants((prev) => prev.filter((consultant) => consultant.type !== type))
+  }
+
+  // Clicking a selected chip deselects it; asks first if anything was entered.
+  function toggleConsultantType(type: ConsultantType) {
+    if (type === OWN_DISCIPLINE) return
+    const existing = consultants.find((consultant) => consultant.type === type)
+    if (!existing) {
+      addConsultantType(type)
+      return
+    }
+    const hasData =
+      existing.emails.length > 0 ||
+      existing.orgName.trim() !== '' ||
+      existing.emailInput.trim() !== ''
+    if (hasData) setConfirmRemove(type)
+    else removeConsultant(type)
+  }
+
+  function addOtherDiscipline() {
+    const name = normalizeDisciplineName(otherName)
+    const error = customDisciplineError(name, selectedTypes)
+    if (error) {
+      setOtherError(error)
+      return
+    }
+    addConsultantType(name)
+    setOtherName('')
+    setOtherError(null)
+    setOtherOpen(false)
   }
 
   function addEmail(type: ConsultantType) {
@@ -280,10 +346,8 @@ export default function NewProjectPage() {
     return null
   }
 
-  async function sendInvites(emails: string[], projectId: string) {
-    setInviteLoading(true)
-    setInviteError(null)
-
+  // Returns true when every invite went out cleanly.
+  async function sendInvites(emails: string[], projectId: string): Promise<boolean> {
     try {
       const res = await fetch('/api/admin/invite', {
         method: 'POST',
@@ -297,14 +361,12 @@ export default function NewProjectPage() {
 
       const payload = (await res.json()) as { results: InviteResult[] }
       setInviteResults(payload.results)
+      return payload.results.every((result) => !result.error)
     } catch (err) {
       // Non-fatal: the project already exists. The admin can invite these
-      // consultants manually later.
-      setInviteError(
-        err instanceof Error ? err.message : 'Failed to send invites.'
-      )
-    } finally {
-      setInviteLoading(false)
+      // consultants again from Settings.
+      setInviteError(err instanceof Error ? err.message : 'Failed to send invites.')
+      return false
     }
   }
 
@@ -320,6 +382,7 @@ export default function NewProjectPage() {
 
     setSubmitting(true)
 
+    let projectId: string
     try {
       const result = await createProject({
         name: projectName,
@@ -329,27 +392,32 @@ export default function NewProjectPage() {
           emails: consultant.emails,
         })),
       })
-
-      setCreatedProject(result.project)
-      setInvitedEmails(result.invitedEmails)
-      setSubmitting(false)
-
-      // Everyone on the new roster, not just result.invitedEmails: that list
-      // only holds addresses that had no pending invite yet, so a person who
-      // already has an account would get neither the "added to <project>"
-      // email nor the in-app notice. The route works out which is which.
-      const rosterEmails = [
-        ...new Set(consultants.flatMap((consultant) => consultant.emails)),
-      ]
-      if (rosterEmails.length > 0) {
-        await sendInvites(rosterEmails, result.project.id)
-      }
+      projectId = result.project.id
     } catch (err) {
       setSubmitting(false)
-      setFormError(
-        err instanceof Error ? err.message : 'Failed to create project.'
-      )
+      setFormError(err instanceof Error ? err.message : 'Failed to create project.')
+      return
     }
+
+    // Everyone on the new roster, not just result.invitedEmails: that list
+    // only holds addresses that had no pending invite yet, so a person who
+    // already has an account would get neither the "added to <project>"
+    // email nor the in-app notice. The route works out which is which.
+    // The creator (pre-filled on Architecture) is left out: they would only
+    // be emailing themselves.
+    const self = user.email.toLowerCase()
+    const rosterEmails = [
+      ...new Set(consultants.flatMap((consultant) => consultant.emails)),
+    ].filter((email) => email.toLowerCase() !== self)
+    const invitesOk = rosterEmails.length === 0 || (await sendInvites(rosterEmails, projectId))
+
+    const settingsHref = `/projects/${encodeURIComponent(projectId)}?tab=settings`
+    if (invitesOk) {
+      router.push(settingsHref)
+      return
+    }
+    setSubmitting(false)
+    setCreatedProjectId(projectId)
   }
 
   async function copyToClipboard(value: string, email: string) {
@@ -366,65 +434,35 @@ export default function NewProjectPage() {
   return (
     <main className="min-h-screen bg-[radial-gradient(circle_at_top_left,_rgba(251,191,36,0.18),_transparent_24%),radial-gradient(circle_at_top_right,_rgba(45,212,191,0.18),_transparent_26%),linear-gradient(180deg,_#fffdf7_0%,_#f8fafc_46%,_#eef2f7_100%)] px-4 py-6 md:px-6">
       <div className="mx-auto max-w-5xl">
-        <div className="mb-6 overflow-hidden rounded-[2rem] border border-white/70 bg-white/72 px-6 py-6 shadow-[0_30px_100px_rgba(15,23,42,0.12)] backdrop-blur-2xl">
-          <div className="flex flex-col gap-5 lg:flex-row lg:items-center lg:justify-between">
-          <div>
-            <p className="text-xs font-semibold uppercase tracking-[0.25em] text-amber-700/70">
-              New Project
-            </p>
-            <h1 className="mt-2 text-4xl font-semibold tracking-tight text-slate-950">
-              Create Project
-            </h1>
-          </div>
-
+        <div className="mb-6 flex items-center justify-between gap-4 rounded-[2rem] border border-white/70 bg-white/72 px-6 py-5 shadow-[0_30px_100px_rgba(15,23,42,0.12)] backdrop-blur-2xl">
+          <h1 className="text-3xl font-semibold tracking-tight text-slate-950">New project</h1>
           <Link
             href="/projects"
             className="rounded-2xl border border-slate-200 bg-white/95 px-4 py-3 text-sm font-medium text-slate-700 shadow-sm transition hover:-translate-y-[1px] hover:border-slate-300"
           >
             Back
           </Link>
-          </div>
         </div>
 
-        {createdProject ? (
-          <div className="mb-6 rounded-[2rem] border border-emerald-200 bg-emerald-50/90 p-5 shadow-sm">
-            <h2 className="text-lg font-semibold text-emerald-900">
-              Project created
-            </h2>
-            <p className="mt-1 text-sm text-emerald-800">
-              {invitedEmails.length > 0
-                ? "The consultants below have been invited and will receive a set-up link by email."
-                : 'No new consultant accounts were needed — every email already has access.'}
+        {createdProjectId ? (
+          <div className="rounded-[2rem] border border-amber-200 bg-amber-50/90 p-5 shadow-sm">
+            <h2 className="text-lg font-semibold text-amber-950">Project created</h2>
+            <p className="mt-1 text-sm text-amber-900">
+              {inviteError
+                ? `Invites weren't sent (${inviteError}). You can send them from Settings.`
+                : 'Some invites need attention.'}
             </p>
-
-            {inviteLoading ? (
-              <p className="mt-4 text-sm text-emerald-700">Sending invites...</p>
-            ) : null}
-
-            {inviteError ? (
-              <div className="mt-4 rounded-2xl bg-amber-50 px-4 py-3 text-sm text-amber-800">
-                The project was created, but sending invites failed ({inviteError}).
-                You can invite these consultants manually from Settings.
-              </div>
-            ) : null}
 
             {inviteResults && inviteResults.length > 0 ? (
               <div className="mt-4 space-y-2">
                 {inviteResults.map((result) => (
-                  <div
-                    key={result.email}
-                    className="rounded-2xl bg-white px-4 py-3 text-sm text-emerald-900"
-                  >
+                  <div key={result.email} className="rounded-2xl bg-white px-4 py-3 text-sm text-slate-900">
                     <div className="flex flex-wrap items-center justify-between gap-2">
                       <span className="font-medium">{result.email}</span>
                       {result.error ? (
-                        <span className="text-xs text-rose-600">
-                          Invite failed: {result.error}
-                        </span>
+                        <span className="text-xs text-rose-600">{result.error}</span>
                       ) : result.alreadyExisted ? (
-                        <span className="text-xs text-slate-500">
-                          Already has an account
-                        </span>
+                        <span className="text-xs text-slate-500">Already has an account</span>
                       ) : (
                         <span className="text-xs text-emerald-600">Invited</span>
                       )}
@@ -440,9 +478,7 @@ export default function NewProjectPage() {
                         />
                         <button
                           type="button"
-                          onClick={() =>
-                            copyToClipboard(result.actionLink as string, result.email)
-                          }
+                          onClick={() => copyToClipboard(result.actionLink as string, result.email)}
                           className="whitespace-nowrap rounded-xl bg-black px-3 py-2 text-xs font-medium text-white"
                         >
                           {copiedEmail === result.email ? 'Copied' : 'Copy set-up link'}
@@ -456,57 +492,122 @@ export default function NewProjectPage() {
 
             <div className="mt-5">
               <Link
-                href={`/projects/${createdProject.id}`}
+                href={`/projects/${encodeURIComponent(createdProjectId)}?tab=settings`}
                 className="inline-flex rounded-2xl bg-[linear-gradient(135deg,#0f172a_0%,#1e293b_45%,#0f766e_100%)] px-5 py-3 text-sm font-medium text-white shadow-lg transition hover:-translate-y-[1px]"
               >
-                Go to project
+                Go to Settings
               </Link>
             </div>
           </div>
-        ) : null}
-
-        {!createdProject ? (
+        ) : (
           <form onSubmit={handleSubmit} className="space-y-5">
             {formError ? (
-              <div className="rounded-[2rem] border border-rose-200 bg-rose-50/90 px-5 py-4 text-sm text-rose-700 shadow-sm">
+              <div
+                role="alert"
+                className="rounded-[2rem] border border-rose-200 bg-rose-50/90 px-5 py-4 text-sm text-rose-700 shadow-sm"
+              >
                 {formError}
               </div>
             ) : null}
 
-            <div className="rounded-[2rem] border border-white/70 bg-white/76 p-5 shadow-[0_24px_90px_rgba(15,23,42,0.12)] backdrop-blur-2xl">
+            <div className={CARD}>
               <input
                 id="project-name"
                 name="project-name"
+                aria-label="Project name"
                 value={projectName}
                 onChange={(e) => setProjectName(e.target.value)}
                 placeholder="Project name"
-                className="w-full rounded-2xl border border-slate-200 bg-white/95 px-4 py-3 text-sm outline-none transition focus:border-teal-600 focus:ring-2 focus:ring-teal-100"
+                className={INPUT}
               />
             </div>
 
-            <div className="rounded-[2rem] border border-white/70 bg-white/76 p-5 shadow-[0_24px_90px_rgba(15,23,42,0.12)] backdrop-blur-2xl">
-              <div className="flex flex-wrap gap-3">
-                {CONSULTANT_TYPES.map((type) => {
+            <div className={CARD}>
+              <div className="flex flex-wrap gap-3" role="group" aria-label="Disciplines">
+                {[...CONSULTANT_TYPES, ...customTypes].map((type) => {
                   const isSelected = selectedTypes.includes(type)
-                  const theme = getConsultantTheme(type)
+                  const isFixed = type === OWN_DISCIPLINE
 
                   return (
                     <button
                       key={type}
                       type="button"
-                      onClick={() => !isSelected && addConsultantType(type)}
-                      disabled={isSelected}
+                      onClick={() => toggleConsultantType(type)}
+                      aria-pressed={isSelected}
+                      disabled={isFixed}
                       className={`rounded-full px-4 py-2 text-sm font-medium transition ${
-                        isSelected
-                          ? theme.selectedChip
-                          : 'border border-slate-300 bg-white/95 text-slate-700 hover:-translate-y-[1px] hover:border-slate-400'
-                      }`}
+                        isSelected ? getConsultantTheme(type).selectedChip : IDLE_CHIP
+                      } ${isFixed ? 'cursor-default' : ''}`}
                     >
                       {type}
                     </button>
                   )
                 })}
+                {!otherOpen ? (
+                  <button
+                    type="button"
+                    onClick={() => setOtherOpen(true)}
+                    className={`rounded-full px-4 py-2 text-sm font-medium transition ${IDLE_CHIP}`}
+                  >
+                    Other…
+                  </button>
+                ) : null}
               </div>
+
+              {otherOpen ? (
+                <div className="mt-4">
+                  <div className="flex gap-2">
+                    <input
+                      id="other-discipline"
+                      aria-label="Discipline name"
+                      value={otherName}
+                      maxLength={MAX_DISCIPLINE_LENGTH}
+                      autoFocus
+                      onChange={(e) => {
+                        setOtherName(e.target.value)
+                        setOtherError(null)
+                      }}
+                      onKeyDown={(e) => {
+                        // Enter adds the discipline; it must never submit the project.
+                        if (e.key === 'Enter') {
+                          e.preventDefault()
+                          addOtherDiscipline()
+                        } else if (e.key === 'Escape') {
+                          setOtherOpen(false)
+                          setOtherName('')
+                          setOtherError(null)
+                        }
+                      }}
+                      aria-invalid={otherError ? true : undefined}
+                      placeholder="Discipline name"
+                      className={`${INPUT} flex-1`}
+                    />
+                    <button
+                      type="button"
+                      onClick={addOtherDiscipline}
+                      className="rounded-2xl bg-slate-900 px-4 py-3 text-sm font-medium text-white"
+                    >
+                      Add
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setOtherOpen(false)
+                        setOtherName('')
+                        setOtherError(null)
+                      }}
+                      className="rounded-2xl border border-slate-200 bg-white/95 px-4 py-3 text-sm font-medium text-slate-700"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                  {otherError ? (
+                    <p role="alert" className="mt-2 text-xs text-red-600">
+                      {otherError}
+                    </p>
+                  ) : null}
+                </div>
+              ) : null}
             </div>
 
             <div className="grid gap-5">
@@ -514,99 +615,69 @@ export default function NewProjectPage() {
                 const theme = getConsultantTheme(consultant.type)
 
                 return (
-                <div
-                  key={consultant.type}
-                  className={`rounded-[2rem] border p-5 shadow-[0_24px_90px_rgba(15,23,42,0.12)] backdrop-blur-2xl ${theme.card}`}
-                >
-                  <div className="mb-5 flex items-start justify-between gap-4">
-                    <div>
-                      <h2 className={`text-xl font-semibold ${theme.badge}`}>
-                        {consultant.type}
-                      </h2>
-                    </div>
+                  <section
+                    key={consultant.type}
+                    aria-label={consultant.type}
+                    className={`rounded-[2rem] border p-5 shadow-[0_24px_90px_rgba(15,23,42,0.12)] backdrop-blur-2xl ${theme.card}`}
+                  >
+                    <h2 className={`mb-4 text-xl font-semibold ${theme.badge}`}>{consultant.type}</h2>
 
-                    {consultant.type !== 'Architecture' ? (
-                      <button
-                        type="button"
-                        onClick={() => removeConsultant(consultant.type)}
-                        className="rounded-full border border-rose-200 px-3 py-1 text-sm font-medium text-rose-600 hover:bg-rose-50"
-                      >
-                        Remove
-                      </button>
-                    ) : (
-                      <div className="rounded-full bg-slate-100 px-3 py-1 text-xs font-medium text-slate-500">
-                        Default
-                      </div>
-                    )}
-                  </div>
-
-                  <div className="grid gap-4 md:grid-cols-[1.2fr_1fr]">
-                    <div>
+                    <div className="grid gap-4 md:grid-cols-[1.2fr_1fr]">
                       <input
                         id={`org-name-${consultant.type}`}
                         name={`org-name-${consultant.type}`}
+                        aria-label={`${consultant.type} organization`}
                         value={consultant.orgName}
-                        onChange={(e) =>
-                          updateConsultant(
-                            consultant.type,
-                            'orgName',
-                            e.target.value
-                          )
-                        }
+                        onChange={(e) => updateConsultant(consultant.type, 'orgName', e.target.value)}
                         placeholder="Organization"
-                        className="w-full rounded-2xl border border-slate-200 bg-white/95 px-4 py-3 text-sm outline-none transition focus:border-teal-600 focus:ring-2 focus:ring-teal-100"
+                        className={INPUT}
                       />
-                    </div>
 
-                    <div>
-                      <div className="flex gap-2">
-                        <input
-                          id={`email-input-${consultant.type}`}
-                          name={`email-input-${consultant.type}`}
-                          value={consultant.emailInput}
-                          onChange={(e) =>
-                            setConsultants((prev) =>
-                              prev.map((item) =>
-                                item.type === consultant.type
-                                  ? {
-                                      ...item,
-                                      emailInput: e.target.value,
-                                      emailError: null,
-                                    }
-                                  : item
+                      <div>
+                        <div className="flex gap-2">
+                          <input
+                            id={`email-input-${consultant.type}`}
+                            name={`email-input-${consultant.type}`}
+                            aria-label={`${consultant.type} email`}
+                            value={consultant.emailInput}
+                            onChange={(e) =>
+                              setConsultants((prev) =>
+                                prev.map((item) =>
+                                  item.type === consultant.type
+                                    ? { ...item, emailInput: e.target.value, emailError: null }
+                                    : item
+                                )
                               )
-                            )
-                          }
-                          onKeyDown={(e) => {
-                            // Enter adds the email; it must never submit (create) the project.
-                            if (e.key === 'Enter') {
-                              e.preventDefault()
-                              addEmail(consultant.type)
                             }
-                          }}
-                          aria-invalid={consultant.emailError ? true : undefined}
-                          placeholder="name@company.com"
-                          className="flex-1 rounded-2xl border border-slate-200 bg-white/95 px-4 py-3 text-sm outline-none transition focus:border-teal-600 focus:ring-2 focus:ring-teal-100"
-                        />
-                        <button
-                          type="button"
-                          onClick={() => addEmail(consultant.type)}
-                          className={`rounded-2xl px-4 py-3 text-sm font-medium ${theme.button}`}
-                        >
-                          Add
-                        </button>
+                            onKeyDown={(e) => {
+                              // Enter adds the email; it must never submit (create) the project.
+                              if (e.key === 'Enter') {
+                                e.preventDefault()
+                                addEmail(consultant.type)
+                              }
+                            }}
+                            aria-invalid={consultant.emailError ? true : undefined}
+                            placeholder="name@company.com"
+                            className={`${INPUT} flex-1`}
+                          />
+                          <button
+                            type="button"
+                            onClick={() => addEmail(consultant.type)}
+                            className={`rounded-2xl px-4 py-3 text-sm font-medium ${theme.button}`}
+                          >
+                            Add
+                          </button>
+                        </div>
+                        {consultant.emailError ? (
+                          <p role="alert" className="mt-2 text-xs text-red-600">
+                            {consultant.emailError}
+                          </p>
+                        ) : null}
                       </div>
-                      {consultant.emailError && (
-                        <p role="alert" className="mt-2 text-xs text-red-600">
-                          {consultant.emailError}
-                        </p>
-                      )}
                     </div>
-                  </div>
 
-                  <div className="mt-4">
                     {consultant.emails.length > 0 ? (
-                      <div className="flex flex-wrap gap-2">
+                      <div className="mt-4 flex flex-wrap gap-2">
                         {consultant.emails.map((email) => (
                           <div
                             key={email}
@@ -624,14 +695,10 @@ export default function NewProjectPage() {
                           </div>
                         ))}
                       </div>
-                    ) : (
-                      <div className="rounded-2xl border border-dashed border-slate-200 px-4 py-4 text-sm text-slate-400">
-                        No emails yet
-                      </div>
-                    )}
-                  </div>
-                </div>
-              )})}
+                    ) : null}
+                  </section>
+                )
+              })}
             </div>
 
             <div className="flex justify-end">
@@ -640,12 +707,44 @@ export default function NewProjectPage() {
                 disabled={submitting}
                 className="rounded-2xl bg-[linear-gradient(135deg,#0f172a_0%,#1e293b_45%,#0f766e_100%)] px-6 py-3 text-sm font-medium text-white shadow-lg transition hover:-translate-y-[1px] disabled:opacity-50"
               >
-                {submitting ? 'Creating...' : 'Create Project'}
+                {submitting ? 'Creating...' : 'Create project'}
               </button>
             </div>
           </form>
-        ) : null}
+        )}
       </div>
+
+      <Modal
+        open={confirmRemove !== null}
+        onClose={() => setConfirmRemove(null)}
+        size="sm"
+        title={`Remove ${confirmRemove ?? ''}?`}
+        footer={
+          <>
+            <button
+              type="button"
+              onClick={() => setConfirmRemove(null)}
+              className="rounded-xl border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700"
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                if (confirmRemove) removeConsultant(confirmRemove)
+                setConfirmRemove(null)
+              }}
+              className="rounded-xl bg-rose-600 px-5 py-2 text-sm font-medium text-white"
+            >
+              Remove
+            </button>
+          </>
+        }
+      >
+        <p className="text-sm text-slate-700">
+          Are you sure? The organization and emails entered for {confirmRemove} will be cleared.
+        </p>
+      </Modal>
     </main>
   )
 }

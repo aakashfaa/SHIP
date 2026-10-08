@@ -5,7 +5,7 @@ import { settle } from '../helpers/settle'
  * Baseline capture of the v1 workspace, taken before the v2 phasing work lands.
  *
  * The point is not that these screenshots are correct — it is that they are
- * *current*. v2 rebuilds the Timeline tab and touches Chunking, Add Data and
+ * *current*. v2 rebuilds the Timeline tab and touches Phasing (was Chunking), Add Data and
  * Master View; having a committed before-image means an unintended change to a
  * tab nobody meant to touch shows up as a diff rather than as a bug report
  * three weeks later.
@@ -33,12 +33,16 @@ test('projects home lists the seeded projects', async ({ page }) => {
   await expect(page).toHaveScreenshot('projects-home.png', { fullPage: true })
 })
 
-for (const tab of ['Add Data', 'Master View', 'Chunking', 'Timeline'] as const) {
+for (const tab of ['Add Data', 'Master View', 'Phasing', 'Timeline'] as const) {
   test(`workspace tab: ${tab}`, async ({ page }) => {
     await openSeedProject(page)
 
     await page.getByRole('button', { name: tab, exact: true }).click()
     await settle(page)
+    // The tab's own content must be on screen, not just its empty frame.
+    if (tab === 'Phasing') {
+      await expect(page.getByRole('button', { name: 'Create Package' })).toBeVisible()
+    }
 
     await expect(page).toHaveScreenshot(
       `tab-${tab.toLowerCase().replace(/\s+/g, '-')}.png`,

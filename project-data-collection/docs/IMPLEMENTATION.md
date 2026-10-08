@@ -259,6 +259,7 @@ has rollback notes for each.
 | `0018_project_lifecycle` | every project gets cost, energy and timeline rows with a fixed year, so totals no longer move on 1 January |
 | `0019_cost_parser` | strict `parse_cost_input`; unreadable legacy text becomes NULL and is flagged |
 | `0020_canonical_time_unit` | converts every stored schedule position to months (see [The cost engine](#the-cost-engine)). **Snapshot the hosted database first; it converts in place.** Run-once, logged per project |
+| `0021_project_view_settings` | per-project display settings (`projects.view_settings`), shared by every member; written only via `update_project_view_settings` (project/platform admin). **Pending on hosted** — apply after 0020, then `notify pgrst, 'reload schema';` |
 
 **Auth and email.** Our server sends every auth email itself through the
 Resend REST API (`lib/email/`); nothing calls `inviteUserByEmail`, client

@@ -1712,3 +1712,130 @@ export async function seedDefaultForm(projectId: string): Promise<void> {
 
   if (error) fail(`Failed to seed default form for "${projectId}"`, error)
 }
+
+/* --------------------------------------------------------- view settings -- */
+
+/**
+ * The project's raw `view_settings` jsonb (migration 0021). Returned as-is:
+ * callers run it through `normalizeViewSettings` (lib/view-settings.ts), which
+ * fills anything missing with defaults. Readable by every project member.
+ * Returns `{}` when the project is not visible to the caller (RLS), so the
+ * caller simply renders the defaults.
+ */
+export async function getProjectViewSettings(projectId: string): Promise<unknown> {
+  const supabase = getSupabaseBrowserClient()
+
+  const { data, error } = await supabase
+    .from('projects')
+    .select('view_settings')
+    .eq('id', projectId)
+    .maybeSingle()
+
+  if (error) fail(`Failed to load display settings for "${projectId}"`, error)
+
+  return (data as { view_settings?: unknown } | null)?.view_settings ?? {}
+}
+
+/**
+ * Saves some of the project's display settings via
+ * `ship.update_project_view_settings` (migration 0021), which MERGES the views
+ * sent into the stored object -- send only the view(s) being changed, so a
+ * concurrent save of another view is never overwritten. Project admins (and
+ * platform admins) only; anyone else gets a permission error. Returns the
+ * whole value the database stored.
+ */
+export async function saveProjectViewSettings(
+  projectId: string,
+  settings: Partial<import('./view-settings').ProjectViewSettings>
+): Promise<unknown> {
+  const supabase = getSupabaseBrowserClient()
+
+  const { data, error } = await supabase.rpc('update_project_view_settings', {
+    p_project_id: projectId,
+    p_settings: settings,
+  })
+
+  if (error) fail(`Failed to save display settings for "${projectId}"`, error)
+
+  return data ?? settings
+}
+
+/**
+ * "Remove" for a column-backed (built-in) field. `ship.guard_form_field`
+ * refuses to delete the row -- other code reads the column -- so removing
+ * one hides it AND stamps `config.removed = true`, in a single UPDATE so the
+ * two can't disagree. The form builder drops removed fields from its list
+ * entirely, which is what separates this from a plain Hide (a hidden field
+ * stays listed and can be shown again). Everything that already skips
+ * hidden fields (`visibleFormFields`, `orderedVisibleFields`) skips these
+ * for the same reason, with no change.
+ *
+ * Read-then-write on `config` so any other keys stored there survive; the
+ * race with a concurrent config edit is the same cosmetic tradeoff
+ * `addFieldOption` accepts for sort order. Custom fields should use
+ * `deleteFormField` instead.
+ */
+export async function removeBuiltinFormField(fieldId: string): Promise<void> {
+  const supabase = getSupabaseBrowserClient()
+
+  const { data: current, error: readError } = await supabase
+    .from('form_fields')
+    .select('config')
+    .eq('id', fieldId)
+    .maybeSingle()
+
+  if (readError) fail(`Failed to load form field "${fieldId}"`, readError)
+
+  const config =
+    current && typeof current.config === 'object' && current.config !== null && !Array.isArray(current.config)
+      ? (current.config as Record<string, unknown>)
+      : {}
+
+  const { error } = await supabase
+    .from('form_fields')
+    .update({ is_hidden: true, config: { ...config, removed: true } })
+    .eq('id', fieldId)
+
+  if (error) fail(`Failed to remove form field "${fieldId}"`, error)
+}
+
+/* ------------------------------------------ project phase template (re)apply -- */
+
+/**
+ * Replaces ALL of a package's phases with `phases` (built by
+ * components/project-workspace/cost-model/phase-layout.ts from the project's
+ * one phase template). Used when a package is created and when the project
+ * template changes.
+ *
+ * One call to ship.replace_chunk_phases (0025): the delete (which cascades
+ * the package's dependency links) and the insert run in one transaction,
+ * after the server has checked edit access and validated the payload. Any
+ * failure leaves the old phases exactly as they were -- never a package with
+ * no phases, which would price at $0.
+ */
+export async function replaceChunkPhases(
+  chunkProjectId: string,
+  phases: Array<Omit<ChunkPhase, 'id' | 'createdAt' | 'chunkProjectId'>>
+): Promise<ChunkPhase[]> {
+  const supabase = getSupabaseBrowserClient()
+
+  const { data, error } = await supabase.rpc('replace_chunk_phases', {
+    p_chunk_id: chunkProjectId,
+    p_phases: phases.map((phase) => ({
+      name: phase.name,
+      kind: phase.kind,
+      sort_order: phase.sortOrder,
+      pct_of_tpc: phase.pctOfTpc,
+      start_month: phase.startMonth,
+      duration_months: phase.durationMonths,
+      duration_locked: phase.durationLocked,
+      template_step_id: phase.templateStepId,
+    })),
+  })
+
+  if (error) fail(`Failed to replace the phases of chunk "${chunkProjectId}"`, error)
+
+  return ((data ?? []) as unknown as ChunkPhaseRow[])
+    .map(rowToChunkPhase)
+    .sort((a, b) => a.sortOrder - b.sortOrder)
+}

@@ -51,6 +51,7 @@ Strictly in order. Each file assumes the previous one has been applied.
 | 18 | `migrations/0018_project_lifecycle.sql` | `create_project()` also creates cost and energy settings rows and fixes the start year; backfills existing projects from `created_at`; then `NOT NULL`. |
 | 19 | `migrations/0019_cost_parser.sql` | Strict `parse_cost_input()` (matches `lib/costs.ts`, 76 parity cases) and **recomputes every `ecc_amount`**: legacy text it cannot read becomes NULL and is flagged. |
 | 20 | `migrations/0020_canonical_time_unit.sql` | **Converts every stored schedule position to months, in place.** `ship.schema_conversions` (run-once marker), `ship.time_unit_conversion_log` (the factor per project). See the warning below. |
+| 20a | `migrations/0021_project_view_settings.sql` | `projects.view_settings` jsonb (per-project display settings, read by every member); `update_project_view_settings()` (project/platform admin only, object ≤ 32KB); table-wide UPDATE on `projects` replaced by a column grant that excludes `view_settings`. **Pending on hosted.** |
 | 21 | `seeds/001_seed.sql` | The `lib/mock-*.ts` fixtures + **the counter backfill**. |
 | 22 | `seeds/002_v2_phases.sql` | Fixture cost/energy settings, phases (in months) and phase dependencies for the v2 Timeline demo. Exists because the CLI applies migrations before seeds, so 0007's own backfill is a no-op on a fresh database — see Gotchas. |
 | 23 | `seeds/003_v2_taxonomy.sql` | Fixture taxonomy rows for all seeded projects, for the same reason 002 exists: 0008's backfill has nothing to join against on a fresh database. |
@@ -100,6 +101,7 @@ psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f supabase/migrations/0018_project_l
 psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f supabase/migrations/0019_cost_parser.sql
 # Snapshot first (see the warning above).
 psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f supabase/migrations/0020_canonical_time_unit.sql
+psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f supabase/migrations/0021_project_view_settings.sql
 # Seeds are fixtures: local/dev databases only, never the hosted project.
 psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f supabase/seeds/001_seed.sql
 psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f supabase/seeds/002_v2_phases.sql
@@ -195,6 +197,7 @@ each one leaves behind if you do need to know:
 
 | File | Not reversible by SQL | Objects it adds |
 | --- | --- | --- |
+| 0021 | Nothing destroyed. To undo: `drop function ship.update_project_view_settings(text, jsonb); alter table ship.projects drop column view_settings; grant update on ship.projects to authenticated;` (the app then renders defaults). | `projects.view_settings`, `update_project_view_settings()` |
 | 0020 | Every schedule value was multiplied by a factor. Reverse by hand, per project, by dividing by `time_unit_conversion_log.months_per_slot` (built-in templates: 12) — tables *and* scenario payloads — then delete the `schema_conversions` row. Only do this together with the pre-0020 app code. | `schema_conversions`, `time_unit_conversion_log` |
 | 0019 | Every `ecc_amount` was recomputed; unreadable text is now NULL. Re-running 0006's parser recomputes them the old (wrong) way. | — |
 | 0018 | Backfilled settings rows and start years; `NOT NULL` on the start year. | — |

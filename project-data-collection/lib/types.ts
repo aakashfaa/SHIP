@@ -1,6 +1,7 @@
 export type UserRole = 'admin' | 'consultant'
 
-export type ConsultantType =
+/** The built-in disciplines (the dropdown list; each has a fixed item-number prefix). */
+export type KnownConsultantType =
   | 'Architecture'
   | 'Accessibility'
   | 'Civil'
@@ -15,6 +16,14 @@ export type ConsultantType =
   | 'Structural'
   | 'Security'
   | 'Telecom'
+
+/**
+ * A discipline: one of the built-in names, or a custom one an admin typed via
+ * "Other…" (migration 0022). `string & {}` keeps editor completion for the
+ * known names while accepting any string, so code must not assume the closed
+ * set -- anything keyed by discipline (colours, ordering) needs a fallback.
+ */
+export type ConsultantType = KnownConsultantType | (string & {})
 
 export type SafeUser = {
   email: string
@@ -157,11 +166,11 @@ export type LineItem = {
   relativeOperationCostImpact: RelativeOperationCostImpact
   relativeOperationalEnergyUsage: RelativeOperationalEnergyUsage
   electrificationEO594: RelativeImpact
-  addressingResiliencySustainability: BooleanChoice
-  addressingDeferredMaintenance: BooleanChoice
-  codeLifeSafetyImprovement: BooleanChoice
-  accessibilityImprovement: BooleanChoice
-  historicImpact: BooleanChoice
+  addressingResiliencySustainability: BooleanChoice | null
+  addressingDeferredMaintenance: BooleanChoice | null
+  codeLifeSafetyImprovement: BooleanChoice | null
+  accessibilityImprovement: BooleanChoice | null
+  historicImpact: BooleanChoice | null
   potentialSynergies: ConsultantType[]
   supportingNotes: string
   createdAt: string

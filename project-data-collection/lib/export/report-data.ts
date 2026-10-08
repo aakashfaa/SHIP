@@ -42,8 +42,17 @@
  */
 
 import type { ShipSupabaseClient } from '../supabase/client'
+import {
+  ECC_COLUMN,
+  UNREADABLE_CELL,
+  eccCell,
+  fieldCell,
+  fieldColumn,
+  type ReportCellValue,
+  type ReportColumn,
+} from './line-item-cells'
 import { parseCostAmount, parseCostInput, parseQuantity, parseQuantityInput } from '../costs'
-import { formatFieldValue, getFieldValue, orderedVisibleFields } from '../form-values'
+import { orderedVisibleFields } from '../form-values'
 import {
   DEFAULT_ENERGY_SETTINGS,
   applyScenarioOverlay,
@@ -343,14 +352,9 @@ function toEnergySettings(row: ProjectEnergySettings | null): EnergySettings {
 
 /* ------------------------------------------------------------- shaping -- */
 
-export type ReportCellValue = string | number
-
-export type ReportColumn = {
-  header: string
-  width: number
-  /** Excel number format hint; text columns leave it unset. */
-  format?: 'currency' | 'number'
-}
+// Cell/column shapes live with the per-cell helpers in line-item-cells.ts
+// (shared with Master View's own export); re-exported for existing importers.
+export type { ReportCellValue, ReportColumn }
 
 /** A sheet whose columns are data, not code -- the Line Items sheet's
  *  columns come from the project's form definition (M-28). */
@@ -429,56 +433,7 @@ export type BuildReportOptions = {
 
 /* ---------------------------------------------------- line-item columns -- */
 
-const ECC_COLUMN: ReportColumn = { header: 'ECC Amount', width: 16, format: 'currency' }
-
-/** Line items whose cost text is present but unreadable get this in the ECC
- *  column instead of a number -- never a silent $0 (M-09). */
-export const UNREADABLE_CELL = 'Unreadable'
-
-function columnWidth(field: FormField): number {
-  switch (field.inputType) {
-    case 'textarea':
-      return 32
-    case 'boolean':
-      return 14
-    case 'number':
-    case 'currency':
-      return 18
-    case 'multiselect':
-      return 26
-    default:
-      return 22
-  }
-}
-
-/** Money-valued built-in number fields. Everything else numeric is a plain
- *  number (D-16: "plain number fields stay plain numbers"). */
-const CURRENCY_NUMBER_KEYS = new Set(['annual_cost_savings'])
-
-function eccCell(item: LineItem): ReportCellValue {
-  const parsed = parseCostAmount(item.estimatedFirstCost)
-  if (!parsed.ok) return UNREADABLE_CELL
-  if (parsed.amount === null) return ''
-  // The stored ecc_amount and the live parse agree by construction (0019 +
-  // check:parser); the stored value is what the totals use, so show it.
-  return item.eccAmount || parsed.amount
-}
-
-function fieldCell(item: LineItem, field: FormField): ReportCellValue {
-  const value = getFieldValue(item, field)
-  if (field.inputType === 'number') {
-    if (typeof value === 'number' && Number.isFinite(value)) return value
-    const n = typeof value === 'string' && value.trim() !== '' ? Number(value) : NaN
-    return Number.isFinite(n) ? n : formatFieldValue(field, value)
-  }
-  if (field.inputType === 'currency' && field.key !== 'estimated_first_cost') {
-    // A custom currency field: a number when readable, the text as typed
-    // when not (so nothing typed is lost from the deliverable).
-    const parsed = parseCostAmount(typeof value === 'string' ? value : String(value ?? ''))
-    if (parsed.ok && parsed.amount !== null) return parsed.amount
-  }
-  return formatFieldValue(field, value)
-}
+export { UNREADABLE_CELL }
 
 /**
  * The Line Items sheet, built from the project's VISIBLE form fields in form
@@ -506,16 +461,7 @@ export function buildLineItemTable(
 
   let eccPlaced = false
   for (const field of orderedVisibleFields(formFields)) {
-    const isMoneyNumber = field.inputType === 'number' && CURRENCY_NUMBER_KEYS.has(field.key)
-    const isCustomCurrency = field.inputType === 'currency' && field.key !== 'estimated_first_cost'
-    specs.push({
-      column: {
-        header: field.label.trim() || field.key,
-        width: columnWidth(field),
-        format: isMoneyNumber || isCustomCurrency ? 'currency' : field.inputType === 'number' ? 'number' : undefined,
-      },
-      value: (item) => fieldCell(item, field),
-    })
+    specs.push({ column: fieldColumn(field), value: (item) => fieldCell(item, field) })
     if (field.key === 'estimated_first_cost') {
       specs.push({ column: ECC_COLUMN, value: eccCell })
       eccPlaced = true

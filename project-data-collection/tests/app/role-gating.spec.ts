@@ -37,13 +37,23 @@ async function openTimelineAs(page: Page, email: string) {
   await settle(page)
 }
 
+/**
+ * The "<View> · <Role>" line under the project name in the top bar. This is
+ * where the shell names the caller's role (it replaced the old "Read-only /
+ * Consultant / Editor Workspace" titles), so it is what tells a viewer apart
+ * from an editor on the same page.
+ */
+function roleLine(page: Page) {
+  return page.locator('[data-workspace-topbar] p').first()
+}
+
 // Every role signs in for itself; the stored admin session would defeat the test.
 test.use({ storageState: { cookies: [], origins: [] } })
 
 test('a viewer gets a read-only plan and an ephemeral sandbox', async ({ page }) => {
   await openTimelineAs(page, 'electrical@voltworks.com')
 
-  await expect(page.getByText('Read-only Workspace')).toBeVisible()
+  await expect(roleLine(page)).toHaveText('Timeline · Client')
   await expect(page.getByText(/Exploring — nothing is saved/i)).toBeVisible()
 
   // R8.4: no deliverables for a viewer.
@@ -67,19 +77,19 @@ test('a viewer cannot reach Add Data at all', async ({ page }) => {
 test('a consultant may branch a what-if but not publish the plan', async ({ page }) => {
   await openTimelineAs(page, 'consultant1@gmail.com')
 
-  await expect(page.getByText('Consultant Workspace')).toBeVisible()
+  await expect(roleLine(page)).toHaveText(/^Timeline · Consultant( · .+)?$/)
   // Branching is theirs — modelling an idea privately is what they are here for.
   await expect(page.getByRole('button', { name: /Try a what-if/i })).toBeVisible()
   // Editing the live schedule is not.
-  await expect(page.getByText(/Read-only\. Ask an editor/i)).toBeVisible()
+  await expect(page.getByText('Read-only', { exact: true })).toBeVisible()
 })
 
 test('an editor gets the plan and the deliverables', async ({ page }) => {
   await openTimelineAs(page, 'planning@atlasmech.com')
 
-  await expect(page.getByText('Editor Workspace')).toBeVisible()
+  await expect(roleLine(page)).toHaveText('Timeline · Editor')
   await expect(page.getByRole('button', { name: /Export Excel/i })).toBeVisible()
-  await expect(page.getByText(/Read-only\. Ask an editor/i)).toHaveCount(0)
+  await expect(page.getByText('Read-only', { exact: true })).toHaveCount(0)
 })
 
 test('an admin can edit the line item form', async ({ page }) => {
@@ -98,7 +108,7 @@ test('an admin can edit the line item form', async ({ page }) => {
   await page.getByRole('button', { name: 'Settings' }).click()
   await settle(page)
 
-  await expect(page.getByRole('heading', { name: /Line item form/i })).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Consultant input form', exact: true })).toBeVisible()
 
   // A built-in field, a custom one, and a field the fixture hides. The three
   // together are the whole model: built-ins are structural, custom fields are
@@ -112,7 +122,7 @@ test('an admin can edit the line item form', async ({ page }) => {
   await expect(page).toHaveScreenshot('form-builder.png', { fullPage: true })
 })
 
-test('built-in fields offer no delete, custom fields do', async ({ page }) => {
+test('default fields offer no remove, every other field does', async ({ page }) => {
   await signInAs(page, 'admin@gmail.com')
   await page.getByRole('link', { name: new RegExp(PROJECT, 'i') }).first().click()
   await page.waitForURL(/\/projects\/.+/)
@@ -127,18 +137,34 @@ test('built-in fields offer no delete, custom fields do', async ({ page }) => {
   // "the feature is missing" rather than "the page had not painted yet".
   await expect(page.getByText('Funding source', { exact: true })).toBeVisible()
 
-  // The database refuses to delete a built-in (migration 0012's guard
-  // trigger). This asserts the UI never offers the action in the first place
-  // -- a button that exists only to produce an error is worse than no button.
-  const deleteCount = await page.getByRole('button', { name: /^Delete$/ }).count()
+  // Remove (and every other write) lives behind the builder's edit mode.
+  await page.getByRole('button', { name: 'Edit form', exact: true }).click()
+  await expect(page.getByRole('button', { name: 'Done editing', exact: true })).toBeVisible()
 
-  // Exactly the two custom fields in the fixture, and none of the 24
-  // built-ins. An upper bound rather than an equality so adding a third
-  // custom field to the seed does not fail this for the wrong reason.
-  expect(deleteCount).toBe(2)
+  // The five Default questions (name, short description, category, timeline
+  // priority, annual energy savings) are asked on every line item and must never be removable --
+  // the UI does not offer the action at all. A button that exists only to
+  // produce a broken form is worse than no button.
+  const rows = page.locator('li[data-drag-row]')
+  const defaultRows = rows.filter({ has: page.getByText('Default', { exact: true }) })
+  await expect(defaultRows).toHaveCount(5)
+  for (const row of await defaultRows.all()) {
+    await expect(row.getByRole('button', { name: /^Remove / })).toHaveCount(0)
+  }
+
+  // Every other listed question -- custom, or column-backed but optional --
+  // can be removed (custom: deleted; column-backed: taken out of the form,
+  // since the database refuses to delete the row). Each offers exactly one.
+  const rowCount = await rows.count()
+  expect(rowCount).toBeGreaterThan(5)
+  await expect(rows.getByRole('button', { name: /^Remove / })).toHaveCount(rowCount - 5)
+
+  // The fixture's custom field among them.
+  const funding = rows.filter({ has: page.getByText('Funding source', { exact: true }) })
+  await expect(funding.getByRole('button', { name: 'Remove Funding source' })).toHaveCount(1)
 })
 
-test('a custom field can be added and removed, built-ins are untouched', async ({ page }) => {
+test('a custom field can be added and removed, defaults are untouched', async ({ page }) => {
   await signInAs(page, 'admin@gmail.com')
   await page.getByRole('link', { name: new RegExp(PROJECT, 'i') }).first().click()
   await page.waitForURL(/\/projects\/.+/)
@@ -147,25 +173,30 @@ test('a custom field can be added and removed, built-ins are untouched', async (
   await settle(page)
   await expect(page.getByText('Funding source', { exact: true })).toBeVisible()
 
-  const builtInCount = await page.getByText('Built-in', { exact: true }).count()
+  const defaultCount = await page.getByText('Default', { exact: true }).count()
+  expect(defaultCount).toBe(5)
 
   // Add a field. This is the client's actual ask -- "they have 10 fields now,
   // in the future they add 2 more" -- so it is worth exercising for real
   // rather than asserting the form that creates it merely renders.
-  await page.getByLabel(/new field label/i).fill('Roof warranty note')
-  await page.getByRole('button', { name: /^Add field$/i }).click()
+  await page.getByRole('button', { name: 'Add questions', exact: true }).click()
+  const dialog = page.getByRole('dialog', { name: 'Add questions' })
+  await dialog.getByLabel('Question 1 label').fill('Roof warranty note')
+  await dialog.getByRole('button', { name: 'Add', exact: true }).click()
+  await expect(dialog).toHaveCount(0)
   await expect(page.getByText('Roof warranty note', { exact: true })).toBeVisible()
 
-  // Adding must not have disturbed the built-ins. That is the additive
+  // Adding must not have disturbed the defaults. That is the additive
   // guarantee, observed from the UI rather than from SQL.
-  expect(await page.getByText('Built-in', { exact: true }).count()).toBe(builtInCount)
+  expect(await page.getByText('Default', { exact: true }).count()).toBe(defaultCount)
 
   // Remove it again, through the two-step inline confirm. A native
   // window.confirm() here would block the page and hang this test.
+  await page.getByRole('button', { name: 'Edit form', exact: true }).click()
   const row = page.locator('li', { hasText: 'Roof warranty note' }).last()
-  await row.getByRole('button', { name: /^Delete$/ }).click()
-  await row.getByRole('button', { name: /^Confirm delete$/ }).click()
+  await row.getByRole('button', { name: 'Remove Roof warranty note' }).click()
+  await row.getByRole('button', { name: /^Confirm remove$/ }).click()
 
   await expect(page.getByText('Roof warranty note', { exact: true })).toHaveCount(0)
-  expect(await page.getByText('Built-in', { exact: true }).count()).toBe(builtInCount)
+  expect(await page.getByText('Default', { exact: true }).count()).toBe(defaultCount)
 })

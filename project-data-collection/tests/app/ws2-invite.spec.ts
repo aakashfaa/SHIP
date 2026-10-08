@@ -207,19 +207,26 @@ test('a new invitee gets an email, sets a password and lands in the project; the
   await page.waitForURL('**/projects')
 
   await page.goto(`/projects/${PROJECT_ID}?tab=settings`)
-  await page.getByRole('button', { name: 'Edit', exact: true }).click()
+  // Settings -> Consultants (+) opens the "Add consultants" popup. Picking a
+  // discipline that already has an organization (Architecture) merges the
+  // new people into it.
+  await page.getByRole('button', { name: 'Add consultants', exact: true }).click()
+  const dialog = page.getByRole('dialog', { name: 'Add consultants' })
+  await dialog.getByLabel('Discipline').selectOption('Architecture')
+  const box = dialog.getByLabel('Email 1', { exact: true })
 
-  const box = page.getByLabel('Add email for Architecture')
-  // M-22: a malformed address is refused on add.
+  // M-22: a malformed address is refused -- the popup stays open with an
+  // inline error and nothing reaches the roster or the mailer.
   await box.fill('not-an-email')
-  await box.press('Enter')
-  await expect(page.getByText(/doesn't look like an email address/)).toBeVisible()
+  await dialog.getByRole('button', { name: 'Add', exact: true }).click()
+  await expect(dialog.getByText(/doesn't look like an email address/)).toBeVisible()
+  await expect(dialog).toBeVisible()
 
   const before = await seenIds(NEW_EMAIL)
   await box.fill(NEW_EMAIL)
-  await box.press('Enter') // M-22: Enter adds
-  await expect(page.getByText(NEW_EMAIL)).toBeVisible()
-  await page.getByRole('button', { name: 'Save Changes' }).click()
+  await dialog.getByRole('button', { name: 'Add', exact: true }).click()
+  await expect(dialog).toHaveCount(0)
+  await expect(page.getByLabel('Consultants').getByText(NEW_EMAIL)).toBeVisible()
 
   const result = page.getByTestId('invite-result').filter({ hasText: NEW_EMAIL })
   await expect(result).toContainText('Invite emailed', { timeout: 20_000 })

@@ -15,6 +15,15 @@ import {
 } from '@/lib/store'
 import { COST_PARSE_MESSAGES, formatCostAmount, parseCostAmount } from '@/lib/costs'
 import { useAsyncData } from '@/lib/useAsyncData'
+import {
+  blankValueForField,
+  EMPTY_FIELD_TEXT,
+  formatFieldValue,
+  getFieldValue as getItemFieldValue,
+  readYesNo,
+  storedFieldValue,
+  writeYesNo,
+} from '@/lib/form-values'
 import type { ProjectPermissions } from '@/lib/project-role'
 import {
   ConsultantType,
@@ -204,38 +213,17 @@ const BASE_FIELD_DEFAULTS: Omit<DraftLineItem, 'projectId' | 'userEmail' | 'cons
   relativeOperationCostImpact: '',
   relativeOperationalEnergyUsage: '',
   electrificationEO594: '',
-  addressingResiliencySustainability: 'No',
-  addressingDeferredMaintenance: 'No',
-  codeLifeSafetyImprovement: 'No',
-  accessibilityImprovement: 'No',
-  historicImpact: 'No',
+  addressingResiliencySustainability: '',
+  addressingDeferredMaintenance: '',
+  codeLifeSafetyImprovement: '',
+  accessibilityImprovement: '',
+  historicImpact: '',
   potentialSynergies: [],
   supportingNotes: '',
-  annualEnergySavings: 0,
-  annualCostSavings: 0,
+  annualEnergySavings: null,
+  annualCostSavings: null,
   energyNotes: '',
   customFields: {},
-}
-
-/** The value a field starts a brand-new line item with. For a `select` this
- *  is its first live option (so a taxonomy-backed field like `category`
- *  defaults to whatever this project's own vocabulary puts first, not a
- *  literal this component would have to know) rather than a hardcoded
- *  literal. */
-function defaultValueForField(field: FormField): unknown {
-  switch (field.inputType) {
-    case 'boolean':
-      return field.storage === 'column' ? 'No' : false
-    case 'multiselect':
-      return []
-    case 'number':
-      // Blank, not 0 (D-9): an unanswered number is NULL, and 0 means zero.
-      return ''
-    case 'select':
-      return fieldOptions(field)[0] ?? ''
-    default:
-      return ''
-  }
 }
 
 /**
@@ -278,11 +266,12 @@ function makeInitialDraft(
     ...BASE_FIELD_DEFAULTS,
   }
 
-  // Every field, not just the visible ones: a hidden built-in (e.g. a firm
-  // that hides `electrification_eo594`) still backs a real, NOT NULL /
-  // CHECK-constrained column that this draft has to carry a legal value for.
+  // Every field, not just the visible ones, and every one starts UNANSWERED
+  // (lib/form-values blankValueForField): a select is never pre-filled with
+  // its first option. Skipped answers are written as NULL / omitted by
+  // normalizeDraft -> storedFieldValue.
   return fields.reduce(
-    (draft, field) => setFieldValue(draft, field, defaultValueForField(field)),
+    (draft, field) => setFieldValue(draft, field, blankValueForField(field)),
     base
   )
 }
@@ -306,11 +295,11 @@ function makeEditableDraft(item: LineItem): DraftLineItem {
     relativeOperationCostImpact: item.relativeOperationCostImpact,
     relativeOperationalEnergyUsage: item.relativeOperationalEnergyUsage,
     electrificationEO594: item.electrificationEO594,
-    addressingResiliencySustainability: item.addressingResiliencySustainability,
-    addressingDeferredMaintenance: item.addressingDeferredMaintenance,
-    codeLifeSafetyImprovement: item.codeLifeSafetyImprovement,
-    accessibilityImprovement: item.accessibilityImprovement,
-    historicImpact: item.historicImpact,
+    addressingResiliencySustainability: item.addressingResiliencySustainability ?? '',
+    addressingDeferredMaintenance: item.addressingDeferredMaintenance ?? '',
+    codeLifeSafetyImprovement: item.codeLifeSafetyImprovement ?? '',
+    accessibilityImprovement: item.accessibilityImprovement ?? '',
+    historicImpact: item.historicImpact ?? '',
     potentialSynergies: item.potentialSynergies,
     supportingNotes: item.supportingNotes,
     annualEnergySavings: item.annualEnergySavings,
@@ -404,6 +393,32 @@ function normalizeDraft(draft: DraftLineItem, fields: FormField[]): DraftLineIte
   }, draft)
 }
 
+/** Skipped answers -> what gets written (lib/form-values storedFieldValue):
+ *  a blank column select is NULL, a blank custom field is dropped from
+ *  custom_fields. Runs after normalizeDraft, on create AND on edit, so an
+ *  existing item's blank answer is never turned into a first option. */
+function withSkippedAnswersCleared(draft: DraftLineItem, fields: FormField[]): DraftLineItem {
+  let customFields = { ...(draft.customFields ?? {}) }
+  let next = draft
+  for (const field of fields) {
+    const stored = storedFieldValue(field, getFieldValue(next, field))
+    if (field.storage === 'custom') {
+      if (stored === undefined) {
+        const { [field.key]: _omit, ...rest } = customFields
+        void _omit
+        customFields = rest
+      }
+      continue
+    }
+    if (stored !== getFieldValue(next, field)) next = setFieldValue(next, field, stored)
+  }
+  return { ...next, customFields }
+}
+
+function prepareForSave(draft: DraftLineItem, fields: FormField[]): DraftLineItem {
+  return withSkippedAnswersCleared(normalizeDraft(draft, fields), fields)
+}
+
 /** M-23: names what a line-item delete takes with it. The FK on
  *  chunk_project_items cascades, so the item also leaves every package. */
 function deleteConsequence(
@@ -424,17 +439,23 @@ function deleteConsequence(
   return `Delete '${label}'? It is also removed from packages ${inPackages.join(', ')}. This can't be undone.`
 }
 
-function ChoicePills<T extends string>({
+/** Single-choice pills. Nothing is pre-selected; when the field is not
+ *  required, clicking the active pill clears it back to unanswered (''). */
+function ChoicePills({
   options,
   value,
   onChange,
+  required,
+  label,
 }: {
-  options: T[]
-  value: T
-  onChange: (value: T) => void
+  options: string[]
+  value: string
+  onChange: (value: string) => void
+  required: boolean
+  label: string
 }) {
   return (
-    <div className="flex flex-wrap gap-3">
+    <div role="radiogroup" aria-label={label} className="flex flex-wrap gap-3">
       {options.map((option) => {
         const active = option === value
 
@@ -442,7 +463,10 @@ function ChoicePills<T extends string>({
           <button
             key={option}
             type="button"
-            onClick={() => onChange(option)}
+            role="radio"
+            aria-checked={active}
+            onClick={() => onChange(active && !required ? '' : option)}
+            title={active && !required ? 'Click again to clear' : undefined}
             className={`rounded-full px-4 py-2.5 text-sm font-medium transition-all duration-200 ${
               active
                 ? 'bg-black text-white shadow-md'
@@ -545,7 +569,13 @@ function FormFieldControl({
         return (
           <div>
             <p className="mb-3 text-sm font-medium text-gray-700">{field.label}</p>
-            <ChoicePills options={options} value={stringValue} onChange={onChange} />
+            <ChoicePills
+              options={options}
+              value={stringValue}
+              onChange={onChange}
+              required={field.isRequired}
+              label={field.label}
+            />
             {field.helpText ? <p className="mt-2 text-xs text-gray-500">{field.helpText}</p> : null}
           </div>
         )
@@ -553,7 +583,13 @@ function FormFieldControl({
 
       return (
         <div>
-          <SelectField label={field.label} value={stringValue} options={options} onChange={onChange} />
+          <SelectField
+            label={field.label}
+            value={stringValue}
+            options={options}
+            onChange={onChange}
+            required={field.isRequired}
+          />
           {field.helpText ? <p className="mt-1 text-xs text-gray-500">{field.helpText}</p> : null}
         </div>
       )
@@ -615,23 +651,19 @@ function LineItemFields({
         <div className="rounded-[1.75rem] bg-gray-50 p-5">
           <p className="text-sm font-medium text-gray-700">{booleanFields[0].groupLabel || 'Flags'}</p>
           <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-3">
-            {booleanFields.map((field) => {
-              const checked = getValue(field) === true || getValue(field) === 'Yes'
-              return (
-                <div key={field.id}>
-                  <CheckboxCard
-                    label={field.label}
-                    checked={checked}
-                    onChange={(next) =>
-                      onChange(field, field.storage === 'column' ? (next ? 'Yes' : 'No') : next)
-                    }
-                  />
-                  {field.helpText ? (
-                    <p className="mt-1 px-1 text-xs text-gray-500">{field.helpText}</p>
-                  ) : null}
-                </div>
-              )
-            })}
+            {booleanFields.map((field) => (
+              <div key={field.id}>
+                <YesNoChoice
+                  label={field.label}
+                  value={readYesNo(getValue(field))}
+                  required={field.isRequired}
+                  onChange={(answer) => onChange(field, writeYesNo(field, answer))}
+                />
+                {field.helpText ? (
+                  <p className="mt-1 px-1 text-xs text-gray-500">{field.helpText}</p>
+                ) : null}
+              </div>
+            ))}
           </div>
         </div>
       ) : null}
@@ -689,6 +721,7 @@ export default function AddDataTab({ project, user, permissions }: Props) {
   )
 
   const visibleFields = useMemo(() => visibleFormFields(fields), [fields])
+  const categoryField = useMemo(() => fields.find((f) => f.key === 'category'), [fields])
   const steps = useMemo(() => groupIntoSteps(visibleFields), [visibleFields])
 
   // Empty rather than crashing: an unseeded project (getFormFieldsForProject
@@ -757,6 +790,7 @@ export default function AddDataTab({ project, user, permissions }: Props) {
   }
 
   function closeCreateFlow() {
+    setExpandedId(null)
     setIsCreating(false)
   }
 
@@ -845,14 +879,12 @@ export default function AddDataTab({ project, user, permissions }: Props) {
     setActionError(null)
     setIsSavingNew(true)
     try {
-      const created = await createLineItem(draftForCreate(normalizeDraft(draft, fields)))
+      await createLineItem(draftForCreate(prepareForSave(draft, fields)))
       if (!isMountedRef.current) return
       reloadLineItems()
-      setExpandedId(created.id)
-      setEditingDrafts((prev) => ({
-        ...prev,
-        [created.id]: makeEditableDraft(created),
-      }))
+      // The new item lands in the list COLLAPSED; the person opens it if they
+      // want the details. (It used to auto-expand.)
+      setExpandedId(null)
       setIsCreating(false)
     } catch (err) {
       if (!isMountedRef.current) return
@@ -925,7 +957,7 @@ export default function AddDataTab({ project, user, permissions }: Props) {
     try {
       const updated = await updateLineItem(
         lineItemId,
-        draftForUpdate(normalizeDraft(currentDraft, fields))
+        draftForUpdate(prepareForSave(currentDraft, fields))
       )
       if (!updated) return
       if (!isMountedRef.current) return
@@ -948,13 +980,8 @@ export default function AddDataTab({ project, user, permissions }: Props) {
   return (
     <>
       <div className="space-y-6">
-        <div className="flex flex-col gap-4 rounded-[1.75rem] border border-slate-200 bg-white/86 p-5 shadow-sm md:flex-row md:items-center md:justify-between">
-          <div>
-            <h2 className="text-xl font-semibold tracking-tight text-slate-950">Line Items</h2>
-            <p className="mt-1 text-sm text-slate-500">
-              Add new scope items, then expand any row to edit details directly.
-            </p>
-          </div>
+        <div className="flex items-center justify-between gap-4">
+          <h2 className="text-xl font-semibold tracking-tight text-slate-950">Add new scope items</h2>
 
           <button
             type="button"
@@ -982,13 +1009,8 @@ export default function AddDataTab({ project, user, permissions }: Props) {
         {lineItems.length === 0 ? (
           <div className="rounded-[2rem] border border-dashed border-gray-300 bg-white p-12 text-center">
             <h4 className="text-lg font-semibold text-gray-900">
-              {lineItemsLoading ? 'Loading line items…' : 'No line items yet'}
+              {lineItemsLoading ? 'Loading…' : 'No line items yet'}
             </h4>
-            <p className="mt-2 text-sm text-gray-500">
-              {lineItemsLoading
-                ? 'Fetching your line items.'
-                : 'Start your list with a guided entry.'}
-            </p>
           </div>
         ) : (
           <div className="space-y-4">
@@ -1030,7 +1052,13 @@ export default function AddDataTab({ project, user, permissions }: Props) {
                       </div>
 
                       <div className="text-right">
-                        <div className="text-xs text-gray-400">{item.category}</div>
+                        <div className="text-xs text-gray-400">
+                          {categoryField
+                            ? formatFieldValue(categoryField, getItemFieldValue(item, categoryField), {
+                                empty: EMPTY_FIELD_TEXT,
+                              })
+                            : item.category || EMPTY_FIELD_TEXT}
+                        </div>
                         <div className="mt-2 text-sm text-gray-500">
                           {expanded ? 'Hide details' : 'View details'}
                         </div>
@@ -1430,31 +1458,110 @@ function TextAreaField({
   )
 }
 
-function SelectField<T extends string>({
+/**
+ * Native select with an UNSELECTED placeholder state. Without the
+ * placeholder, a blank value made the browser display the first option,
+ * which read as an answer that was never given. The placeholder is disabled
+ * and hidden so it is not a choosable option; an optional field gets a
+ * "Clear" button instead to go back to unanswered.
+ */
+function SelectField({
   label,
   value,
   options,
   onChange,
+  required,
 }: {
   label: string
-  value: T
-  options: T[]
-  onChange: (value: T) => void
+  value: string
+  options: string[]
+  onChange: (value: string) => void
+  required: boolean
 }) {
+  const selectId = useId()
   return (
     <div>
-      <label className="mb-2 block text-sm font-medium text-gray-700">{label}</label>
+      <div className="mb-2 flex items-center justify-between gap-2">
+        <label htmlFor={selectId} className="block text-sm font-medium text-gray-700">
+          {label}
+        </label>
+        {!required && value !== '' ? (
+          <button
+            type="button"
+            onClick={() => onChange('')}
+            aria-label={`Clear ${label}`}
+            className="text-xs text-gray-500 underline-offset-2 hover:text-gray-900 hover:underline"
+          >
+            Clear
+          </button>
+        ) : null}
+      </div>
       <select
+        id={selectId}
         value={value}
-        onChange={(e) => onChange(e.target.value as T)}
-        className="w-full rounded-2xl border border-gray-200 bg-white px-4 py-3 text-sm outline-none transition focus:border-black"
+        required={required}
+        onChange={(e) => onChange(e.target.value)}
+        className={`w-full rounded-2xl border border-gray-200 bg-white px-4 py-3 text-sm outline-none transition focus:border-black ${
+          value === '' ? 'text-gray-400' : 'text-gray-900'
+        }`}
       >
+        <option value="" disabled hidden>
+          Select…
+        </option>
         {options.map((option) => (
-          <option key={option} value={option}>
+          <option key={option} value={option} className="text-gray-900">
             {option}
           </option>
         ))}
       </select>
+    </div>
+  )
+}
+
+/**
+ * A Yes/No question as two radio buttons with nothing preselected (0023):
+ * unanswered is its own state, not "No". Clicking the chosen answer again
+ * clears it when the question is optional.
+ */
+function YesNoChoice({
+  label,
+  value,
+  required,
+  onChange,
+}: {
+  label: string
+  value: boolean | null
+  required: boolean
+  onChange: (value: boolean | null) => void
+}) {
+  return (
+    <div className="flex items-center justify-between gap-3 rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-700">
+      <span>
+        {label}
+        {required ? <span className="text-red-600"> *</span> : null}
+      </span>
+      <div role="radiogroup" aria-label={label} className="flex shrink-0 gap-1">
+        {([true, false] as const).map((answer) => {
+          const active = value === answer
+          return (
+            <button
+              key={String(answer)}
+              type="button"
+              role="radio"
+              aria-checked={active}
+              onClick={() => onChange(active && !required ? null : answer)}
+              title={active && !required ? 'Click again to clear' : undefined}
+              className={`rounded-full px-3 py-1 text-xs font-medium transition ${
+                active
+                  ? 'bg-black text-white'
+                  : 'border border-slate-300 bg-white text-slate-700 hover:border-black'
+              }`}
+            >
+              {answer ? 'Yes' : 'No'}
+            </button>
+          )
+        })}
+      </div>
     </div>
   )
 }

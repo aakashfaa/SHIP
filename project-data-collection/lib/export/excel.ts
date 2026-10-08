@@ -19,7 +19,8 @@
  */
 
 import ExcelJS from 'exceljs'
-import type { ProjectReportData, ReportCellValue } from './report-data'
+import type { ProjectReportData } from './report-data'
+import type { ReportCellValue, ReportColumn } from './line-item-cells'
 
 const CURRENCY_FORMAT = '$#,##0'
 const HEADER_FILL: ExcelJS.Fill = {
@@ -218,4 +219,49 @@ export async function buildExcelBuffer(data: ProjectReportData): Promise<Buffer>
   const workbook = buildExcelWorkbook(data)
   const arrayBuffer = await workbook.xlsx.writeBuffer()
   return Buffer.from(arrayBuffer)
+}
+
+/* ------------------------------------------------------- plain table -- */
+
+/**
+ * A single-sheet workbook of exactly what a table view shows: its visible
+ * columns, its current rows in their current order, nothing else (Master
+ * View's "Excel" export). Same flat-values rule as above; built in the
+ * browser, so no Buffer.
+ */
+export type PlainTable = {
+  title: string
+  sheetName: string
+  columns: ReportColumn[]
+  rows: ReportCellValue[][]
+}
+
+export function buildPlainTableWorkbook(table: PlainTable): ExcelJS.Workbook {
+  const workbook = new ExcelJS.Workbook()
+  workbook.creator = 'SHIP'
+  workbook.created = new Date()
+  workbook.title = table.title
+
+  addSheet<ReportCellValue[]>(
+    workbook,
+    // Excel caps sheet names at 31 characters and forbids []:*?/\ in them.
+    table.sheetName.replace(/[[\]:*?/\\]/g, ' ').slice(0, 31) || 'Sheet1',
+    table.columns.map((column, index) => ({
+      header: column.header,
+      width: column.width,
+      currency: column.format === 'currency',
+      value: (row) => row[index] ?? '',
+    })),
+    table.rows,
+    null
+  )
+
+  return workbook
+}
+
+export async function buildPlainTableBlob(table: PlainTable): Promise<Blob> {
+  const buffer = await buildPlainTableWorkbook(table).xlsx.writeBuffer()
+  return new Blob([buffer], {
+    type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  })
 }

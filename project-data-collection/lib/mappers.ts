@@ -109,11 +109,11 @@ export type LineItemRow = {
   relative_operation_cost_impact: string
   relative_operational_energy_usage: string
   electrification_eo594: string
-  addressing_resiliency_sustainability: string
-  addressing_deferred_maintenance: string
-  code_life_safety_improvement: string
-  accessibility_improvement: string
-  historic_impact: string
+  addressing_resiliency_sustainability: string | null
+  addressing_deferred_maintenance: string | null
+  code_life_safety_improvement: string | null
+  accessibility_improvement: string | null
+  historic_impact: string | null
   potential_synergies: string[] | null
   supporting_notes: string | null
   created_at: string

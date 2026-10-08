@@ -2,8 +2,9 @@ import { test, expect, type Page } from '@playwright/test'
 import { settle } from '../helpers/settle'
 
 /**
- * WS-7: form builder reordering (M-18), two-step delete confirms for packages
- * and phases (M-23), and package quantity validation (M-10).
+ * WS-7: form builder reordering (M-18, keyboard path on the drag handle), two-step delete confirm for packages
+ * (M-23; per-package phase editing is gone, phases come from the project
+ * template), and package quantity validation (M-10).
  *
  * These write to the local DB, so each test puts everything back: the reorder
  * test moves a field down and then back up, and the package test creates its
@@ -15,52 +16,77 @@ test.describe.configure({ mode: 'serial' })
 const PROJECT = 'federal-campus-master-plan'
 
 async function fieldOrder(page: Page): Promise<string[]> {
-  // Each field row has "Move <label> up" / "Move <label> down" buttons. Read
-  // the labels off the "up" buttons, in DOM order (option-level buttons only
-  // exist once a field's options are shown, which this test never opens).
+  // In edit mode each question row has a drag handle labelled
+  // "Reorder <label> (arrow keys move it)"; group handles read "Reorder group
+  // ..." and are skipped. Read the labels off the handles, in DOM order.
   const names = await page
-    .getByRole('button', { name: /^Move .+ up$/ })
+    .getByRole('button', { name: /^Reorder (?!group ).+ \(arrow keys move it\)$/ })
     .evaluateAll((els) => els.map((e) => e.getAttribute('aria-label') ?? ''))
-  return names.map((n) => n.replace(/^Move /, '').replace(/ up$/, ''))
+  return names.map((n) => n.replace(/^Reorder /, '').replace(/ \(arrow keys move it\)$/, ''))
 }
 
-test('form builder: field up/down persists and survives a reload', async ({ page }) => {
+function handleFor(page: Page, label: string) {
+  return page.getByRole('button', { name: `Reorder ${label} (arrow keys move it)`, exact: true })
+}
+
+async function openEditMode(page: Page) {
+  await page.getByRole('button', { name: 'Edit form', exact: true }).click()
+  await expect(page.getByRole('button', { name: 'Done editing', exact: true })).toBeVisible()
+}
+
+test('form builder: field reorder persists and survives a reload', async ({ page }) => {
   await page.goto(`/projects/${PROJECT}?tab=settings`)
   await settle(page)
+  await openEditMode(page)
 
   const before = await fieldOrder(page)
   expect(before.length).toBeGreaterThan(2)
 
-  // Second field of the first group moves above the first.
+  // First field of the first group moves below the second, via the keyboard
+  // path on its drag handle (the same commit a drag makes).
   const [first, second] = before
-  const downOfFirst = page.getByRole('button', { name: `Move ${first} down` })
   try {
-    await downOfFirst.click()
+    await handleFor(page, first).focus()
+    await page.keyboard.press('ArrowDown')
     await expect(page.getByText(/Failed to reorder|violates not-null/i)).toHaveCount(0)
+    // The builder's own error banner (role=alert); Next's route announcer
+    // also carries role=alert and is not an error.
+    await expect(page.locator('[role="alert"]:not(#__next-route-announcer__)')).toHaveCount(0)
     await expect.poll(async () => (await fieldOrder(page)).slice(0, 2)).toEqual([second, first])
 
     await page.reload()
     await settle(page)
+    await openEditMode(page)
     expect((await fieldOrder(page)).slice(0, 2)).toEqual([second, first])
   } finally {
     // Put it back so the seed order is unchanged for every other spec.
-    const upOfFirst = page.getByRole('button', { name: `Move ${first} up` })
-    if (await upOfFirst.isEnabled()) {
-      await upOfFirst.click()
+    const order = await fieldOrder(page)
+    if (order.indexOf(first) === 1 && order[0] === second) {
+      await handleFor(page, first).focus()
+      await page.keyboard.press('ArrowUp')
       await expect.poll(async () => (await fieldOrder(page)).slice(0, 2)).toEqual([first, second])
     }
   }
 })
 
-test('chunking: package and phase deletes need a second click; quantity is validated', async ({
+/**
+ * A package card on the Phasing tab. The `:not(...)` clauses because the
+ * workspace frame (root and box) that holds every tab is overflow-hidden too, and it
+ * contains every card's text.
+ */
+function packageCard(page: Page, name: string) {
+  return page.locator('div.overflow-hidden:not([data-workspace-root]):not([data-workspace-box])', { hasText: name }).first()
+}
+
+test('phasing: a new package gets the project template phases; quantity is validated; delete needs a second click', async ({
   page,
 }) => {
   const name = `WS7 temp ${Date.now()}`
-  await page.goto(`/projects/${PROJECT}?tab=chunking`)
+  await page.goto(`/projects/${PROJECT}?tab=phasing`)
   await settle(page)
 
   async function deleteTempPackageIfAny() {
-    const card = page.locator('div.overflow-hidden', { hasText: name }).first()
+    const card = packageCard(page, name)
     if ((await card.count()) === 0) return
     await card.getByRole('button', { name: 'Delete', exact: true }).click()
     await card.getByRole('button', { name: 'Confirm delete' }).click()
@@ -68,14 +94,18 @@ test('chunking: package and phase deletes need a second click; quantity is valid
   }
 
   try {
-    // Create a package holding one line item.
+    // Create a package holding one line item. No per-package template step:
+    // phases come from the project's one phase template.
     await page.getByRole('button', { name: 'Create Package' }).click()
-    await page.getByPlaceholder('Package name').fill(name)
-    await page.locator('input[type="checkbox"]').first().check()
-    await page.getByRole('button', { name: 'Create', exact: true }).click()
+    const dialog = page.getByRole('dialog', { name: 'New package' })
+    await dialog.getByLabel('Package name').fill(name)
+    await dialog.locator('input[type="checkbox"]').first().check()
+    await expect(dialog.getByText('1 selected')).toBeVisible()
+    await dialog.getByRole('button', { name: 'Create', exact: true }).click()
+    await expect(dialog).toHaveCount(0)
     await expect(page.getByText(name)).toBeVisible()
 
-    const card = page.locator('div.overflow-hidden', { hasText: name }).first()
+    const card = packageCard(page, name)
 
     // --- M-10: quantity validation -------------------------------------
     const qty = card.getByRole('textbox', { name: /^Quantity for / }).first()
@@ -91,33 +121,23 @@ test('chunking: package and phase deletes need a second click; quantity is valid
     await page.waitForTimeout(900)
     await page.reload()
     await settle(page)
-    const reloaded = page.locator('div.overflow-hidden', { hasText: name }).first()
+    const reloaded = packageCard(page, name)
     await expect(
       reloaded.getByRole('textbox', { name: /^Quantity for / }).first()
     ).not.toHaveValue('abc')
 
-    // --- M-23: phase delete confirm ------------------------------------
-    await reloaded.getByRole('button', { name: /^(Edit|Hide|View|Open) package/ }).click()
-    await reloaded.getByRole('button', { name: 'Apply Template' }).click()
-    await expect(reloaded.getByRole('button', { name: /^Delete / }).first()).toBeVisible()
-    const phaseDeletes = reloaded.getByRole('button', { name: /^Delete / })
-    const phaseCount = await phaseDeletes.count()
+    // --- created WITH phases, read-only here ----------------------------
+    const toggle = reloaded.getByRole('button', { name: /^(Edit|Hide|View|Open) package/ })
+    if ((await toggle.getAttribute('aria-label'))?.startsWith('Edit')) await toggle.click()
+    const phaseRows = reloaded.locator('table').last().locator('tbody tr')
+    await expect(phaseRows.first()).toBeVisible()
+    const phaseCount = await phaseRows.count()
     expect(phaseCount).toBeGreaterThan(1)
-
-    await phaseDeletes.first().click()
-    await expect(reloaded.getByText(/Delete this phase\?/)).toBeVisible()
-    await reloaded.getByRole('button', { name: 'Cancel' }).click()
-    await expect(reloaded.getByRole('button', { name: /^Delete / })).toHaveCount(phaseCount)
-
-    await reloaded.getByRole('button', { name: /^Delete / }).first().click()
-    await reloaded.getByRole('button', { name: /^Confirm delete / }).click()
-    await expect(reloaded.getByRole('button', { name: /^Delete / })).toHaveCount(phaseCount - 1)
+    await expect(reloaded.getByRole('button', { name: 'Apply Template' })).toHaveCount(0)
 
     // --- M-23: package delete confirm names the phases -----------------
     await reloaded.getByRole('button', { name: 'Delete', exact: true }).click()
-    await expect(reloaded.getByRole('alertdialog')).toContainText(
-      `${phaseCount - 1} phases`
-    )
+    await expect(reloaded.getByRole('alertdialog')).toContainText(`${phaseCount} phases`)
     await reloaded.getByRole('button', { name: 'Cancel' }).last().click()
     await expect(page.getByText(name)).toBeVisible()
   } finally {

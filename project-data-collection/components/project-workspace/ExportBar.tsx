@@ -1,6 +1,8 @@
 'use client'
 
 import { useState } from 'react'
+import type { PlainTable } from '@/lib/export/excel'
+import { printTable } from '@/lib/export/print-table'
 import type { Project } from '@/lib/types'
 
 /**
@@ -14,12 +16,18 @@ import type { Project } from '@/lib/types'
  * the commercial constraint (R8.3) on what the file may contain.
  *
  * PDF is a plain browser print (`window.print()`), not a server-rendered
- * one — see the `@media print` block appended to app/globals.css. This is
- * the intentional replacement for the `window.open(...).print()` popup
- * hack in MasterViewTab.tsx's `exportMatrixOnly`: printing the page in
- * place, styled by CSS, is what lets a package's bars and the energy chart
+ * one — see the `@media print` block appended to app/globals.css. For the
+ * Timeline that beats a `window.open(...).print()` popup: printing the page
+ * in place, styled by CSS, is what lets a package's bars and the energy chart
  * (colours, gradients, pixel alignment) survive into the PDF instead of
  * being re-flowed into a bare HTML table in a detached window.
+ *
+ * TABLE MODE (`table` prop, Master View): both buttons export exactly the
+ * table the caller hands over -- its visible columns and its current rows in
+ * their current order. Excel is a single plain sheet built in the browser
+ * (lib/export/excel.ts buildPlainTableWorkbook), PDF a print window holding
+ * just that table (lib/export/print-table.ts). No cost model is involved, so
+ * there is no server round trip.
  */
 
 type Props = {
@@ -32,13 +40,26 @@ type Props = {
    */
   scenario?: { id: string; name: string } | null
   className?: string
+  /** Table mode: called at click time for what is on screen right now. */
+  table?: () => PlainTable & { subtitle?: string }
 }
 
 function slugify(value: string) {
   return value.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'project'
 }
 
-export default function ExportBar({ project, scenario = null, className = '' }: Props) {
+function downloadBlob(blob: Blob, fileName: string) {
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = fileName
+  document.body.appendChild(link)
+  link.click()
+  link.remove()
+  URL.revokeObjectURL(url)
+}
+
+export default function ExportBar({ project, scenario = null, className = '', table }: Props) {
   const [isExporting, setIsExporting] = useState(false)
   const [exportError, setExportError] = useState<string | null>(null)
 
@@ -47,6 +68,17 @@ export default function ExportBar({ project, scenario = null, className = '' }: 
     setIsExporting(true)
 
     try {
+      if (table) {
+        // Loaded on click: exceljs is large and most visits never export.
+        const { buildPlainTableBlob } = await import('@/lib/export/excel')
+        const data = table()
+        downloadBlob(
+          await buildPlainTableBlob(data),
+          `${slugify(project.name)}-${slugify(data.sheetName)}.xlsx`
+        )
+        return
+      }
+
       const query = scenario ? `?scenario=${encodeURIComponent(scenario.id)}` : ''
       const response = await fetch(`/api/projects/${encodeURIComponent(project.id)}/export/xlsx${query}`)
 
@@ -61,19 +93,10 @@ export default function ExportBar({ project, scenario = null, className = '' }: 
         throw new Error(message)
       }
 
-      const blob = await response.blob()
-      const url = URL.createObjectURL(blob)
-      const link = document.createElement('a')
       const slug = scenario
         ? `${slugify(project.name)}-scenario-${slugify(scenario.name)}`
         : slugify(project.name)
-
-      link.href = url
-      link.download = `${slug}-export.xlsx`
-      document.body.appendChild(link)
-      link.click()
-      link.remove()
-      URL.revokeObjectURL(url)
+      downloadBlob(await response.blob(), `${slug}-export.xlsx`)
     } catch (error) {
       setExportError(error instanceof Error ? error.message : 'Export failed.')
     } finally {
@@ -82,7 +105,14 @@ export default function ExportBar({ project, scenario = null, className = '' }: 
   }
 
   function handleExportPdf() {
-    window.print()
+    setExportError(null)
+    if (!table) {
+      window.print()
+      return
+    }
+    // Synchronous on purpose: the print window must open inside the click,
+    // or popup blockers stop it.
+    if (!printTable(table())) setExportError('Allow pop-ups for this site to export a PDF.')
   }
 
   return (

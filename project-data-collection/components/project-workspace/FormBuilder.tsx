@@ -1,45 +1,75 @@
 'use client'
 
-import { useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import type { DragEvent, KeyboardEvent } from 'react'
+import { isRemovedField } from '@/lib/form-defaults'
 import {
-  addFieldOption,
-  createFormField,
   deleteFormField,
-  reorderFieldOptions,
+  removeBuiltinFormField,
   reorderFormFields,
-  setFieldOptionArchived,
   updateFormField,
 } from '@/lib/store'
-import type { FormField, FormFieldInputType } from '@/lib/types'
+import type { FormField } from '@/lib/types'
+import AddQuestionsModal from './form-builder/AddQuestionsModal'
+import EditFieldModal from './form-builder/EditFieldModal'
+import FieldRow from './form-builder/FieldRow'
+import GroupNameModal from './form-builder/GroupNameModal'
+import {
+  CheckIcon,
+  GripIcon,
+  IconButton,
+  PencilIcon,
+  PlusIcon,
+  TrashIcon,
+  groupDisplayName,
+  groupKeyOf,
+} from './form-builder/shared'
 
 /**
- * Editor for a project's line-item FORM (migration 0012), replacing the
- * vocabulary editor this project used to have.
+ * Editor for a project's line-item FORM (migration 0012) -- the "Input form"
+ * column of Settings.
  *
  * The client's own words: "instead of vocabulary like that, can we make it
  * such that they can create a form with the different input types and then
  * the different options? ... don't call it a vocabulary, just call it a
- * form creation." That reframes the whole screen: this used to be four lists
- * of dropdown VALUES for a fixed set of questions. Now the questions
- * themselves — their labels, types, order and grouping — are the thing being
- * edited, and options are just a property a field has when its type calls
- * for one.
+ * form creation." The questions themselves -- labels, types, order and
+ * grouping -- are what is edited here; options are a property a question
+ * has when its type calls for one.
  *
- * TWO KINDS OF FIELD (see the migration's header for the full rationale):
- *   - built-in (`isBuiltin`): backed by a real `line_items` column that other
- *     code reads by name (ecc_amount from estimated_first_cost, the energy
- *     chart from annual_energy_savings, numbering from discipline). Label,
- *     help text, grouping, order, required and hidden are all fair game.
- *     The key, input type and existence of the row are not — the database
- *     enforces that with `ship.guard_form_field`, and this editor mirrors
- *     the restriction in the UI rather than showing a control that would
- *     only fail on save.
- *   - custom (`!isBuiltin`): lives in `LineItem.customFields`. Fully
- *     editable, retypeable and deletable.
+ * COMPACT UNTIL EDITED. The list shows each question's label, input type and
+ * status pills, nothing else. A chevron opens a dropdown's options. The
+ * header's edit button switches on edit mode: drag handles, clickable pills,
+ * per-row edit (a popup) and remove. Adding is a popup that takes several
+ * questions at once.
  *
- * There is no delete for a built-in — Hide is presented as ITS delete,
- * because for a built-in that is exactly what it is: the field stops being
- * asked without anything downstream losing the column it depends on.
+ * THREE KINDS OF QUESTION (see lib/form-defaults.ts):
+ *   - Default (`isDefaultField`): name, short description, category,
+ *     timeline priority, annual energy saving. Renameable and movable;
+ *     never hidden or removed.
+ *   - Other column-backed (`isBuiltin`): pre-seeded, backed by a real
+ *     `line_items` column other code reads by name, so `ship.guard_form_field`
+ *     refuses to delete or retype one. "Remove" therefore hides it AND marks
+ *     it removed (`removeBuiltinFormField`); removed ones leave this list.
+ *   - Custom (`!isBuiltin`): lives in `LineItem.customFields`. Retypeable,
+ *     and "Remove" deletes it for real.
+ *
+ * HIDE IS NOT REMOVE (owner's call): any non-default question can be hidden
+ * in place with its Visible/Hidden pill and shown again whenever; Remove
+ * (always behind a confirm) takes it out of the form for good.
+ *
+ * ORDER. `reorderFormFields` persists one project-wide order (it renumbers
+ * whatever id list it is given 0..n-1), so every move resends every id --
+ * removed questions included, kept in the slots they already occupy. Groups
+ * are the wizard steps (`groupLabel`); dragging a question into another
+ * group rewrites its groupLabel first, then the order.
+ *
+ * GROUPS ARE JUST LABELS. A group exists because some field carries its
+ * `groupLabel`, so an empty one has nothing to persist in. "Add group" (and
+ * a group whose last question was dragged out) is therefore held in this
+ * component's state for the session -- shown at the bottom, ready for a
+ * question to be dragged or added into it -- and becomes real the moment one
+ * is. Renaming a group rewrites `groupLabel` on every field that carries it,
+ * removed ones included, so nothing is left behind under the old name.
  */
 
 type Props = {
@@ -49,734 +79,702 @@ type Props = {
   readOnly?: boolean
 }
 
+type Group = { key: string; fields: FormField[] }
+
+type DragItem = { kind: 'field'; id: string } | { kind: 'group'; key: string }
+type DropTarget =
+  | { kind: 'field'; id: string; after: boolean }
+  | { kind: 'group'; key: string; after: boolean }
+
 /**
- * Selects (and one multiselect) whose values are still `CHECK`-constrained
- * on `ship.line_items` by migration 0001 and were never freed by 0008 the
- * way the four taxonomy columns were — see `ship.default_form_field_options`
- * in migration 0012, which seeds exactly this set and no others. Offering an
- * "Add option" control here would produce a value the database rejects on
- * the very next save, which is worse than not offering it at all.
- *
- * Deliberately not "the four taxonomy dropdowns' opposite" — it is easy to
- * undercount this list (six of these read as "the obvious impact scales"
- * and it's tempting to stop there), so it is checked directly against
- * 0001's CHECK constraints rather than assumed: `electrification_eo594`
- * keeps its own four-value CHECK, and `potential_synergies` (a multiselect)
- * is constrained to the consultant-type array. Reordering and archiving
- * existing options is still fine for all of these — the CHECK constrains
- * the VALUE, not its order or whether it is offered.
+ * A drag shows its result straight away rather than snapping back for the
+ * length of two round trips. Tied to the `fields` array it was computed
+ * from: as soon as the parent hands in a refetched list, that list wins.
  */
-const FIXED_OPTION_SET_KEYS = new Set<string>([
-  'operational_impact',
-  'benefit_to_users',
-  'benefit_to_public',
-  'relative_first_cost',
-  'relative_operation_cost_impact',
-  'relative_operational_energy_usage',
-  'electrification_eo594',
-  'potential_synergies',
-])
-
-const INPUT_TYPE_LABELS: Record<FormFieldInputType, string> = {
-  text: 'Text',
-  textarea: 'Long text',
-  number: 'Number',
-  currency: 'Currency',
-  select: 'Dropdown (single choice)',
-  multiselect: 'Dropdown (multiple choice)',
-  boolean: 'Yes / no',
-  date: 'Date',
+type Optimistic = {
+  base: FormField[]
+  order: string[]
+  groupOverrides: Record<string, string>
 }
 
-const INPUT_TYPES = Object.keys(INPUT_TYPE_LABELS) as FormFieldInputType[]
+type ModalSession = { n: number; open: boolean }
+type GroupModal = ModalSession & ({ mode: 'add' } | { mode: 'rename'; key: string })
 
-function hasOptions(inputType: FormFieldInputType): boolean {
-  return inputType === 'select' || inputType === 'multiselect'
+let sessionCounter = 0
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : 'Something went wrong.'
 }
 
-function Badge({
-  tone,
-  title,
-  children,
-}: {
-  tone: 'builtin' | 'hidden' | 'required'
-  title?: string
-  children: React.ReactNode
-}) {
-  const toneClasses =
-    tone === 'builtin'
-      ? 'bg-slate-950 text-white'
-      : tone === 'hidden'
-        ? 'border border-amber-200 bg-amber-50 text-amber-800'
-        : 'border border-teal-200 bg-teal-50 text-teal-700'
-
-  return (
-    <span
-      title={title}
-      className={`inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide ${toneClasses}`}
-    >
-      {children}
-    </span>
-  )
-}
-
-/** One field's option list: add, archive, restore, reorder. Mirrors
- *  TaxonomyEditor's KindSection, which this supersedes. */
-/** The one-line summary on the collapsed options disclosure. Counts rather
- *  than a generic "Options" label, so a field with no values at all -- which
- *  renders an empty dropdown in Add Data -- is visible without expanding. */
-function optionSummary(field: FormField): string {
-  const active = field.options.filter((o) => !o.isArchived).length
-  const archived = field.options.length - active
-
-  if (active === 0 && archived === 0) return 'No options yet'
-  const base = `${active} option${active === 1 ? '' : 's'}`
-  return archived > 0 ? `${base}, ${archived} archived` : base
-}
-
-function OptionsEditor({
-  field,
-  onChanged,
-}: {
-  field: FormField
-  onChanged: () => void
-}) {
-  const [draft, setDraft] = useState('')
-  const [busy, setBusy] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-  const [showArchived, setShowArchived] = useState(false)
-
-  const active = useMemo(
-    () => field.options.filter((o) => !o.isArchived).sort((a, b) => a.sortOrder - b.sortOrder),
-    [field.options]
-  )
-  const archived = useMemo(
-    () => field.options.filter((o) => o.isArchived).sort((a, b) => a.sortOrder - b.sortOrder),
-    [field.options]
-  )
-  const fixedSet = FIXED_OPTION_SET_KEYS.has(field.key)
-
-  async function run(action: () => Promise<unknown>, refetchOnError = false) {
-    setBusy(true)
-    setError(null)
-    try {
-      await action()
-      onChanged()
-    } catch (err) {
-      // A failed reorder leaves the list on screen out of step with the
-      // database (or with whoever else is editing), so reorders re-fetch.
-      if (refetchOnError) onChanged()
-      // Verbatim: `ship.form_field_options` errors and the client-side
-      // blank check below are both meant to be read, not paraphrased.
-      setError(err instanceof Error ? err.message : 'Something went wrong.')
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  async function handleAdd() {
-    const value = draft.trim()
-    if (value === '') return
-
-    const existing = active.find((o) => o.value.toLowerCase() === value.toLowerCase())
-    if (!existing) {
-      const archivedMatch = archived.find((o) => o.value.toLowerCase() === value.toLowerCase())
-      if (archivedMatch) {
-        await run(() => setFieldOptionArchived(archivedMatch.id, false))
-        setDraft('')
-        return
-      }
-      await run(async () => {
-        await addFieldOption(field.id, value)
-        setDraft('')
-      })
-      return
-    }
-    setError(`"${value}" is already an option on this field.`)
-  }
-
-  function move(index: number, direction: -1 | 1) {
-    const next = [...active]
-    const target = index + direction
-    if (target < 0 || target >= next.length) return
-    ;[next[index], next[target]] = [next[target], next[index]]
-
-    // The full ordered id list (active in their new order, then archived),
-    // which the reorder RPC renumbers 0..n-1 in one statement.
-    void run(
-      () =>
-        reorderFieldOptions(field.id, [...next.map((o) => o.id), ...archived.map((o) => o.id)]),
-      true
-    )
-  }
-
-  return (
-    <div className="mt-3 rounded-[1rem] border border-dashed border-slate-200 bg-slate-50/60 p-3">
-      <div className="flex items-center justify-between gap-2">
-        <span className="text-[11px] font-medium text-slate-500">
-          Options ({active.length})
-        </span>
-      </div>
-
-      {error ? (
-        <div className="mt-2 rounded-[0.85rem] border border-rose-200 bg-rose-50 px-3 py-1.5 text-[11px] text-rose-700">
-          {error}
-        </div>
-      ) : null}
-
-      <ul className="mt-2 space-y-1.5">
-        {active.length === 0 ? (
-          <li className="rounded-[0.85rem] border border-dashed border-slate-200 px-3 py-3 text-center text-[11px] text-slate-400">
-            No options yet. This dropdown has nothing to offer.
-          </li>
-        ) : (
-          active.map((option, index) => (
-            <li
-              key={option.id}
-              className="flex items-center gap-2 rounded-[0.85rem] border border-slate-200 bg-white px-2.5 py-1.5"
-            >
-              <span className="min-w-0 flex-1 truncate text-[12px] text-slate-800">
-                {option.label}
-              </span>
-              <button
-                type="button"
-                onClick={() => move(index, -1)}
-                disabled={busy || index === 0}
-                aria-label={`Move ${option.label} up`}
-                className="rounded-[0.6rem] border border-slate-200 px-1.5 py-0.5 text-[11px] text-slate-600 disabled:opacity-30"
-              >
-                ↑
-              </button>
-              <button
-                type="button"
-                onClick={() => move(index, 1)}
-                disabled={busy || index === active.length - 1}
-                aria-label={`Move ${option.label} down`}
-                className="rounded-[0.6rem] border border-slate-200 px-1.5 py-0.5 text-[11px] text-slate-600 disabled:opacity-30"
-              >
-                ↓
-              </button>
-              <button
-                type="button"
-                onClick={() => void run(() => setFieldOptionArchived(option.id, true))}
-                disabled={busy}
-                title="Stops offering this value on new line items. Existing line items keep it."
-                className="rounded-[0.6rem] border border-slate-200 px-2 py-0.5 text-[11px] font-medium text-slate-600 hover:border-slate-300 disabled:opacity-40"
-              >
-                Archive
-              </button>
-            </li>
-          ))
-        )}
-      </ul>
-
-      {fixedSet ? (
-        <p className="mt-2 text-[11px] leading-snug text-slate-400">
-          This dropdown&apos;s values are fixed by a database constraint and can&apos;t take new
-          entries — reorder or archive the ones above, but adding one here would only fail on
-          save.
-        </p>
-      ) : (
-        <div className="mt-2 flex gap-1.5">
-          <input
-            value={draft}
-            onChange={(e) => setDraft(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') {
-                e.preventDefault()
-                void handleAdd()
-              }
-            }}
-            placeholder="Add an option"
-            aria-label={`Add an option to ${field.label}`}
-            className="min-w-0 flex-1 rounded-[0.7rem] border border-slate-200 bg-white px-2.5 py-1.5 text-[12px] outline-none transition focus:border-teal-500 focus:ring-2 focus:ring-teal-100"
-          />
-          <button
-            type="button"
-            onClick={() => void handleAdd()}
-            disabled={busy || draft.trim() === ''}
-            className="rounded-[0.7rem] bg-slate-950 px-3 py-1.5 text-[12px] font-medium text-white disabled:opacity-40"
-          >
-            Add
-          </button>
-        </div>
-      )}
-
-      {archived.length > 0 ? (
-        <div className="mt-2 border-t border-slate-200 pt-2">
-          <button
-            type="button"
-            onClick={() => setShowArchived((v) => !v)}
-            className="text-[11px] font-medium text-slate-500 underline underline-offset-2"
-          >
-            {showArchived ? 'Hide' : 'Show'} {archived.length} archived
-          </button>
-
-          {showArchived ? (
-            <ul className="mt-1.5 space-y-1.5">
-              {archived.map((option) => (
-                <li
-                  key={option.id}
-                  className="flex items-center gap-2 rounded-[0.85rem] border border-dashed border-slate-200 bg-white px-2.5 py-1.5"
-                >
-                  <span className="min-w-0 flex-1 truncate text-[12px] text-slate-500 line-through">
-                    {option.label}
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => void run(() => setFieldOptionArchived(option.id, false))}
-                    disabled={busy}
-                    className="rounded-[0.6rem] border border-slate-200 bg-white px-2 py-0.5 text-[11px] font-medium text-slate-600 disabled:opacity-40"
-                  >
-                    Restore
-                  </button>
-                </li>
-              ))}
-            </ul>
-          ) : null}
-        </div>
-      ) : null}
-    </div>
-  )
-}
-
-function FieldRow({
-  field,
-  onChanged,
-  canMoveUp,
-  canMoveDown,
-  onMove,
-}: {
-  field: FormField
-  onChanged: () => void
-  canMoveUp: boolean
-  canMoveDown: boolean
-  onMove: (direction: -1 | 1) => Promise<void>
-}) {
-  const [label, setLabel] = useState(field.label)
-  const [helpText, setHelpText] = useState(field.helpText)
-  const [busy, setBusy] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-  // Two-step inline confirm rather than window.confirm(). A native dialog
-  // blocks the whole page until it is dismissed, which freezes any browser
-  // automation that reaches it, and nothing else in this app uses one.
-  const [confirmingDelete, setConfirmingDelete] = useState(false)
-
-  async function run(action: () => Promise<unknown>) {
-    setBusy(true)
-    setError(null)
-    try {
-      await action()
-      onChanged()
-    } catch (err) {
-      // `ship.guard_form_field` names the field and says "Hide it instead" --
-      // that is more useful than anything this component could invent, so it
-      // is shown exactly as thrown rather than replaced.
-      setError(err instanceof Error ? err.message : 'Something went wrong.')
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  function saveLabel() {
-    const trimmed = label.trim()
-    if (trimmed === field.label) return
-    if (trimmed === '') {
-      setError('Label cannot be blank.')
-      setLabel(field.label)
-      return
-    }
-    void run(() => updateFormField(field.id, { label: trimmed }))
-  }
-
-  function saveHelpText() {
-    if (helpText === field.helpText) return
-    void run(() => updateFormField(field.id, { helpText }))
-  }
-
-  return (
-    <li className="rounded-[1rem] border border-slate-200 bg-white p-3">
-      <div className="flex flex-wrap items-center gap-2">
-        <div className="flex min-w-0 flex-1 items-center gap-2">
-          <span className="min-w-0 truncate text-sm font-medium text-slate-900">
-            {field.label}
-          </span>
-          <span className="shrink-0 font-mono text-[11px] text-slate-400">{field.key}</span>
-        </div>
-
-        {field.isBuiltin ? (
-          <Badge
-            tone="builtin"
-            title={`Built-in — maps to the "${field.key}" column, which the cost and energy engines read. It can be relabelled, reordered and hidden, but not deleted or retyped.`}
-          >
-            Built-in
-          </Badge>
-        ) : null}
-        {field.isHidden ? <Badge tone="hidden">Hidden</Badge> : null}
-        {field.isRequired ? <Badge tone="required">Required</Badge> : null}
-
-        <div className="flex shrink-0 items-center gap-1">
-          <button
-            type="button"
-            onClick={() => void run(() => onMove(-1))}
-            disabled={busy || !canMoveUp}
-            aria-label={`Move ${field.label} up`}
-            className="rounded-[0.7rem] border border-slate-200 px-2 py-1 text-xs text-slate-600 disabled:opacity-30"
-          >
-            ↑
-          </button>
-          <button
-            type="button"
-            onClick={() => void run(() => onMove(1))}
-            disabled={busy || !canMoveDown}
-            aria-label={`Move ${field.label} down`}
-            className="rounded-[0.7rem] border border-slate-200 px-2 py-1 text-xs text-slate-600 disabled:opacity-30"
-          >
-            ↓
-          </button>
-          <button
-            type="button"
-            onClick={() => void run(() => updateFormField(field.id, { isRequired: !field.isRequired }))}
-            disabled={busy}
-            className={`rounded-[0.7rem] border px-2.5 py-1 text-xs font-medium disabled:opacity-40 ${
-              field.isRequired
-                ? 'border-teal-200 bg-teal-50 text-teal-700'
-                : 'border-slate-200 text-slate-600 hover:border-slate-300'
-            }`}
-          >
-            {field.isRequired ? 'Required' : 'Optional'}
-          </button>
-          <button
-            type="button"
-            onClick={() => void run(() => updateFormField(field.id, { isHidden: !field.isHidden }))}
-            disabled={busy}
-            title={
-              field.isBuiltin
-                ? 'Stops asking this question without touching the column downstream code reads. This is a built-in\'s equivalent of deleting it.'
-                : 'Stops asking this question. The field and any values already recorded are kept, so it can be brought back later.'
-            }
-            className={`rounded-[0.7rem] border px-2.5 py-1 text-xs font-medium disabled:opacity-40 ${
-              field.isBuiltin && !field.isHidden
-                ? 'border-slate-950 bg-slate-950 text-white hover:opacity-90'
-                : 'border-slate-200 text-slate-600 hover:border-slate-300'
-            }`}
-          >
-            {field.isHidden ? 'Unhide' : 'Hide'}
-          </button>
-          {!field.isBuiltin ? (
-            confirmingDelete ? (
-              <>
-                <button
-                  type="button"
-                  onClick={() => void run(() => deleteFormField(field.id))}
-                  disabled={busy}
-                  className="rounded-[0.7rem] border border-rose-300 bg-rose-600 px-2.5 py-1 text-xs font-medium text-white hover:bg-rose-700 disabled:opacity-40"
-                >
-                  {busy ? 'Deleting…' : 'Confirm delete'}
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setConfirmingDelete(false)}
-                  disabled={busy}
-                  className="rounded-[0.7rem] border border-slate-200 px-2.5 py-1 text-xs font-medium text-slate-600 hover:border-slate-300 disabled:opacity-40"
-                >
-                  Cancel
-                </button>
-              </>
-            ) : (
-              <button
-                type="button"
-                onClick={() => setConfirmingDelete(true)}
-                disabled={busy}
-                title={`Removes "${field.label}" from the form. Values already recorded against it stay in the database but stop being shown.`}
-                className="rounded-[0.7rem] border border-rose-200 bg-white px-2.5 py-1 text-xs font-medium text-rose-600 hover:bg-rose-50 disabled:opacity-40"
-              >
-                Delete
-              </button>
-            )
-          ) : null}
-        </div>
-      </div>
-
-      {error ? (
-        <div className="mt-2 rounded-[0.85rem] border border-rose-200 bg-rose-50 px-3 py-1.5 text-[12px] text-rose-700">
-          {error}
-        </div>
-      ) : null}
-
-      <div className="mt-2.5 grid gap-2 sm:grid-cols-[1fr_1fr_auto]">
-        <input
-          value={label}
-          onChange={(e) => setLabel(e.target.value)}
-          onBlur={saveLabel}
-          aria-label={`Label for ${field.key}`}
-          className="min-w-0 rounded-[0.7rem] border border-slate-200 bg-white px-2.5 py-1.5 text-[12px] outline-none transition focus:border-teal-500 focus:ring-2 focus:ring-teal-100"
-        />
-        <input
-          value={helpText}
-          onChange={(e) => setHelpText(e.target.value)}
-          onBlur={saveHelpText}
-          placeholder="Help text shown under the question (optional)"
-          aria-label={`Help text for ${field.key}`}
-          className="min-w-0 rounded-[0.7rem] border border-slate-200 bg-white px-2.5 py-1.5 text-[12px] outline-none transition focus:border-teal-500 focus:ring-2 focus:ring-teal-100"
-        />
-        {field.isBuiltin ? (
-          <span className="flex items-center rounded-[0.7rem] bg-slate-100 px-2.5 py-1.5 text-[12px] text-slate-500">
-            {INPUT_TYPE_LABELS[field.inputType]}
-          </span>
-        ) : (
-          <select
-            value={field.inputType}
-            onChange={(e) =>
-              void run(() =>
-                updateFormField(field.id, { inputType: e.target.value as FormFieldInputType })
-              )
-            }
-            disabled={busy}
-            aria-label={`Input type for ${field.key}`}
-            className="rounded-[0.7rem] border border-slate-200 bg-white px-2.5 py-1.5 text-[12px] outline-none transition focus:border-teal-500 focus:ring-2 focus:ring-teal-100 disabled:opacity-40"
-          >
-            {INPUT_TYPES.map((type) => (
-              <option key={type} value={type}>
-                {INPUT_TYPE_LABELS[type]}
-              </option>
-            ))}
-          </select>
-        )}
-      </div>
-
-      {/*
-        Collapsed by default. Expanded, 26 fields with every dropdown's values
-        listed inline made this page ~10,000px tall -- the building-level
-        field alone has 13 options and the synergies field has 14. A settings
-        screen you have to scroll for a minute to audit is one nobody audits.
-        The summary line carries the count so the shape of a field is still
-        legible without opening it.
-      */}
-      {hasOptions(field.inputType) ? (
-        <details className="mt-2 group">
-          <summary className="cursor-pointer list-none text-[11px] font-medium text-slate-500 hover:text-slate-700">
-            <span className="group-open:hidden">▸ </span>
-            <span className="hidden group-open:inline">▾ </span>
-            {optionSummary(field)}
-          </summary>
-          <OptionsEditor field={field} onChanged={onChanged} />
-        </details>
-      ) : null}
-    </li>
-  )
-}
-
-/** Draft state for the "add a field" control at the foot of the list. */
-function AddFieldControl({
-  projectId,
-  groupSuggestions,
-  onChanged,
-}: {
-  projectId: string
-  groupSuggestions: string[]
-  onChanged: () => void
-}) {
-  const [label, setLabel] = useState('')
-  const [inputType, setInputType] = useState<FormFieldInputType>('text')
-  const [groupLabel, setGroupLabel] = useState('')
-  const [busy, setBusy] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-
-  async function handleAdd() {
-    const trimmed = label.trim()
-    if (trimmed === '') return
-
-    setBusy(true)
-    setError(null)
-    try {
-      await createFormField(projectId, {
-        label: trimmed,
-        inputType,
-        groupLabel: groupLabel.trim(),
-      })
-      setLabel('')
-      setGroupLabel('')
-      setInputType('text')
-      onChanged()
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Something went wrong.')
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  return (
-    <div className="rounded-[1.5rem] border border-dashed border-slate-300 bg-white/60 p-5">
-      <div className="text-sm font-semibold text-slate-950">Add a field</div>
-      <p className="mt-1 text-[12px] text-slate-500">
-        Creates a fully custom field — its type, label and options are yours to change or remove
-        later. Options (if the type needs them) are added below once the field exists.
-      </p>
-
-      {error ? (
-        <div className="mt-3 rounded-[1rem] border border-rose-200 bg-rose-50 px-3 py-2 text-[12px] text-rose-700">
-          {error}
-        </div>
-      ) : null}
-
-      <div className="mt-3 grid gap-2 sm:grid-cols-[1.4fr_1fr_1fr_auto]">
-        <input
-          value={label}
-          onChange={(e) => setLabel(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter') {
-              e.preventDefault()
-              void handleAdd()
-            }
-          }}
-          placeholder="Question, e.g. Roof warranty expiry"
-          aria-label="New field label"
-          className="min-w-0 rounded-[0.95rem] border border-slate-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-teal-500 focus:ring-2 focus:ring-teal-100"
-        />
-        <select
-          value={inputType}
-          onChange={(e) => setInputType(e.target.value as FormFieldInputType)}
-          aria-label="New field input type"
-          className="rounded-[0.95rem] border border-slate-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-teal-500 focus:ring-2 focus:ring-teal-100"
-        >
-          {INPUT_TYPES.map((type) => (
-            <option key={type} value={type}>
-              {INPUT_TYPE_LABELS[type]}
-            </option>
-          ))}
-        </select>
-        <input
-          value={groupLabel}
-          onChange={(e) => setGroupLabel(e.target.value)}
-          list="form-builder-group-suggestions"
-          placeholder="Group (e.g. Cost and energy)"
-          aria-label="New field group"
-          className="min-w-0 rounded-[0.95rem] border border-slate-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-teal-500 focus:ring-2 focus:ring-teal-100"
-        />
-        <button
-          type="button"
-          onClick={() => void handleAdd()}
-          disabled={busy || label.trim() === ''}
-          className="rounded-[0.95rem] bg-slate-950 px-4 py-2 text-sm font-medium text-white transition disabled:opacity-40"
-        >
-          Add field
-        </button>
-      </div>
-
-      <datalist id="form-builder-group-suggestions">
-        {groupSuggestions.map((g) => (
-          <option key={g} value={g} />
-        ))}
-      </datalist>
-    </div>
-  )
+function isAfter(event: DragEvent<HTMLElement>): boolean {
+  const rect = event.currentTarget.getBoundingClientRect()
+  return event.clientY > rect.top + rect.height / 2
 }
 
 export default function FormBuilder({ projectId, fields, onChanged, readOnly = false }: Props) {
-  const sorted = useMemo(() => [...fields].sort((a, b) => a.sortOrder - b.sortOrder), [fields])
+  const [editMode, setEditMode] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [pendingIds, setPendingIds] = useState<ReadonlySet<string>>(new Set())
+  const [reordering, setReordering] = useState(false)
+  const [optimistic, setOptimistic] = useState<Optimistic | null>(null)
+  const [expandedIds, setExpandedIds] = useState<ReadonlySet<string>>(new Set())
+  const [confirmingDeleteId, setConfirmingDeleteId] = useState<string | null>(null)
+  const [drag, setDrag] = useState<DragItem | null>(null)
+  const [dropTarget, setDropTarget] = useState<DropTarget | null>(null)
+  const [editSession, setEditSession] = useState<(ModalSession & { field: FormField }) | null>(
+    null
+  )
+  const [addSession, setAddSession] = useState<(ModalSession & { group: string }) | null>(null)
+  const [groupModal, setGroupModal] = useState<GroupModal | null>(null)
+  // Session-only empty groups (see GROUPS ARE JUST LABELS above).
+  const [emptyGroups, setEmptyGroups] = useState<string[]>([])
+  const refocusHandle = useRef<string | null>(null)
 
-  const groups = useMemo(() => {
+  const editing = editMode && !readOnly
+
+  // ---- derived lists -------------------------------------------------------
+
+  const effective = useMemo(() => {
+    const sorted = [...fields].sort((a, b) => a.sortOrder - b.sortOrder)
+    if (!optimistic || optimistic.base !== fields) return sorted
+    const byId = new Map(sorted.map((f) => [f.id, f]))
+    const ordered = optimistic.order
+      .map((id) => byId.get(id))
+      .filter((f): f is FormField => f !== undefined)
+      .map((f) =>
+        f.id in optimistic.groupOverrides ? { ...f, groupLabel: optimistic.groupOverrides[f.id] } : f
+      )
+    // Anything the optimistic order doesn't know about keeps its place at the end.
+    const known = new Set(optimistic.order)
+    return [...ordered, ...sorted.filter((f) => !known.has(f.id))]
+  }, [fields, optimistic])
+
+  const groups = useMemo<Group[]>(() => {
     const order: string[] = []
-    const byLabel = new Map<string, FormField[]>()
-    for (const field of sorted) {
-      const label = field.groupLabel.trim() === '' ? 'Ungrouped' : field.groupLabel
-      if (!byLabel.has(label)) {
-        order.push(label)
-        byLabel.set(label, [])
+    const byKey = new Map<string, FormField[]>()
+    for (const field of effective) {
+      if (isRemovedField(field)) continue
+      const key = groupKeyOf(field)
+      if (!byKey.has(key)) {
+        order.push(key)
+        byKey.set(key, [])
       }
-      byLabel.get(label)!.push(field)
+      byKey.get(key)!.push(field)
     }
-    return order.map((label) => ({ label, fields: byLabel.get(label)! }))
-  }, [sorted])
+    const persisted = order.map((key) => ({ key, fields: byKey.get(key)! }))
+    const empties = emptyGroups
+      .filter((key) => key !== '' && !byKey.has(key))
+      .map((key) => ({ key, fields: [] as FormField[] }))
+    return [...persisted, ...empties]
+  }, [effective, emptyGroups])
 
+  // Exactly the named groups on screen. A label carried only by REMOVED
+  // fields is invisible, so it is neither suggested nor treated as taken;
+  // reusing it just puts new questions alongside rows nobody can see.
   const groupSuggestions = useMemo(
-    () => groups.map((g) => g.label).filter((label) => label !== 'Ungrouped'),
+    () => groups.map((g) => g.key).filter((key) => key !== ''),
     [groups]
   )
 
-  /**
-   * Moving a field up or down reorders it against its GROUP neighbours, but
-   * `reorderFormFields` persists a single project-wide order (it renumbers
-   * whatever id list it is given 0..n-1) -- so the move swaps the two
-   * fields' positions in the full list and resends everyone's id, the same
-   * way TaxonomyEditor resent archived rows alongside active ones just to
-   * keep them where they were.
-   */
-  async function moveField(groupFields: FormField[], field: FormField, direction: -1 | 1) {
-    const groupIndex = groupFields.findIndex((f) => f.id === field.id)
-    const targetIndex = groupIndex + direction
-    if (targetIndex < 0 || targetIndex >= groupFields.length) return
-    const other = groupFields[targetIndex]
+  // ---- single-field actions ------------------------------------------------
 
-    const next = sorted.map((f) => {
-      if (f.id === field.id) return other
-      if (f.id === other.id) return field
-      return f
-    })
-
+  async function runField(fieldId: string, action: () => Promise<unknown>) {
+    setPendingIds((prev) => new Set(prev).add(fieldId))
+    setError(null)
     try {
-      await reorderFormFields(projectId, next.map((f) => f.id))
-    } catch (err) {
-      // Re-fetch so the list shows what the database really holds, then
-      // rethrow so the row's own error banner shows the message.
+      await action()
       onChanged()
-      throw err
+    } catch (err) {
+      // `ship.guard_form_field` names the field and says why -- that is more
+      // useful than anything this component could invent, so it is shown
+      // exactly as thrown rather than replaced.
+      setError(errorMessage(err))
+    } finally {
+      setPendingIds((prev) => {
+        const next = new Set(prev)
+        next.delete(fieldId)
+        return next
+      })
     }
   }
 
+  async function handleConfirmRemove(field: FormField) {
+    // Column-backed: the database won't delete the row (other code reads the
+    // column), so it is hidden and marked removed instead. Custom: deleted.
+    await runField(field.id, () =>
+      field.isBuiltin ? removeBuiltinFormField(field.id) : deleteFormField(field.id)
+    )
+    setConfirmingDeleteId(null)
+  }
+
+  // ---- reordering ----------------------------------------------------------
+
+  /**
+   * Persist a new arrangement of the LISTED questions. Removed ones keep the
+   * slots they occupy in the project-wide order; the listed ones fill the
+   * remaining slots in their new order.
+   */
+  function commitArrangement(
+    next: Group[],
+    groupChange?: { id: string; groupLabel: string }
+  ): boolean {
+    const listedOrder = next.flatMap((g) => g.fields.map((f) => f.id))
+    const listedSet = new Set(listedOrder)
+    let cursor = 0
+    const fullOrder = effective.map((f) => (listedSet.has(f.id) ? listedOrder[cursor++] : f.id))
+
+    const unchanged = fullOrder.every((id, i) => id === effective[i].id)
+    if (unchanged && !groupChange) return false
+
+    void persistArrangement(fullOrder, groupChange)
+    return true
+  }
+
+  async function persistArrangement(
+    fullOrder: string[],
+    groupChange?: { id: string; groupLabel: string }
+  ) {
+    setOptimistic({
+      base: fields,
+      order: fullOrder,
+      groupOverrides: groupChange ? { [groupChange.id]: groupChange.groupLabel } : {},
+    })
+    setReordering(true)
+    setError(null)
+    try {
+      if (groupChange) {
+        await updateFormField(groupChange.id, { groupLabel: groupChange.groupLabel })
+      }
+      await reorderFormFields(projectId, fullOrder)
+      onChanged()
+    } catch (err) {
+      // Drop the optimistic view and re-fetch so the list shows what the
+      // database really holds, then say why.
+      setOptimistic(null)
+      onChanged()
+      setError(errorMessage(err))
+    } finally {
+      setReordering(false)
+    }
+  }
+
+  /** Move a question into `targetKey`'s group at `index` (counted with the
+   *  question already taken out of its old place). Returns whether anything
+   *  actually moved. */
+  function moveField(fieldId: string, targetKey: string, index: number): boolean {
+    const field = groups.flatMap((g) => g.fields).find((f) => f.id === fieldId)
+    if (!field) return false
+    const next = groups.map((g) => ({ key: g.key, fields: g.fields.filter((f) => f.id !== fieldId) }))
+    const target = next.find((g) => g.key === targetKey)
+    if (!target) return false
+    target.fields.splice(Math.max(0, Math.min(index, target.fields.length)), 0, field)
+
+    const sourceKey = groupKeyOf(field)
+    const changed = sourceKey !== targetKey
+    // A named group whose last question just left stays on screen (empty),
+    // so it can take another question or be deleted deliberately.
+    if (changed && sourceKey !== '' && next.find((g) => g.key === sourceKey)?.fields.length === 0) {
+      setEmptyGroups((prev) => (prev.includes(sourceKey) ? prev : [...prev, sourceKey]))
+    }
+    return commitArrangement(
+      next.filter((g) => g.fields.length > 0),
+      changed ? { id: field.id, groupLabel: targetKey } : undefined
+    )
+  }
+
+  function moveGroup(key: string, targetKey: string, after: boolean): boolean {
+    if (key === targetKey) return false
+    const moving = groups.find((g) => g.key === key)
+    if (!moving) return false
+    const rest = groups.filter((g) => g.key !== key)
+    const index = rest.findIndex((g) => g.key === targetKey)
+    if (index < 0) return false
+    rest.splice(index + (after ? 1 : 0), 0, moving)
+    return commitArrangement(rest)
+  }
+
+  /** Arrow keys on a handle: one step, crossing into the neighbouring group
+   *  at a boundary (which regroups the question, same as dragging it). */
+  function nudgeField(field: FormField, direction: -1 | 1): boolean {
+    const gi = groups.findIndex((g) => g.key === groupKeyOf(field))
+    if (gi < 0) return false
+    const group = groups[gi]
+    const index = group.fields.findIndex((f) => f.id === field.id)
+    const target = index + direction
+    if (target >= 0 && target < group.fields.length) {
+      return moveField(field.id, group.key, target)
+    }
+    const neighbour = groups[gi + direction]
+    if (!neighbour) return false
+    return moveField(field.id, neighbour.key, direction === -1 ? neighbour.fields.length : 0)
+  }
+
+  function nudgeGroup(key: string, direction: -1 | 1): boolean {
+    // Empty groups always sit at the bottom (they have no place in the saved
+    // order yet), so only groups with questions take part.
+    const filled = groups.filter((g) => g.fields.length > 0)
+    const gi = filled.findIndex((g) => g.key === key)
+    const neighbour = filled[gi + direction]
+    if (gi < 0 || !neighbour) return false
+    return moveGroup(key, neighbour.key, direction === 1)
+  }
+
+  // ---- group create / rename / delete --------------------------------------
+
+  async function renameGroup(oldKey: string, newName: string) {
+    const carriers = fields.filter((f) => groupKeyOf(f) === oldKey)
+    try {
+      // One at a time: a partial failure leaves a clear split rather than
+      // an unknown one, and the refetch below shows exactly where it stopped.
+      for (const field of carriers) {
+        await updateFormField(field.id, { groupLabel: newName })
+      }
+    } finally {
+      if (carriers.length > 0) onChanged()
+    }
+    setEmptyGroups((prev) => prev.map((key) => (key === oldKey ? newName : key)))
+  }
+
+  function addGroup(name: string) {
+    setEmptyGroups((prev) => (prev.includes(name) ? prev : [...prev, name]))
+  }
+
+  function deleteEmptyGroup(key: string) {
+    setEmptyGroups((prev) => prev.filter((k) => k !== key))
+  }
+
+  // ---- drag and drop (native HTML5) ----------------------------------------
+
+  function startDrag(event: DragEvent<HTMLElement>, item: DragItem, rowSelector: string) {
+    event.dataTransfer.effectAllowed = 'move'
+    // Firefox won't start a drag without some data on it.
+    event.dataTransfer.setData('text/plain', item.kind === 'field' ? item.id : item.key)
+    const row = event.currentTarget.closest(rowSelector)
+    if (row instanceof HTMLElement) {
+      const rect = row.getBoundingClientRect()
+      event.dataTransfer.setDragImage(row, event.clientX - rect.left, event.clientY - rect.top)
+    }
+    setDrag(item)
+  }
+
+  function endDrag() {
+    setDrag(null)
+    setDropTarget(null)
+  }
+
+  function sameTarget(a: DropTarget | null, b: DropTarget): boolean {
+    if (!a || a.kind !== b.kind || a.after !== b.after) return false
+    return a.kind === 'field' ? a.id === (b as { id: string }).id : a.key === (b as { key: string }).key
+  }
+
+  function overTarget(event: DragEvent<HTMLElement>, target: DropTarget) {
+    event.preventDefault()
+    event.stopPropagation()
+    event.dataTransfer.dropEffect = 'move'
+    if (!sameTarget(dropTarget, target)) setDropTarget(target)
+  }
+
+  function dropOnField(event: DragEvent<HTMLElement>, groupKey: string, fieldId: string) {
+    if (drag?.kind !== 'field') return
+    event.preventDefault()
+    event.stopPropagation()
+    const after = isAfter(event)
+    const draggedId = drag.id
+    endDrag()
+    if (draggedId === fieldId) return
+    const group = groups.find((g) => g.key === groupKey)
+    if (!group) return
+    const withoutDragged = group.fields.filter((f) => f.id !== draggedId)
+    const index = withoutDragged.findIndex((f) => f.id === fieldId)
+    moveField(draggedId, groupKey, index + (after ? 1 : 0))
+  }
+
+  function dropOnGroup(event: DragEvent<HTMLElement>, groupKey: string) {
+    if (!drag) return
+    event.preventDefault()
+    event.stopPropagation()
+    const current = drag
+    const after = isAfter(event)
+    endDrag()
+    if (current.kind === 'group') moveGroup(current.key, groupKey, after)
+    // A question dropped on a group's header goes to the top of that group.
+    else moveField(current.id, groupKey, 0)
+  }
+
+  function handleKeys(
+    event: KeyboardEvent<HTMLElement>,
+    handleId: string,
+    onMove: (direction: -1 | 1) => boolean
+  ) {
+    if (event.key === 'ArrowUp' || event.key === 'ArrowDown') {
+      event.preventDefault()
+      if (reordering) return
+      // A nudge across a group boundary remounts the row under its new
+      // group, which drops focus to <body>; put it back on the same handle.
+      // Armed only when something actually moved -- a no-op (top of the
+      // list, an empty group) leaves focus where it is and must not leave a
+      // stale request that yanks focus out of the next popup opened.
+      refocusHandle.current = onMove(event.key === 'ArrowUp' ? -1 : 1) ? handleId : null
+    }
+  }
+
+  // Runs after every render: if a keyboard nudge asked for it, re-focus the
+  // moved item's handle (found by its data attribute, since it may be a
+  // brand-new element in a different group).
+  useEffect(() => {
+    const id = refocusHandle.current
+    if (id === null) return
+    const handle = document.querySelector<HTMLElement>(
+      `[data-reorder-handle="${CSS.escape(id)}"]`
+    )
+    // Only reclaim focus that was LOST (dropped to <body> by a remount),
+    // never focus the user has since moved somewhere else, such as a popup.
+    const active = document.activeElement
+    if (handle && handle !== active && (active === null || active === document.body)) {
+      handle.focus()
+    }
+    // Keep trying until the save settles: the refetch can remount again.
+    if (!reordering) refocusHandle.current = null
+  })
+
+  // ---- modals --------------------------------------------------------------
+
+  // Stable identities: Modal re-runs its open effect (and re-focuses its
+  // panel, stealing focus from whatever input has it) whenever onClose
+  // changes, so these must not be recreated on every render.
+  const closeEdit = useCallback(
+    () => setEditSession((s) => (s ? { ...s, open: false } : s)),
+    []
+  )
+  const closeAdd = useCallback(() => setAddSession((s) => (s ? { ...s, open: false } : s)), [])
+  const closeGroupModal = useCallback(
+    () => setGroupModal((s) => (s ? { ...s, open: false } : s)),
+    []
+  )
+
+  const liveEditField = editSession
+    ? (fields.find((f) => f.id === editSession.field.id) ?? editSession.field)
+    : null
+
+  // ---- render --------------------------------------------------------------
+
+  const draggable = editing && !reordering
+
   return (
-    <fieldset disabled={readOnly} className="m-0 min-w-0 border-0 p-0 space-y-4">
-      <div>
-        <h3 className="text-lg font-semibold tracking-tight text-slate-950">Line item form</h3>
-        <p className="mt-1 max-w-2xl text-sm text-slate-500">
-          The questions asked when someone on this project adds a line item — their labels,
-          types, order and grouping. This is per project, so a practice that wants to ask
-          something extra, drop a question it never uses, or reorder the wizard does it here
-          instead of filing a change request.
-        </p>
-        <p className="mt-2 max-w-2xl rounded-[1.25rem] border border-slate-200 bg-slate-50 px-4 py-3 text-[12px] leading-snug text-slate-600">
-          <span className="font-medium text-slate-800">Built-in</span> fields map to a real
-          column that the cost and energy engines read — they can be relabelled, reordered,
-          regrouped and hidden, but not deleted or retyped. Hiding one is the built-in
-          equivalent of deleting it: the question stops being asked and nothing downstream loses
-          the column it depends on.
-        </p>
+    // Not a disabled <fieldset> any more: read-only viewers still need the
+    // chevrons. Every control that WRITES is edit-mode only, and edit mode is
+    // unreachable without the header button, which read-only doesn't render.
+    <div className="min-w-0">
+      <div className="flex items-center justify-between gap-3">
+        <h3 className="text-base font-semibold tracking-tight text-slate-950">
+          Consultant input form
+        </h3>
+        {readOnly ? (
+          <span
+            title="Only a project editor or admin can change the form."
+            className="rounded-full border border-amber-200 bg-amber-50 px-2.5 py-0.5 text-[11px] font-medium text-amber-800"
+          >
+            Read-only
+          </span>
+        ) : (
+          <div className="flex items-center gap-1.5">
+            <IconButton
+              label={editMode ? 'Done editing' : 'Edit form'}
+              onClick={() => {
+                setEditMode((v) => !v)
+                setConfirmingDeleteId(null)
+              }}
+              active={editMode}
+            >
+              {editMode ? <CheckIcon /> : <PencilIcon />}
+            </IconButton>
+            <IconButton
+              label="Add questions"
+              onClick={() => setAddSession({ n: ++sessionCounter, open: true, group: '' })}
+            >
+              <PlusIcon />
+            </IconButton>
+          </div>
+        )}
       </div>
 
-      {readOnly ? (
-        <div className="rounded-[1.25rem] border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
-          <span className="font-medium">Read-only.</span> Only a project editor or admin can
-          change the form.
+      {error ? (
+        <div
+          role="alert"
+          className="mt-3 flex items-start justify-between gap-2 rounded-[0.9rem] border border-rose-200 bg-rose-50 px-3 py-2 text-[12px] text-rose-700"
+        >
+          <span>{error}</span>
+          <button
+            type="button"
+            onClick={() => setError(null)}
+            aria-label="Dismiss error"
+            className="shrink-0 font-medium text-rose-500 hover:text-rose-700"
+          >
+            ×
+          </button>
         </div>
       ) : null}
 
-      <div className="space-y-4">
-        {groups.map((group) => (
-          <div key={group.label} className="rounded-[1.5rem] border border-slate-200 bg-white/90 p-5">
-            <div className="text-sm font-semibold text-slate-950">{group.label}</div>
+      {groups.length === 0 ? (
+        <div className="mt-3 rounded-[1rem] border border-dashed border-slate-200 px-4 py-6 text-center text-sm text-slate-400">
+          No questions yet.
+        </div>
+      ) : (
+        <div className="mt-3 space-y-2.5">
+          {groups.map((group) => {
+            const groupDrop =
+              dropTarget?.kind === 'group' && dropTarget.key === group.key ? dropTarget : null
+            const isGroupDrag = drag?.kind === 'group'
+            const isFieldDrag = drag?.kind === 'field'
+            const name = groupDisplayName(group.key)
+            const empty = group.fields.length === 0
+            const groupDraggable = draggable && !empty
+            return (
+              <section
+                key={`g:${group.key}`}
+                data-drag-group
+                aria-label={`Group ${name}`}
+                onDragOver={
+                  isGroupDrag
+                    ? (e) => overTarget(e, { kind: 'group', key: group.key, after: isAfter(e) })
+                    : undefined
+                }
+                onDrop={isGroupDrag ? (e) => dropOnGroup(e, group.key) : undefined}
+                className={`relative rounded-[1.1rem] border p-2 transition ${
+                  drag?.kind === 'group' && drag.key === group.key ? 'opacity-50' : ''
+                } ${
+                  isFieldDrag && groupDrop
+                    ? 'border-teal-300 bg-teal-50/60'
+                    : 'border-slate-200 bg-slate-50/80'
+                }`}
+              >
+                {isGroupDrag && groupDrop ? (
+                  <span
+                    aria-hidden
+                    className={`pointer-events-none absolute inset-x-2 h-0.5 rounded-full bg-teal-500 ${
+                      groupDrop.after ? '-bottom-1.5' : '-top-1.5'
+                    }`}
+                  />
+                ) : null}
 
-            <ul className="mt-3 space-y-2.5">
-              {group.fields.map((field, index) => (
-                <FieldRow
-                  key={field.id}
-                  field={field}
-                  onChanged={onChanged}
-                  canMoveUp={index > 0}
-                  canMoveDown={index < group.fields.length - 1}
-                  onMove={(direction) => moveField(group.fields, field, direction)}
-                />
-              ))}
-            </ul>
-          </div>
-        ))}
-      </div>
+                <div
+                  onDragOver={
+                    isFieldDrag
+                      ? (e) => overTarget(e, { kind: 'group', key: group.key, after: false })
+                      : undefined
+                  }
+                  onDrop={isFieldDrag ? (e) => dropOnGroup(e, group.key) : undefined}
+                  className="flex items-center gap-2 px-1 pb-1.5 pt-0.5"
+                >
+                  {editing ? (
+                    // Rendered for the whole of edit mode (aria-disabled while
+                    // a save is in flight) so the focused handle survives the
+                    // `reordering` flip a keyboard nudge causes.
+                    <div
+                      role="button"
+                      tabIndex={0}
+                      draggable={groupDraggable}
+                      data-reorder-handle={`group:${group.key}`}
+                      onDragStart={(e) => startDrag(e, { kind: 'group', key: group.key }, '[data-drag-group]')}
+                      onDragEnd={endDrag}
+                      onKeyDown={(e) => handleKeys(e, `group:${group.key}`, (d) => nudgeGroup(group.key, d))}
+                      aria-label={`Reorder group ${name} (arrow keys move it)`}
+                      aria-disabled={!groupDraggable}
+                      title={empty ? 'Add a question to place this group' : 'Drag to move this group'}
+                      className={`flex h-5 w-5 shrink-0 items-center justify-center rounded text-slate-400 hover:text-slate-700 ${
+                        groupDraggable ? 'cursor-grab active:cursor-grabbing' : 'cursor-default opacity-40'
+                      }`}
+                    >
+                      <GripIcon />
+                    </div>
+                  ) : null}
+                  <span className="min-w-0 truncate text-[13px] font-semibold text-slate-800">
+                    {name}
+                  </span>
+                  <span className="shrink-0 rounded-full border border-slate-200 bg-white px-1.5 text-[10px] font-medium text-slate-500">
+                    {group.fields.length}
+                  </span>
+                  <span className="flex-1" />
+                  {editing ? (
+                    <>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setAddSession({ n: ++sessionCounter, open: true, group: group.key })
+                        }
+                        aria-label={`Add question to ${name}`}
+                        className="inline-flex shrink-0 items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-medium text-slate-500 transition hover:bg-white hover:text-slate-900"
+                      >
+                        <PlusIcon /> Question
+                      </button>
+                      <IconButton
+                        label={`Rename group ${name}`}
+                        onClick={() =>
+                          setGroupModal({
+                            n: ++sessionCounter,
+                            open: true,
+                            mode: 'rename',
+                            key: group.key,
+                          })
+                        }
+                        disabled={reordering}
+                      >
+                        <PencilIcon />
+                      </IconButton>
+                      {empty ? (
+                        <IconButton
+                          label={`Delete group ${name}`}
+                          onClick={() => deleteEmptyGroup(group.key)}
+                          tone="danger"
+                        >
+                          <TrashIcon />
+                        </IconButton>
+                      ) : null}
+                    </>
+                  ) : null}
+                </div>
 
-      <AddFieldControl
-        projectId={projectId}
-        groupSuggestions={groupSuggestions}
-        onChanged={onChanged}
-      />
-    </fieldset>
+                <ul className="space-y-1 pl-3">
+                  {empty ? (
+                    <li
+                      data-empty-group-drop
+                      onDragOver={
+                        isFieldDrag
+                          ? (e) => overTarget(e, { kind: 'group', key: group.key, after: false })
+                          : undefined
+                      }
+                      onDrop={isFieldDrag ? (e) => dropOnGroup(e, group.key) : undefined}
+                      className="rounded-[0.8rem] border border-dashed border-slate-300 bg-white/60 px-3 py-3 text-center text-[12px] text-slate-400"
+                    >
+                      Empty group — drag a question here or add one
+                    </li>
+                  ) : null}
+                  {group.fields.map((field) => {
+                    const fieldDrop =
+                      dropTarget?.kind === 'field' && dropTarget.id === field.id ? dropTarget : null
+                    return (
+                      <FieldRow
+                        key={field.id}
+                        field={field}
+                        editMode={editing}
+                        busy={pendingIds.has(field.id) || reordering}
+                        expanded={expandedIds.has(field.id)}
+                        confirmingDelete={confirmingDeleteId === field.id}
+                        dropIndicator={
+                          drag?.kind === 'field' && fieldDrop && drag.id !== field.id
+                            ? fieldDrop.after
+                              ? 'after'
+                              : 'before'
+                            : null
+                        }
+                        handle={
+                          <div
+                            role="button"
+                            tabIndex={0}
+                            draggable={draggable}
+                            data-reorder-handle={`field:${field.id}`}
+                            onDragStart={(e) => startDrag(e, { kind: 'field', id: field.id }, '[data-drag-row]')}
+                            onDragEnd={endDrag}
+                            onKeyDown={(e) => handleKeys(e, `field:${field.id}`, (d) => nudgeField(field, d))}
+                            aria-label={`Reorder ${field.label} (arrow keys move it)`}
+                            aria-disabled={!draggable}
+                            title="Drag to reorder"
+                            className={`flex h-5 w-5 shrink-0 items-center justify-center rounded text-slate-300 hover:text-slate-600 ${
+                              draggable ? 'cursor-grab active:cursor-grabbing' : 'cursor-wait'
+                            } ${drag?.kind === 'field' && drag.id === field.id ? 'text-teal-600' : ''}`}
+                          >
+                            <GripIcon />
+                          </div>
+                        }
+                        onToggleExpand={() =>
+                          setExpandedIds((prev) => {
+                            const next = new Set(prev)
+                            if (next.has(field.id)) next.delete(field.id)
+                            else next.add(field.id)
+                            return next
+                          })
+                        }
+                        onToggleRequired={() =>
+                          void runField(field.id, () =>
+                            updateFormField(field.id, { isRequired: !field.isRequired })
+                          )
+                        }
+                        onToggleHidden={() =>
+                          void runField(field.id, () =>
+                            updateFormField(field.id, { isHidden: !field.isHidden })
+                          )
+                        }
+                        onEdit={() =>
+                          setEditSession({ n: ++sessionCounter, open: true, field })
+                        }
+                        onRemove={() => setConfirmingDeleteId(field.id)}
+                        onConfirmDelete={() => void handleConfirmRemove(field)}
+                        onCancelDelete={() => setConfirmingDeleteId(null)}
+                        onDragOver={(e) => {
+                          if (drag?.kind !== 'field') return
+                          overTarget(e, { kind: 'field', id: field.id, after: isAfter(e) })
+                        }}
+                        onDrop={(e) => dropOnField(e, group.key, field.id)}
+                      />
+                    )
+                  })}
+                </ul>
+              </section>
+            )
+          })}
+        </div>
+      )}
+
+      {editing ? (
+        <button
+          type="button"
+          onClick={() => setGroupModal({ n: ++sessionCounter, open: true, mode: 'add' })}
+          className="mt-2.5 inline-flex w-full items-center justify-center gap-1.5 rounded-[1.1rem] border border-dashed border-slate-300 px-3 py-2 text-[12px] font-medium text-slate-500 transition hover:border-slate-400 hover:text-slate-900"
+        >
+          <PlusIcon /> Add group
+        </button>
+      ) : null}
+
+      {editSession && liveEditField ? (
+        <EditFieldModal
+          key={editSession.n}
+          open={editSession.open}
+          field={liveEditField}
+          groupSuggestions={groupSuggestions}
+          onClose={closeEdit}
+          onChanged={onChanged}
+        />
+      ) : null}
+
+      {addSession ? (
+        <AddQuestionsModal
+          key={addSession.n}
+          open={addSession.open}
+          projectId={projectId}
+          groupSuggestions={groupSuggestions}
+          initialGroup={addSession.group}
+          onClose={closeAdd}
+          onChanged={onChanged}
+        />
+      ) : null}
+
+      {groupModal ? (
+        <GroupNameModal
+          key={groupModal.n}
+          open={groupModal.open}
+          title={groupModal.mode === 'add' ? 'Add group' : 'Rename group'}
+          submitLabel={groupModal.mode === 'add' ? 'Add group' : 'Rename'}
+          initialName={groupModal.mode === 'rename' ? groupModal.key : ''}
+          existingNames={groupSuggestions.filter(
+            (name) => groupModal.mode === 'add' || name !== groupModal.key
+          )}
+          onClose={closeGroupModal}
+          onSubmit={async (name) => {
+            if (groupModal.mode === 'add') addGroup(name)
+            else await renameGroup(groupModal.key, name)
+          }}
+        />
+      ) : null}
+    </div>
   )
 }

@@ -89,13 +89,7 @@ export default function SandboxBar({
         role="status"
         className="flex flex-wrap items-center justify-between gap-3 rounded-[1.25rem] border border-sky-300 bg-sky-50 px-5 py-3"
       >
-        <div>
-          <div className="text-sm font-semibold text-sky-950">Exploring — nothing is saved</div>
-          <p className="mt-0.5 text-xs text-sky-800">
-            Move anything you like. None of it reaches the plan, and it resets when you
-            reload.
-          </p>
-        </div>
+        <div className="text-sm font-semibold text-sky-950">Exploring — nothing is saved</div>
         <button
           type="button"
           onClick={onExit}
@@ -167,8 +161,8 @@ export default function SandboxBar({
             className="mt-3 flex flex-wrap items-center justify-between gap-3 rounded-[1rem] border border-rose-300 bg-rose-50 px-4 py-3"
           >
             <p className="text-sm text-rose-900">
-              Discard <span className="font-semibold">&lsquo;{activeScenario.name}&rsquo;</span>?
-              Every move in it is deleted. This can&apos;t be undone.
+              Delete <span className="font-semibold">&lsquo;{activeScenario.name}&rsquo;</span>?
+              Can&apos;t be undone.
             </p>
             <div className="flex items-center gap-2">
               <button
@@ -251,7 +245,7 @@ export default function SandboxBar({
               autoFocus
               value={draftName}
               onChange={(event) => setDraftName(event.target.value)}
-              placeholder="What if we defer the east wing…"
+              placeholder="What-if name"
               className="w-72 rounded-[0.95rem] border border-slate-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-teal-500 focus:ring-2 focus:ring-teal-100"
             />
             <button

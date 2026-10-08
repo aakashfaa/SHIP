@@ -17,7 +17,6 @@ import {
 import {
   DEFAULT_COST_SETTINGS,
   applyScenarioOverlay,
-  calendarMonthName,
   DEFAULT_ENERGY_SETTINGS,
   computeEnergySeries,
   computeFiscalYearTotals,
@@ -80,7 +79,11 @@ import TimelineGrid, {
 import EnergyChart from './timeline/EnergyChart'
 import type { ArrowLink } from './timeline/DependencyArrows'
 import ExportBar from './ExportBar'
+import TimelineFilter from './view-filter/TimelineFilter'
 import SandboxBar from './timeline/SandboxBar'
+import CostModelBox from './cost-model/CostModelBox'
+import { flattenFiscalQuarters } from './timeline/cost-breakdown'
+import { useEffectiveViewSettings } from '@/lib/use-effective-view-settings'
 import {
   BAR_HEIGHT,
   CELL_WIDTH,
@@ -272,9 +275,14 @@ export default function TimelineTab({ project, permissions }: Props) {
     data: phases,
     setData: setPhases,
     error: phasesError,
+    reload: reloadPhases,
   } = useAsyncData<ChunkPhase[]>(() => getChunkPhasesForProject(project.id), [project.id], [])
 
-  const { data: dependencies, error: dependenciesError } = useAsyncData<PhaseDependency[]>(
+  const {
+    data: dependencies,
+    error: dependenciesError,
+    reload: reloadDependencies,
+  } = useAsyncData<PhaseDependency[]>(
     () => getPhaseDependenciesForProject(project.id),
     [project.id],
     []
@@ -291,23 +299,44 @@ export default function TimelineTab({ project, permissions }: Props) {
     { projectId: project.id, ...DEFAULT_TIMELINE_SETTINGS }
   )
 
+  // `reload` is how the Cost model popup's writes reach the totals: it calls
+  // back after every save, and the whole plan re-prices from the fresh rows.
+  // useAsyncData keeps the old row on screen while the re-read is in flight.
   const {
     data: costSettingsRow,
     loading: costSettingsLoading,
     error: costSettingsError,
-  } =
-    useAsyncData<ProjectCostSettings | null>(
-      () => getCostSettingsForProject(project.id),
-      [project.id],
-      null
-    )
+    reload: reloadCostSettings,
+  } = useAsyncData<ProjectCostSettings | null>(
+    () => getCostSettingsForProject(project.id),
+    [project.id],
+    null
+  )
 
-  const { data: energySettingsRow, error: energySettingsError } =
-    useAsyncData<ProjectEnergySettings | null>(
-      () => getEnergySettingsForProject(project.id),
-      [project.id],
-      null
-    )
+  const {
+    data: energySettingsRow,
+    error: energySettingsError,
+    reload: reloadEnergySettings,
+  } = useAsyncData<ProjectEnergySettings | null>(
+    () => getEnergySettingsForProject(project.id),
+    [project.id],
+    null
+  )
+
+  // Phases and links too: changing the project's phase template re-applies
+  // it to every package (cost-model/CostModelEditor).
+  const handleCostModelChanged = useCallback(() => {
+    reloadCostSettings()
+    reloadEnergySettings()
+    reloadPhases()
+    reloadDependencies()
+  }, [reloadCostSettings, reloadEnergySettings, reloadPhases, reloadDependencies])
+
+  // Display choices: the project default, or this person's own from the
+  // Filter button (lib/use-effective-view-settings). Display only: nothing
+  // here changes what is priced, just what is drawn.
+  const timelineView = useEffectiveViewSettings(project.id, 'timeline', permissions.isAdmin)
+  const { costBreakdown, showEnergy, showPackages } = timelineView.effective
 
   const [expanded, setExpanded] = useState<Set<string>>(new Set())
   const [hoveredSlot, setHoveredSlot] = useState<number | null>(null)
@@ -556,6 +585,8 @@ export default function TimelineTab({ project, permissions }: Props) {
     () => computeFiscalYearTotals(summaries, geometry),
     [summaries, geometry]
   )
+  // The by-quarter strip is the same totals laid out flat, never a second sum.
+  const fiscalQuarters = useMemo(() => flattenFiscalQuarters(fiscalTotals), [fiscalTotals])
   const engineDependencies = useMemo(
     () => dependencies.map(toEngineDependency),
     [dependencies]
@@ -863,7 +894,7 @@ export default function TimelineTab({ project, permissions }: Props) {
       if (!result.ok) {
         if (result.reason === 'conflict') {
           setConflict(
-            'Someone changed the live plan while you were exploring. Pull in the latest plan: your moves stay where you put them, and everything you did not move takes the live plan’s newer values. Then publish again.'
+            'Pull in the latest plan (your moves are kept), then publish again.'
           )
         } else {
           setSaveError(result.message)
@@ -1178,15 +1209,10 @@ export default function TimelineTab({ project, permissions }: Props) {
     <div className="space-y-5">
       <div className="flex flex-col gap-4 rounded-[1.75rem] border border-slate-200 bg-white/86 p-5 shadow-sm">
         <div className="flex flex-wrap items-start justify-between gap-4">
-          <div>
-            <h2 className="text-xl font-semibold tracking-tight text-slate-950">Timeline</h2>
-            <p className="mt-1 max-w-2xl text-sm text-slate-500">
-              Schedule each package&apos;s phases independently — design can sit years ahead
-              of the construction it belongs to. Costs escalate from where they land.
-            </p>
-          </div>
+          <h2 className="text-xl font-semibold tracking-tight text-slate-950">Timeline</h2>
 
           <div className="flex flex-wrap items-center gap-2">
+            <TimelineFilter view={timelineView} />
             {/* The two deliverables the client actually asked for: "we can make
                 that an Excel spreadsheet pretty easily that we could give to the
                 client. And then we would want a PDF view of the whole phasing
@@ -1243,9 +1269,8 @@ export default function TimelineTab({ project, permissions }: Props) {
             role="alert"
             className="rounded-[1.25rem] border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900"
           >
-            {unreadableCostCount} item{unreadableCostCount === 1 ? ' has' : 's have'} an
-            unreadable cost &mdash; {unreadableCostCount === 1 ? 'it counts' : 'they count'} as
-            $0 until fixed in Master View.
+            {unreadableCostCount} item{unreadableCostCount === 1 ? ' has an' : 's have'} unreadable
+            cost{unreadableCostCount === 1 ? '' : 's'}, counted as $0.
           </div>
         ) : null}
 
@@ -1261,8 +1286,7 @@ export default function TimelineTab({ project, permissions }: Props) {
               ? 'Timeline start year not set. '
               : ''}
             {costSettingsRow?.baseYear === null ? 'Cost base year not set. ' : ''}
-            Fiscal years and escalation below use {standInYear} as a stand-in, so treat these
-            totals as provisional until it is set.
+            Totals are provisional (using {standInYear}).
           </div>
         ) : null}
 
@@ -1272,7 +1296,9 @@ export default function TimelineTab({ project, permissions }: Props) {
           </div>
         ) : null}
 
-        <div className="grid gap-4 xl:grid-cols-3">
+        {/* items-start: each card is as tall as its own content, not the
+            tallest card in the row. */}
+        <div className="grid items-start gap-4 xl:grid-cols-3">
           <div className="rounded-[1.25rem] border border-slate-200 bg-slate-50/80 p-4">
             <div className="flex items-center justify-between gap-4">
               <label htmlFor="timeline-years" className="text-sm font-medium text-slate-700">
@@ -1314,7 +1340,6 @@ export default function TimelineTab({ project, permissions }: Props) {
               step={1}
               value={zoomLevel}
               onChange={(e) => handleZoomChange(Number(e.target.value))}
-              aria-describedby="timeline-zoom-note"
               className="mt-4 w-full accent-slate-900"
             />
             <div className="mt-3 grid grid-cols-5 text-center text-[10px] font-medium text-slate-500">
@@ -1322,39 +1347,16 @@ export default function TimelineTab({ project, permissions }: Props) {
                 <span key={z.level}>{z.label}</span>
               ))}
             </div>
-            <p id="timeline-zoom-note" className="mt-3 text-[11px] text-slate-500">
-              Changes only your view. Schedules are kept in months, so totals are the same at
-              every zoom.
-            </p>
           </div>
 
-          {/* Escalation is READ-ONLY here and edited on the Cost Model tab.
-              It is not a slider you nudge while presenting — changing it
-              re-prices the entire plan, which is a decision, not a gesture. */}
-          <div className="rounded-[1.25rem] border border-slate-200 bg-slate-50/80 p-4">
-            <div className="text-sm font-medium text-slate-700">Escalation</div>
-            <div className="mt-3 space-y-1 text-sm text-slate-600">
-              <div>
-                <span className="font-semibold text-slate-900">
-                  {costSettings.escalationAnnualPercent}%
-                </span>{' '}
-                {costSettings.escalationMode === 'compound_annual'
-                  ? 'compounding annually'
-                  : `every ${costSettings.escalationStepYears} yrs`}
-              </div>
-              <div className="text-xs text-slate-500">
-                from base year {costSettings.baseYear}, measured to the{' '}
-                {costSettings.escalationBasis} of each phase
-              </div>
-              {costSettings.rateOverrides.size > 0 ? (
-                <div className="text-xs text-slate-500">
-                  {costSettings.rateOverrides.size} year
-                  {costSettings.rateOverrides.size === 1 ? '' : 's'} overridden
-                </div>
-              ) : null}
-            </div>
-            <p className="mt-3 text-[11px] text-slate-400">Edit on the Cost Model tab.</p>
-          </div>
+          {/* Read-only summary; the full editor opens in a popup (CostModelBox). */}
+          <CostModelBox
+            projectId={project.id}
+            canEdit={canEditBaseline}
+            costRow={costSettingsRow}
+            energyRow={energySettingsRow}
+            onChanged={handleCostModelChanged}
+          />
         </div>
       </div>
 
@@ -1389,17 +1391,14 @@ export default function TimelineTab({ project, permissions }: Props) {
           role="status"
           className="rounded-[1.25rem] border border-sky-200 bg-sky-50 px-5 py-3 text-sm text-sky-900"
         >
-          Some phases run past the {horizon.configuredYears}-year Timeline Length, so the
-          timeline below is extended to {geometry.years} years to show them. Every total
-          includes them, and the Excel export does the same.
+          Extended to {geometry.years} years to fit phases past the{' '}
+          {horizon.configuredYears}-year Timeline Length.
         </div>
       ) : null}
 
       {rows.length === 0 ? (
         <div className="rounded-[2rem] border border-dashed border-slate-300 bg-white/70 px-6 py-16 text-center text-sm font-medium text-slate-400">
-          {chunksLoading
-            ? 'Loading timeline…'
-            : 'Create packages in Chunking before scheduling them.'}
+          {chunksLoading ? 'Loading timeline…' : 'No packages yet.'}
         </div>
       ) : (
         <div className="overflow-hidden rounded-[2rem] border border-slate-200 bg-white shadow-sm">
@@ -1426,55 +1425,77 @@ export default function TimelineTab({ project, permissions }: Props) {
               // role RPC is in flight -- so it can hold its caption instead
               // of announcing a permission that has not resolved.
               permissionsLoading={permissions.loading}
+              showPackages={showPackages}
               onHoverSlot={setHoveredSlot}
               onToggleExpand={handleToggleExpand}
               onSetAllExpanded={handleSetAllExpanded}
               onPhasePointerDown={handlePhasePointerDown}
               onSelectLink={() => undefined}
             />
-            <EnergyChart
-              series={energySeries}
-              slotCount={slotCount}
-              hoveredSlot={hoveredSlot}
-            />
+            {showEnergy ? (
+              <EnergyChart
+                series={energySeries}
+                slotCount={slotCount}
+                hoveredSlot={hoveredSlot}
+              />
+            ) : null}
           </div>
         </div>
       )}
 
-      {fiscalTotals.length > 0 ? (
+      {/* Monthly resolution, fiscal quarters (M-26, D-11): the same figures as
+          the Excel Annual Cost Summary, at every zoom. Which strip shows is a
+          per-project view setting; both read `fiscalTotals`. */}
+      {costBreakdown !== 'none' && fiscalTotals.length > 0 ? (
         <div className="rounded-[1.75rem] border border-slate-200 bg-white/86 p-5 shadow-sm">
-          <h3 className="text-sm font-semibold text-slate-950">By fiscal year</h3>
-          <p className="mt-1 text-xs text-slate-500">
-            What a capital plan is actually presented as — and what the client has to fit
-            into an annual allocation. Split month by month into fiscal years and fiscal
-            quarters (Q1 starts in {calendarMonthName(geometry.fiscalYearStartMonth - 1)}), the
-            same at every zoom and the same as the Excel Annual Cost Summary.
-          </p>
-          <div className="mt-3 flex flex-wrap gap-2">
-            {fiscalTotals.map((year) => (
-              <div
-                key={year.fiscalYear}
-                data-fiscal-year={year.fiscalYear}
-                className="rounded-[1rem] border border-slate-200 bg-slate-50 px-3 py-2"
-              >
-                <div className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">
-                  {formatFiscalYear(year.fiscalYear)}
-                </div>
-                <div className="text-sm font-semibold text-slate-900">
-                  {formatCurrency(year.escalatedTotal)}
-                </div>
-                {year.escalatedTotal > 0 ? (
-                  <div className="mt-1 grid grid-cols-2 gap-x-2 text-[10px] text-slate-500">
-                    {year.quarters.map((q) => (
-                      <span key={q.quarter}>
-                        Q{q.quarter} {q.escalatedTotal > 0 ? formatCurrency(q.escalatedTotal) : '—'}
-                      </span>
-                    ))}
+          <h3 className="text-sm font-semibold text-slate-950">
+            {costBreakdown === 'quarter' ? 'By fiscal quarter' : 'By fiscal year'}
+          </h3>
+          {costBreakdown === 'quarter' ? (
+            <div className="mt-3 flex flex-wrap gap-2">
+              {fiscalQuarters.map((q) => (
+                <div
+                  key={`${q.fiscalYear}-${q.quarter}`}
+                  data-fiscal-year={q.fiscalYear}
+                  data-fiscal-quarter={q.quarter}
+                  className="rounded-[1rem] border border-slate-200 bg-slate-50 px-3 py-2"
+                >
+                  <div className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">
+                    {formatFiscalYear(q.fiscalYear)} Q{q.quarter}
                   </div>
-                ) : null}
-              </div>
-            ))}
-          </div>
+                  <div className="text-sm font-semibold text-slate-900">
+                    {q.escalatedTotal > 0 ? formatCurrency(q.escalatedTotal) : '—'}
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="mt-3 flex flex-wrap gap-2">
+              {fiscalTotals.map((year) => (
+                <div
+                  key={year.fiscalYear}
+                  data-fiscal-year={year.fiscalYear}
+                  className="rounded-[1rem] border border-slate-200 bg-slate-50 px-3 py-2"
+                >
+                  <div className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">
+                    {formatFiscalYear(year.fiscalYear)}
+                  </div>
+                  <div className="text-sm font-semibold text-slate-900">
+                    {formatCurrency(year.escalatedTotal)}
+                  </div>
+                  {year.escalatedTotal > 0 ? (
+                    <div className="mt-1 grid grid-cols-2 gap-x-2 text-[10px] text-slate-500">
+                      {year.quarters.map((q) => (
+                        <span key={q.quarter}>
+                          Q{q.quarter} {q.escalatedTotal > 0 ? formatCurrency(q.escalatedTotal) : '—'}
+                        </span>
+                      ))}
+                    </div>
+                  ) : null}
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       ) : null}
     </div>

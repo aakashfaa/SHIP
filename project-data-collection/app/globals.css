@@ -77,10 +77,10 @@ textarea::placeholder {
  *
  * `.no-print` is an ordinary utility class: apply it to anything that is
  * export/interaction chrome (ExportBar's own buttons already do). The
- * other selectors below target markup that already exists in
- * ProjectDashboardShell.tsx / TimelineGrid.tsx / EnergyChart.tsx by their
- * REAL Tailwind utility classes — nothing here invents a class name that
- * isn't already in the compiled output.
+ * workspace frame is reached through its `data-workspace-*` attributes
+ * (ProjectDashboardShell.tsx, shell/*); the selectors for TimelineGrid.tsx /
+ * EnergyChart.tsx target their REAL Tailwind utility classes — nothing here
+ * invents a class name that isn't already in the compiled output.
  * ===================================================================== */
 
 @media print {
@@ -106,29 +106,45 @@ textarea::placeholder {
     display: none !important;
   }
 
-  /* ProjectDashboardShell's persistent bottom tab bar. It has no id/class
-   * of its own beyond Tailwind utilities, so it's targeted by the exact
-   * combination that positions it (fixed, pinned to the bottom, centred) —
-   * a fixed-position nav bar has no meaning on a paginated printed page. */
-  .fixed.bottom-6.left-1\/2 {
-    display: none !important;
+  /* ProjectDashboardShell's chrome -- the floating tab bar, the top bar's
+   * Back / Logout and the rename pencil -- carries `.no-print` above. The
+   * project name and "<View> · <Role>" line stay as the printed header.
+   *
+   * The workspace frame is a 100dvh column whose rounded box scrolls its
+   * content internally (`data-workspace-scroll`). On paper that would print
+   * one viewport of the Timeline and clip the rest, so every layer goes back
+   * to normal flow: auto height, visible overflow, no space reserved for
+   * the (hidden) nav, and plain white instead of the gradient wash. */
+  [data-workspace-root],
+  [data-workspace-main],
+  [data-workspace-box],
+  [data-workspace-scroll] {
+    display: block !important;
+    height: auto !important;
+    min-height: 0 !important;
+    max-height: none !important;
+    overflow: visible !important;
   }
 
-  /* ProjectDashboardShell's header Back / Logout actions — the only two
-   * buttons in that header, each with its own distinct utility
-   * combination so this does not also hit unrelated buttons elsewhere
-   * (e.g. ChunkingTab's differently-rounded `rounded-[1rem]` buttons). */
-  a.rounded-2xl.border.border-slate-200.bg-white\/95.px-4.py-3,
-  button.rounded-2xl.bg-slate-950.px-4.py-3 {
-    display: none !important;
-  }
-
-  /* The page's decorative radial/linear-gradient background
-   * (ProjectDashboardShell's outer wrapper). A wash of amber/sky radial
-   * gradients behind a cost table is screen decoration, not a
-   * deliverable — flatten it to plain white paper. */
-  .min-h-screen {
+  [data-workspace-root] {
     background: #fff !important;
+  }
+
+  [data-workspace-main] {
+    padding: 0 !important;
+  }
+
+  [data-workspace-box] {
+    max-width: none !important;
+    border: 0 !important;
+    border-radius: 0 !important;
+    background: #fff !important;
+  }
+
+  [data-workspace-topbar] {
+    background: #fff !important;
+    border: 0 !important;
+    padding: 0 0 4mm !important;
   }
 
   /* Glass-card dressing (blur + drop shadow) is a screen affordance that

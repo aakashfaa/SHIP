@@ -140,11 +140,7 @@ export default function EnergyChart({ series, slotCount, hoveredSlot }: Props) {
               {reductionPct !== null ? ` (${reductionPct.toFixed(0)}%)` : ''}
             </div>
           </div>
-        ) : (
-          <p className="mt-3 text-xs text-slate-400">
-            Add energy savings to line items to see reductions here.
-          </p>
-        )}
+        ) : null}
       </div>
 
       <div className="relative" style={{ height: ENERGY_CHART_HEIGHT }}>
@@ -259,7 +255,7 @@ export default function EnergyChart({ series, slotCount, hoveredSlot }: Props) {
           </svg>
         ) : (
           <div className="flex h-full items-center justify-center text-xs text-slate-400">
-            No energy savings recorded yet
+            No energy savings
           </div>
         )}
       </div>

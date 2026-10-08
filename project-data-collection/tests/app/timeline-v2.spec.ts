@@ -115,16 +115,22 @@ test('a fixed-duration phase is marked and has no resize handles', async ({ page
   await expect(page.getByLabel('Fixed duration')).toBeVisible()
 })
 
-test('cost model tab exposes the assumptions behind the numbers', async ({ page }) => {
-  await page.goto('/projects')
+test('the cost model popup exposes the assumptions behind the numbers', async ({ page }) => {
+  // The Cost Model tab is gone; an old `?tab=cost-model` link lands on the
+  // Timeline, where the cost model now lives behind its summary box.
+  await page.goto('/projects/federal-campus-master-plan?tab=cost-model')
   await settle(page)
-  await page.getByRole('link', { name: new RegExp(SEED_PROJECT, 'i') }).first().click()
-  await page.waitForURL(/\/projects\/.+/)
-  await page.getByRole('button', { name: 'Cost Model', exact: true }).click()
+  await expect(page.getByRole('button', { name: 'Cost Model', exact: true })).toHaveCount(0)
+  await expect(page.locator('[data-workspace-topbar] p').first()).toHaveText(/^Timeline · /)
+
+  await page.getByRole('button', { name: 'Edit cost model', exact: true }).click()
+  const dialog = page.getByRole('dialog', { name: 'Cost model', exact: true })
+  await expect(dialog).toBeVisible()
+  await expect(dialog.getByRole('heading', { name: 'Cost model', exact: true })).toBeVisible()
+  await expect(dialog.getByText('What $1,000,000 becomes')).toBeVisible()
   await settle(page)
 
-  await expect(page.getByRole('heading', { name: 'Cost Model' })).toBeVisible()
-  await expect(page.getByText('What $1,000,000 becomes')).toBeVisible()
-
-  await expect(page).toHaveScreenshot('cost-model.png', { fullPage: true })
+  // The popup, not the page: it is a fixed overlay over the Timeline, and its
+  // body scrolls inside the panel.
+  await expect(dialog).toHaveScreenshot('cost-model.png')
 })

@@ -78,8 +78,8 @@ export type FormatFieldValueOptions = {
 /**
  * A field's value as display text: option labels for select/multiselect
  * (falling back to the stored value for a retired option), "Yes"/"No" for
- * booleans (column booleans already store 'Yes'/'No'; custom ones store
- * true/false), grouped digits for numbers. Currency text is shown as typed --
+ * booleans (column booleans store 'Yes'/'No'/NULL; custom ones store
+ * true/false or omit the key when unanswered), grouped digits for numbers. Currency text is shown as typed --
  * it is the input of record, and the parsed amount has its own column.
  */
 export function formatFieldValue(
@@ -115,4 +115,79 @@ export function orderedVisibleFields<T extends Pick<FormField, 'isHidden' | 'sor
   fields: readonly T[]
 ): T[] {
   return fields.filter((field) => !field.isHidden).slice().sort((a, b) => a.sortOrder - b.sortOrder)
+}
+
+/**
+ * What every on-screen surface shows for a skipped answer (Add Data rows,
+ * Master View, Phasing). Exports keep a truly blank cell (formatFieldValue's
+ * default ''), so this is opt-in via `{ empty: EMPTY_FIELD_TEXT }`.
+ */
+export const EMPTY_FIELD_TEXT = '-'
+
+/**
+ * The value a field starts a brand-new line item with: always "unanswered".
+ * A `select` starts EMPTY -- never its first option. Picking options[0] here
+ * used to make every skipped Category / Timeline priority / Building area /
+ * Operational impact / ... silently save as whatever the project listed
+ * first, indistinguishable from a real answer.
+ *
+ * Yes/No questions too (0023): they are a Yes / No choice with nothing
+ * preselected, so a question nobody answered is not recorded as "No".
+ */
+export function blankValueForField(field: Pick<FormField, 'inputType' | 'storage'>): unknown {
+  switch (field.inputType) {
+    case 'multiselect':
+      return []
+    default:
+      // select, boolean, text, textarea, date, currency, and number
+      // (D-9: blank, not 0).
+      return ''
+  }
+}
+
+/**
+ * What a skipped answer is WRITTEN as. Column-backed selects and Yes/No
+ * questions become NULL (nullable since 0014 / 0023, and '' would trip their
+ * CHECK constraints); column text stays '' (those
+ * columns are `not null default ''`); a skipped custom field is dropped from
+ * `custom_fields` (`undefined` here means "omit the key"). A real answer is
+ * returned unchanged.
+ */
+export function storedFieldValue(
+  field: Pick<FormField, 'inputType' | 'storage'>,
+  value: unknown
+): unknown {
+  if (!isFieldValueEmpty(field, value)) return value
+  if (field.storage === 'custom') return undefined
+  switch (field.inputType) {
+    case 'select':
+    case 'boolean':
+    case 'number':
+    case 'date':
+      return null
+    case 'multiselect':
+      return []
+    default:
+      return value ?? ''
+  }
+}
+
+/**
+ * A Yes/No answer in either storage, as a tri-state: true (Yes), false (No)
+ * or null (not answered). Column booleans store 'Yes' / 'No' / NULL (0023),
+ * custom ones true / false / absent.
+ */
+export function readYesNo(value: unknown): boolean | null {
+  if (value === true || value === 'Yes') return true
+  if (value === false || value === 'No') return false
+  return null
+}
+
+/** The tri-state back into the field's storage shape: 'Yes'/'No' for a
+ *  column, true/false for a custom field, '' (unanswered, written as
+ *  NULL / omitted by storedFieldValue) for null. */
+export function writeYesNo(field: Pick<FormField, 'storage'>, answer: boolean | null): unknown {
+  if (answer === null) return ''
+  if (field.storage === 'column') return answer ? 'Yes' : 'No'
+  return answer
 }

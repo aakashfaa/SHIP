@@ -52,3 +52,25 @@ nextjs-portal,
 [data-workspace-nav] {
   display: none !important;
 }
+
+/*
+ * The workspace is a 100dvh frame whose rounded box scrolls its content in an
+ * inner element ([data-workspace-scroll]); the window itself never scrolls.
+ * A `fullPage` capture measures the document, so without this every workspace
+ * screenshot would be one viewport tall and silently stop covering whatever
+ * sits below the fold -- most of the Timeline, all of a long Chunking list.
+ *
+ * During capture only, put the frame back into normal flow so the document is
+ * as tall as the content and `fullPage` sees all of it. This mirrors the
+ * `@media print` rules in app/globals.css (the same problem, on paper), but
+ * keeps the box's on-screen dressing so the baseline still shows the design.
+ */
+[data-workspace-root],
+[data-workspace-main],
+[data-workspace-box],
+[data-workspace-scroll] {
+  height: auto !important;
+  min-height: 0 !important;
+  max-height: none !important;
+  overflow: visible !important;
+}

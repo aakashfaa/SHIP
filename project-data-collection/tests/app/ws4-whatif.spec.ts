@@ -223,7 +223,7 @@ test('Discard asks first and names the what-if (M-23)', async ({ page }) => {
   await page.getByRole('button', { name: 'Discard' }).click()
   const confirm = page.getByRole('alertdialog', { name: 'Confirm discard' })
   await expect(confirm).toContainText(name)
-  await expect(confirm).toContainText("can't be undone")
+  await expect(confirm).toContainText(/can't be undone/i)
   // Nothing has been deleted yet.
   await expect(page.getByText('Local copy')).toBeVisible()
 

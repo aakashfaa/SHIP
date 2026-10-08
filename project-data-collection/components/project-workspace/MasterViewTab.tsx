@@ -1,9 +1,33 @@
 'use client'
 
-import { useDeferredValue, useMemo, useRef, useState } from 'react'
+import { useDeferredValue, useMemo, useState } from 'react'
+import Modal from '@/components/ui/Modal'
+import ExportBar from './ExportBar'
+import EditableCell from './master-view/EditableCell'
+import ColumnsFilter from './view-filter/ColumnsFilter'
+import {
+  buildRowPatch,
+  initialCellValue,
+  sameCellValue,
+  validateRowDraft,
+  type CellValue,
+  type RowDraft,
+} from './master-view/cell-edit'
 import { useAsyncData } from '@/lib/useAsyncData'
-import { getFormFieldsForProject, getLineItemsForProject, visibleFormFields } from '@/lib/store'
+import { getFormFieldsForProject, getLineItemsForProject, updateLineItem } from '@/lib/store'
 import type { ProjectPermissions } from '@/lib/project-role'
+import { useEffectiveViewSettings } from '@/lib/use-effective-view-settings'
+import { visibleColumns } from '@/lib/view-settings'
+import {
+  MASTER_COLUMN_KEYS,
+  getMasterViewColumnDefs,
+  masterCellText,
+  masterExportCell,
+  masterExportColumn,
+  sortMasterRows,
+  type MasterColumnDef,
+  type MasterSort,
+} from '@/lib/view-columns/master'
 import { FormField, LineItem, Project } from '@/lib/types'
 
 type Props = {
@@ -13,7 +37,20 @@ type Props = {
   permissions: ProjectPermissions
 }
 
-type SortKey = 'itemNumber' | 'name' | 'discipline' | 'companyName' | 'relativeFirstCost'
+/*
+ * Columns come from lib/view-columns/master.ts (every visible form field,
+ * custom ones included, plus the system columns), minus the hidden ones:
+ * the project default an admin set for everyone, or this person's own
+ * choice from the Filter button (lib/use-effective-view-settings.ts). The
+ * exports take the same visible columns.
+ *
+ * Edit mode (project admins, which includes platform admins: project_role()
+ * resolves a platform admin to 'admin'): every form-field cell of every row
+ * becomes an input, whoever submitted the row. RLS already allows it --
+ * line_items_update (0009) admits any row in my_editable_project_ids(), and
+ * 0014's system-column guard only blocks the filing columns, which this
+ * never sends. Rows save one at a time, sending only the changed fields.
+ */
 
 const DISCIPLINE_COLORS: Record<string, string> = {
   MECHANICAL: '#F4B400',
@@ -35,142 +72,74 @@ const DISCIPLINE_COLORS: Record<string, string> = {
   HAZARDOUS_MATERIALS: '#9C6B3A',
 }
 
-/*
- * migration 0012 turned the fixed column list into `form_fields` data (see
- * lib/store.ts getFormFieldsForProject / visibleFormFields). Everything a
- * consultant actually FILLS IN on the form -- name, category, the strategic
- * flags, a custom "Funding source" a firm added in Settings -- is rendered
- * here as one column per visible field, in field sort order, instead of a
- * column list this component owns.
- *
- * The columns that survive as hardcoded are the ones that are NOT form
- * fields at all: the discipline colour stripe, item number, discipline,
- * organization and submitted-by are system-managed (item/company/discipline
- * triggers, auth) -- see the "Columns deliberately absent" comment in
- * migration 0012's default_form_fields().
- */
-
-/** Same mechanical key->property mapping AddDataTab.tsx uses, and the same
- *  one exception -- see the comment there. Duplicated rather than shared
- *  because lib/ is off limits for this change and these two components do
- *  not otherwise import from each other. */
-const CAMEL_CASE_OVERRIDES: Record<string, string> = {
-  electrification_eo594: 'electrificationEO594',
-}
-
-function toCamelCase(key: string): string {
-  return CAMEL_CASE_OVERRIDES[key] ?? key.replace(/_([a-z0-9])/g, (_, c: string) => c.toUpperCase())
-}
-
-/** Reads a field's value off a line item, hiding the `storage: 'column'` vs
- *  `'custom'` split the same way AddDataTab's get/set pair does -- this
- *  side only ever needs to read. */
-function getFieldValue(item: LineItem, field: FormField): unknown {
-  if (field.storage === 'custom') return item.customFields?.[field.key]
-  return (item as unknown as Record<string, unknown>)[toCamelCase(field.key)]
-}
-
-function formatFieldValue(field: FormField, value: unknown): string {
-  if (field.inputType === 'multiselect') {
-    return Array.isArray(value) && value.length > 0 ? value.join(', ') : '-'
-  }
-  if (value === null || value === undefined || value === '') return '-'
-  return String(value)
-}
-
-/** Left offsets (px) of the sticky columns: 8px colour stripe, then # (72),
- *  Discipline (128), Name (200). Widths are fixed in the cells below. */
-const STICKY_LEFT = { number: 8, discipline: 80, name: 208 } as const
-
-function columnWidthClass(field: FormField): string {
-  if (field.inputType === 'textarea') return 'min-w-[200px]'
-  if (field.inputType === 'boolean') return 'w-[104px]'
-  if (field.inputType === 'multiselect') return 'w-[140px]'
-  return 'min-w-[128px]'
-}
-
-function getDisciplineKey(value: string) {
-  return value.trim().toUpperCase().replace(/\s+/g, '_')
-}
-
 function normalizeDiscipline(value: LineItem['discipline']) {
   return value === 'Admin' ? 'Architecture' : value
 }
 
 function getDisciplineColor(value: LineItem['discipline']) {
-  return DISCIPLINE_COLORS[getDisciplineKey(normalizeDiscipline(value))] || '#94A3B8'
+  const key = normalizeDiscipline(value).trim().toUpperCase().replace(/\s+/g, '_')
+  return DISCIPLINE_COLORS[key] || '#94A3B8'
 }
 
-function colorTint(hex: string, opacity: string) {
-  return `${hex}${opacity}`
+/** Sticky left offsets (px): 8px colour stripe, then Item # (72px), then
+ *  Name. Both are locked columns, so the offsets never shift. */
+const STRIPE_WIDTH = 8
+const NUMBER_WIDTH = 72
+const NAME_WIDTH = 200
+
+function columnWidthClass(def: MasterColumnDef): string {
+  if (def.kind !== 'field') return def.kind === 'submittedBy' ? 'min-w-[160px]' : 'min-w-[120px]'
+  switch (def.field.inputType) {
+    case 'textarea':
+      return 'min-w-[220px]'
+    case 'boolean':
+      return 'w-[96px] min-w-[96px]'
+    case 'multiselect':
+      return 'min-w-[160px]'
+    default:
+      return 'min-w-[132px]'
+  }
 }
 
-function itemNumberSort(a: string, b: string) {
-  const aMatch = a.match(/^([A-Z]+)(\d+)$/i)
-  const bMatch = b.match(/^([A-Z]+)(\d+)$/i)
-
-  if (!aMatch || !bMatch) return a.localeCompare(b)
-
-  const [, aPrefix, aNum] = aMatch
-  const [, bPrefix, bNum] = bMatch
-
-  if (aPrefix !== bPrefix) return aPrefix.localeCompare(bPrefix)
-  return Number(aNum) - Number(bNum)
-}
-
-function sortLineItems(items: LineItem[], sortKey: SortKey) {
-  return [...items].sort((a, b) => {
-    if (sortKey === 'itemNumber') return itemNumberSort(a.itemNumber, b.itemNumber)
-    return a[sortKey].localeCompare(b[sortKey])
-  })
-}
+type RowStatus = { saving?: boolean; error?: string; fieldErrors?: Record<string, string> }
 
 export default function MasterViewTab({ project, permissions }: Props) {
-  const exportRef = useRef<HTMLDivElement | null>(null)
   const [query, setQuery] = useState('')
   const [disciplineFilter, setDisciplineFilter] = useState('all')
   const [orgFilter, setOrgFilter] = useState('all')
-  const [sortKey, setSortKey] = useState<SortKey>('itemNumber')
+  const [sort, setSort] = useState<MasterSort>({ key: MASTER_COLUMN_KEYS.itemNumber, direction: 'asc' })
   const deferredQuery = useDeferredValue(query)
 
-  const {
-    data: formFields,
-    loading: fieldsLoading,
-  } = useAsyncData<FormField[]>(
+  const [editing, setEditing] = useState(false)
+  const [drafts, setDrafts] = useState<Record<string, RowDraft>>({})
+  const [rowStatus, setRowStatus] = useState<Record<string, RowStatus>>({})
+  const [confirmDone, setConfirmDone] = useState(false)
+
+  // Project default, or this person's own column choice on top of it.
+  const viewSettings = useEffectiveViewSettings(project.id, 'masterView', permissions.isAdmin)
+  const hiddenColumns = viewSettings.effective.hiddenColumns
+
+  const { data: formFields, loading: fieldsLoading } = useAsyncData<FormField[]>(
     () => getFormFieldsForProject(project.id),
     [project.id],
     []
   )
 
-  const visibleFields = useMemo(() => visibleFormFields(formFields), [formFields])
-
-  // M-19: #, Discipline and Name stay pinned on the left while the rest of
-  // the (very wide) matrix scrolls. Name is pulled out of the field order and
-  // rendered directly after Discipline so the three sticky offsets are
-  // contiguous; every other field keeps its sort order after Organization.
-  const nameField = useMemo(
-    () => visibleFields.find((f) => f.storage === 'column' && f.key === 'name') ?? null,
-    [visibleFields]
-  )
-  const scrollingFields = useMemo(
-    () => visibleFields.filter((f) => f !== nameField),
-    [visibleFields, nameField]
-  )
-
-  // Empty rather than crashing: an unseeded project has no columns to build,
-  // and the right response is pointing at Settings, not a hardcoded list of
-  // some other firm's questions.
-  const formNotSeeded = !fieldsLoading && visibleFields.length === 0
-
   const {
     data: rawLineItems,
+    setData: setRawLineItems,
     loading: lineItemsLoading,
     error: lineItemsError,
-  } = useAsyncData<LineItem[]>(
-    () => getLineItemsForProject(project.id),
-    [project.id],
-    []
-  )
+  } = useAsyncData<LineItem[]>(() => getLineItemsForProject(project.id), [project.id], [])
+
+  const allDefs = useMemo(() => getMasterViewColumnDefs(formFields), [formFields])
+  const defs = useMemo(() => {
+    const shown = new Set(visibleColumns(allDefs, hiddenColumns).map((c) => c.key))
+    return allDefs.filter((def) => shown.has(def.key))
+  }, [allDefs, hiddenColumns])
+
+  const fieldByKey = useMemo(() => new Map(formFields.map((f) => [f.key, f])), [formFields])
+  const formNotSeeded = !fieldsLoading && !allDefs.some((def) => def.kind === 'field')
 
   const lineItems = useMemo(
     () =>
@@ -178,265 +147,404 @@ export default function MasterViewTab({ project, permissions }: Props) {
         ...item,
         discipline: normalizeDiscipline(item.discipline),
         companyName: item.companyName || 'FAA',
-        estimatedFirstCost: item.estimatedFirstCost || '',
       })),
     [rawLineItems]
   )
+  const rawById = useMemo(() => new Map(rawLineItems.map((item) => [item.id, item])), [rawLineItems])
 
   const disciplineOptions = useMemo(
     () => Array.from(new Set(lineItems.map((item) => item.discipline))).sort(),
     [lineItems]
   )
-
   const orgOptions = useMemo(
     () => Array.from(new Set(lineItems.map((item) => item.companyName))).sort(),
     [lineItems]
   )
+  const synergyOptions = useMemo(
+    () => Array.from(new Set(project.consultants.map((c) => c.type))),
+    [project.consultants]
+  )
 
-  const filteredItems = useMemo(() => {
-    const normalizedQuery = deferredQuery.trim().toLowerCase()
-
+  // Filters and sort apply to what is on screen, and the export takes the
+  // rows exactly as filtered and ordered here.
+  const rows = useMemo(() => {
+    const q = deferredQuery.trim().toLowerCase()
     const filtered = lineItems.filter((item) => {
-      const matchesQuery =
-        !normalizedQuery ||
-        [
-          item.itemNumber,
-          item.name,
-          item.shortDescription,
-          item.discipline,
-          item.companyName,
-          item.category,
-          item.timelinePriority,
-          item.buildingAreaImpacted,
-          item.buildingLevelImpacted,
-          item.supportingNotes,
-          item.relativeFirstCost,
-          item.estimatedFirstCost,
-          JSON.stringify(item.customFields ?? {}),
-        ]
-          .join(' ')
-          .toLowerCase()
-          .includes(normalizedQuery)
-
-      const matchesDiscipline =
-        disciplineFilter === 'all' || item.discipline === disciplineFilter
-      const matchesOrg = orgFilter === 'all' || item.companyName === orgFilter
-
-      return matchesQuery && matchesDiscipline && matchesOrg
+      if (disciplineFilter !== 'all' && item.discipline !== disciplineFilter) return false
+      if (orgFilter !== 'all' && item.companyName !== orgFilter) return false
+      if (!q) return true
+      return defs.some((def) => masterCellText(def, item).toLowerCase().includes(q))
     })
+    return sortMasterRows(filtered, defs, sort)
+  }, [deferredQuery, defs, disciplineFilter, lineItems, orgFilter, sort])
 
-    return sortLineItems(filtered, sortKey)
-  }, [deferredQuery, disciplineFilter, lineItems, orgFilter, sortKey])
+  const dirtyIds = Object.keys(drafts)
+  const savingAny = Object.values(rowStatus).some((s) => s.saving)
 
-  function exportMatrixOnly() {
-    const table = exportRef.current?.querySelector('table')
-    if (!table) return
+  function toggleSort(key: string) {
+    setSort((current) =>
+      current.key === key
+        ? { key, direction: current.direction === 'asc' ? 'desc' : 'asc' }
+        : { key, direction: 'asc' }
+    )
+  }
 
-    // M-20: the print document is built with DOM APIs only. project.name
-    // goes in through textContent, never into an HTML string, so a project
-    // named an <img onerror=...> tag prints as text instead of running in
-    // this origin. The window is same-origin about:blank, so it is detached
-    // from us (opener = null) before anything is written to it; the
-    // 'noopener' window feature is not usable here because it makes
-    // window.open return null, and we need the handle to fill the document.
-    const printWindow = window.open('', '_blank', 'width=1500,height=900')
-    if (!printWindow) return
-    printWindow.opener = null
+  function exportTable() {
+    const filters = [
+      disciplineFilter !== 'all' ? disciplineFilter : null,
+      orgFilter !== 'all' ? orgFilter : null,
+      deferredQuery.trim() ? `"${deferredQuery.trim()}"` : null,
+    ].filter(Boolean)
+    return {
+      title: `${project.name} - Master View`,
+      sheetName: 'Master View',
+      subtitle: `${rows.length} of ${lineItems.length} items${filters.length ? ` · ${filters.join(' · ')}` : ''}`,
+      columns: defs.map(masterExportColumn),
+      rows: rows.map((item) => defs.map((def) => masterExportCell(def, item))),
+    }
+  }
 
-    const doc = printWindow.document
-    doc.title = `${project.name} - Master View`
+  /* --------------------------------------------------------- edit mode -- */
 
-    const style = doc.createElement('style')
-    style.textContent = `
-      * { box-sizing: border-box; }
-      body { margin: 24px; font-family: Arial, Helvetica, sans-serif; color: #0f172a; }
-      table { width: 100%; border-collapse: collapse; table-layout: fixed; font-size: 10px; }
-      th, td { border: 1px solid #dbe1ea; padding: 8px 6px; vertical-align: top; word-break: break-word; }
-      th { background: #e2e8f0; text-transform: uppercase; letter-spacing: .04em; font-size: 9px; }
-    `
-    doc.head.appendChild(style)
+  function setCell(item: LineItem, field: FormField, value: CellValue) {
+    const initial = initialCellValue(field, rawById.get(item.id) ?? item)
+    setDrafts((prev) => {
+      const row = { ...(prev[item.id] ?? {}) }
+      if (sameCellValue(value, initial)) delete row[field.key]
+      else row[field.key] = value
+      const next = { ...prev }
+      if (Object.keys(row).length === 0) delete next[item.id]
+      else next[item.id] = row
+      return next
+    })
+    setRowStatus((prev) => {
+      const status = prev[item.id]
+      if (!status?.fieldErrors?.[field.key] && !status?.error) return prev
+      const fieldErrors = { ...(status.fieldErrors ?? {}) }
+      delete fieldErrors[field.key]
+      return { ...prev, [item.id]: { ...status, error: undefined, fieldErrors } }
+    })
+  }
 
-    const heading = doc.createElement('h1')
-    heading.textContent = project.name
-    const subtitle = doc.createElement('p')
-    subtitle.textContent = 'Master View export'
-    doc.body.append(heading, subtitle, doc.importNode(table, true))
+  function revertRow(id: string) {
+    setDrafts((prev) => {
+      const next = { ...prev }
+      delete next[id]
+      return next
+    })
+    setRowStatus((prev) => ({ ...prev, [id]: {} }))
+  }
 
-    printWindow.focus()
-    printWindow.print()
+  async function saveRow(id: string): Promise<boolean> {
+    const draft = drafts[id]
+    const item = rawById.get(id)
+    if (!draft || !item) return true
+
+    const fieldErrors = validateRowDraft(formFields, draft)
+    if (Object.keys(fieldErrors).length > 0) {
+      setRowStatus((prev) => ({ ...prev, [id]: { error: 'Fix the highlighted cells.', fieldErrors } }))
+      return false
+    }
+
+    setRowStatus((prev) => ({ ...prev, [id]: { saving: true } }))
+    try {
+      const updated = await updateLineItem(id, buildRowPatch(item, formFields, draft))
+      if (!updated) throw new Error('Not saved: this row no longer exists or you lost access to it.')
+      setRawLineItems((prev) => prev.map((row) => (row.id === id ? updated : row)))
+      setDrafts((prev) => {
+        // Keep anything typed into the row while the save was in flight.
+        const current = prev[id]
+        const next = { ...prev }
+        if (!current || current === draft) delete next[id]
+        return next
+      })
+      setRowStatus((prev) => ({ ...prev, [id]: {} }))
+      return true
+    } catch (err) {
+      setRowStatus((prev) => ({
+        ...prev,
+        [id]: { error: err instanceof Error ? err.message : 'Failed to save.' },
+      }))
+      return false
+    }
+  }
+
+  async function saveAll() {
+    for (const id of dirtyIds) await saveRow(id)
+  }
+
+  function finishEditing() {
+    if (dirtyIds.length > 0) {
+      setConfirmDone(true)
+      return
+    }
+    setEditing(false)
+    setRowStatus({})
+  }
+
+  function discardAndFinish() {
+    setDrafts({})
+    setRowStatus({})
+    setConfirmDone(false)
+    setEditing(false)
+  }
+
+  const canEditRows = permissions.isAdmin && !lineItemsLoading && !lineItemsError && !formNotSeeded
+
+  function stickyLeft(def: MasterColumnDef): number | undefined {
+    if (def.key === MASTER_COLUMN_KEYS.itemNumber) return STRIPE_WIDTH
+    if (def.kind === 'field' && def.key === MASTER_COLUMN_KEYS.name) return STRIPE_WIDTH + NUMBER_WIDTH
+    return undefined
   }
 
   return (
-    <div className="space-y-5">
-      <div className="flex flex-col gap-4 rounded-[1.75rem] border border-slate-200 bg-white/86 p-5 shadow-sm">
-        <div className="flex flex-col gap-4 xl:flex-row xl:items-center xl:justify-between">
-          <div>
-            <h2 className="text-xl font-semibold tracking-tight text-slate-950">Master View</h2>
-            <p className="mt-1 text-sm text-slate-500">
-              Query, filter, and sort the full line-item matrix without discipline section breaks.
-            </p>
-          </div>
+    <div className="flex h-full min-h-0 flex-col gap-3">
+      <div className="flex flex-wrap items-center gap-2">
+        <input
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          placeholder="Search"
+          aria-label="Search line items"
+          className="min-w-[180px] flex-1 rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-slate-900 sm:max-w-xs"
+        />
+        <select
+          value={disciplineFilter}
+          onChange={(e) => setDisciplineFilter(e.target.value)}
+          aria-label="Discipline"
+          className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-slate-900"
+        >
+          <option value="all">All disciplines</option>
+          {disciplineOptions.map((option) => (
+            <option key={option} value={option}>
+              {option}
+            </option>
+          ))}
+        </select>
+        <select
+          value={orgFilter}
+          onChange={(e) => setOrgFilter(e.target.value)}
+          aria-label="Organization"
+          className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm outline-none transition focus:border-slate-900"
+        >
+          <option value="all">All organizations</option>
+          {orgOptions.map((option) => (
+            <option key={option} value={option}>
+              {option}
+            </option>
+          ))}
+        </select>
+        <span className="text-xs text-slate-500">
+          {rows.length} of {lineItems.length}
+        </span>
 
-          {/* R8.4: a viewer does not get a copy of the plan to carry off, only
-              the on-screen read of it. Master View is open to every role
-              (unlike Add Data), so this button — not a route gate — is the
-              only thing standing between a viewer and the full matrix, and it
-              has to be hidden rather than merely disabled. */}
-          {permissions.isViewer ? null : (
-            <button
-              type="button"
-              onClick={exportMatrixOnly}
-              className="rounded-2xl bg-black px-5 py-3 text-sm font-medium text-white shadow-lg transition hover:-translate-y-[1px]"
-            >
-              Export PDF
-            </button>
+        <div className="ml-auto flex items-center gap-2">
+          {editing ? (
+            <>
+              {dirtyIds.length > 0 ? (
+                <>
+                  <span className="text-xs text-amber-700">{dirtyIds.length} unsaved</span>
+                  <button
+                    type="button"
+                    onClick={saveAll}
+                    disabled={savingAny}
+                    className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs font-medium text-slate-700 transition hover:border-slate-300 disabled:opacity-60"
+                  >
+                    Save all
+                  </button>
+                </>
+              ) : null}
+              <button
+                type="button"
+                onClick={finishEditing}
+                disabled={savingAny}
+                className="rounded-xl bg-black px-4 py-2 text-xs font-medium text-white transition hover:-translate-y-[1px] disabled:opacity-60"
+              >
+                Done
+              </button>
+            </>
+          ) : (
+            <>
+              {/* R8.4: a viewer gets the on-screen read only, no file to
+                  carry off -- hidden, not just disabled. */}
+              <ColumnsFilter view={viewSettings} columns={allDefs} />
+              {permissions.isViewer ? null : <ExportBar project={project} table={exportTable} />}
+              {canEditRows ? (
+                <button
+                  type="button"
+                  onClick={() => setEditing(true)}
+                  className="rounded-xl border border-slate-200 bg-white px-4 py-2 text-xs font-medium text-slate-700 transition hover:border-slate-300"
+                >
+                  Edit
+                </button>
+              ) : null}
+            </>
           )}
-        </div>
-
-        <div className="grid gap-3 lg:grid-cols-[2fr_1fr_1fr_1fr]">
-          <input
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            placeholder="Search line items, notes, orgs, disciplines"
-            className="w-full rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm outline-none transition focus:border-slate-900"
-          />
-          <select
-            value={disciplineFilter}
-            onChange={(e) => setDisciplineFilter(e.target.value)}
-            className="rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm outline-none transition focus:border-slate-900"
-          >
-            <option value="all">All disciplines</option>
-            {disciplineOptions.map((option) => (
-              <option key={option} value={option}>
-                {option}
-              </option>
-            ))}
-          </select>
-          <select
-            value={orgFilter}
-            onChange={(e) => setOrgFilter(e.target.value)}
-            className="rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm outline-none transition focus:border-slate-900"
-          >
-            <option value="all">All organizations</option>
-            {orgOptions.map((option) => (
-              <option key={option} value={option}>
-                {option}
-              </option>
-            ))}
-          </select>
-          <select
-            value={sortKey}
-            onChange={(e) => setSortKey(e.target.value as SortKey)}
-            className="rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm outline-none transition focus:border-slate-900"
-          >
-            <option value="itemNumber">Sort: Item #</option>
-            <option value="name">Sort: Name</option>
-            <option value="discipline">Sort: Discipline</option>
-            <option value="companyName">Sort: Organization</option>
-            <option value="relativeFirstCost">Sort: First Cost</option>
-          </select>
-        </div>
-
-        <div className="flex flex-wrap gap-2 text-xs text-slate-500">
-          <span className="rounded-full bg-slate-100 px-3 py-1.5">
-            {filteredItems.length} shown
-          </span>
-          <span className="rounded-full bg-slate-100 px-3 py-1.5">
-            {lineItems.length} total
-          </span>
-          <span className="rounded-full bg-slate-100 px-3 py-1.5">{project.name}</span>
         </div>
       </div>
 
       {formNotSeeded ? (
-        <div className="rounded-[2rem] border border-dashed border-amber-300 bg-white p-12 text-center">
-          <h4 className="text-lg font-semibold text-gray-900">No form configured</h4>
-          <p className="mt-2 text-sm text-gray-500">
-            This project has no line-item form fields yet. Add fields in Settings &rarr; Line item
-            form.
-          </p>
-        </div>
+        <EmptyState tone="amber">No form fields yet. Add them in Settings.</EmptyState>
       ) : lineItemsLoading || fieldsLoading ? (
-        <div className="rounded-[2rem] border border-dashed border-gray-300 bg-white p-12 text-center">
-          <p className="text-sm text-gray-500">Loading line items...</p>
-        </div>
+        <EmptyState>Loading…</EmptyState>
       ) : lineItemsError ? (
-        <div className="rounded-[2rem] border border-dashed border-rose-300 bg-white p-12 text-center">
-          <p className="text-sm text-rose-600">Could not load line items. Please try again.</p>
-        </div>
-      ) : filteredItems.length === 0 ? (
-        <div className="rounded-[2rem] border border-dashed border-gray-300 bg-white p-12 text-center">
-          <h4 className="text-lg font-semibold text-gray-900">No matching line items</h4>
-          <p className="mt-2 text-sm text-gray-500">Adjust the search or filters to widen the view.</p>
-        </div>
+        <EmptyState tone="rose">Couldn&apos;t load line items.</EmptyState>
+      ) : rows.length === 0 ? (
+        <EmptyState>{lineItems.length === 0 ? 'No line items yet.' : 'No matches.'}</EmptyState>
       ) : (
-        <div
-          ref={exportRef}
-          className="overflow-x-auto rounded-[2rem] border border-slate-200 bg-white shadow-sm"
-        >
-          <table className="w-full min-w-max border-collapse text-[11px] leading-4 text-slate-700">
+        // Its own scroll box, both axes: sticky header and sticky columns
+        // stick to THIS box, not to the workspace scroller around it.
+        <div data-testid="master-view-table" className="min-h-0 flex-1 overflow-auto rounded-[1.5rem] border border-slate-200 bg-white shadow-sm">
+          <table className="w-full min-w-max border-separate border-spacing-0 text-[11px] leading-4 text-slate-700">
             <thead>
-              <tr className="bg-slate-100 text-left">
-                <th className="sticky left-0 z-20 w-2 min-w-2 border-b border-r border-slate-200 bg-slate-100 p-0" />
-                <HeaderCell sticky left={STICKY_LEFT.number} className="w-[72px] min-w-[72px]">
-                  #
-                </HeaderCell>
-                <HeaderCell sticky left={STICKY_LEFT.discipline} className="w-[128px] min-w-[128px]">
-                  Discipline
-                </HeaderCell>
-                {nameField ? (
-                  <HeaderCell sticky left={STICKY_LEFT.name} className="w-[200px] min-w-[200px]">
-                    {nameField.label}
-                  </HeaderCell>
+              <tr className="text-left">
+                <th
+                  className="sticky left-0 top-0 z-30 border-b border-r border-slate-200 bg-slate-100 p-0"
+                  style={{ width: STRIPE_WIDTH, minWidth: STRIPE_WIDTH }}
+                />
+                {defs.map((def) => {
+                  const left = stickyLeft(def)
+                  const width =
+                    def.key === MASTER_COLUMN_KEYS.itemNumber ? NUMBER_WIDTH : left !== undefined ? NAME_WIDTH : undefined
+                  const active = sort.key === def.key
+                  return (
+                    <th
+                      key={def.key}
+                      style={{ left, width, minWidth: width, maxWidth: width }}
+                      aria-sort={active ? (sort.direction === 'asc' ? 'ascending' : 'descending') : undefined}
+                      className={`sticky top-0 border-b border-r border-slate-200 bg-slate-100 p-0 ${
+                        left !== undefined ? 'z-30' : 'z-20'
+                      } ${width ? '' : columnWidthClass(def)}`}
+                    >
+                      <button
+                        type="button"
+                        onClick={() => toggleSort(def.key)}
+                        className="flex w-full items-center gap-1 px-2 py-3 text-left text-[10px] font-semibold uppercase tracking-[0.14em] text-slate-600 hover:text-slate-950"
+                      >
+                        <span>{def.label}</span>
+                        <span aria-hidden className="inline-block w-2 text-slate-950">
+                          {active ? (sort.direction === 'desc' ? '↓' : '↑') : null}
+                        </span>
+                      </button>
+                    </th>
+                  )
+                })}
+                {editing ? (
+                  <th className="sticky right-0 top-0 z-30 min-w-[132px] border-b border-l border-slate-200 bg-slate-100 px-2 py-3" />
                 ) : null}
-                <HeaderCell className="min-w-[144px]">Organization</HeaderCell>
-                {scrollingFields.map((field) => (
-                  <HeaderCell key={field.id} className={columnWidthClass(field)}>
-                    {field.label}
-                  </HeaderCell>
-                ))}
-                <HeaderCell className="w-[150px]">Submitted By</HeaderCell>
               </tr>
             </thead>
             <tbody>
-              {filteredItems.map((item) => {
+              {rows.map((item) => {
                 const color = getDisciplineColor(item.discipline)
+                const tint = `${color}10`
+                const draft = drafts[item.id]
+                const status = rowStatus[item.id] ?? {}
+                const raw = rawById.get(item.id) ?? item
 
                 return (
-                  <tr key={item.id} style={{ backgroundColor: colorTint(color, '10') }}>
-                    <td className="sticky left-0 z-10 w-2 min-w-2 p-0" style={{ backgroundColor: color }} />
-                    <BodyCell sticky left={STICKY_LEFT.number} tint={colorTint(color, '10')}>
-                      <span
-                        className="inline-flex rounded-full px-2 py-1 text-[10px] font-semibold text-slate-950"
-                        style={{ backgroundColor: colorTint(color, '2A') }}
-                      >
-                        {item.itemNumber}
-                      </span>
-                    </BodyCell>
-                    <BodyCell sticky left={STICKY_LEFT.discipline} tint={colorTint(color, '10')}>
-                      {item.discipline}
-                    </BodyCell>
-                    {nameField ? (
-                      <BodyCell sticky left={STICKY_LEFT.name} tint={colorTint(color, '10')}>
-                        {formatFieldValue(nameField, getFieldValue(item, nameField))}
-                      </BodyCell>
-                    ) : null}
-                    <BodyCell>{item.companyName}</BodyCell>
-                    {scrollingFields.map((field) => {
-                      const raw = getFieldValue(item, field)
+                  <tr
+                    key={item.id}
+                    style={{ backgroundColor: tint }}
+                    onKeyDown={(e) => {
+                      // Enter in a single-line input saves the row.
+                      const target = e.target as HTMLElement
+                      if (
+                        editing &&
+                        e.key === 'Enter' &&
+                        target instanceof HTMLInputElement &&
+                        target.type !== 'checkbox' &&
+                        draft
+                      ) {
+                        e.preventDefault()
+                        void saveRow(item.id)
+                      }
+                    }}
+                  >
+                    <td
+                      className="sticky left-0 z-10 border-b border-slate-200 p-0"
+                      style={{ backgroundColor: color, width: STRIPE_WIDTH, minWidth: STRIPE_WIDTH }}
+                    />
+                    {defs.map((def) => {
+                      const left = stickyLeft(def)
+                      const stickyStyle =
+                        left !== undefined
+                          ? {
+                              left,
+                              // Opaque, or the cells scrolling under it show through.
+                              backgroundImage: `linear-gradient(${tint}, ${tint})`,
+                              backgroundColor: '#fff',
+                            }
+                          : undefined
+                      const cellClass = `border-b border-r border-slate-200 px-2 py-2 align-top ${
+                        left !== undefined ? 'sticky z-10' : ''
+                      }`
 
-                      if (field.inputType === 'boolean') {
-                        const isYes = raw === true || raw === 'Yes'
+                      if (def.kind === 'itemNumber') {
                         return (
-                          <BodyCell key={field.id} centered>
-                            {isYes ? 'Y' : ''}
-                          </BodyCell>
+                          <td key={def.key} style={stickyStyle} className={cellClass}>
+                            <span
+                              className="inline-flex rounded-full px-2 py-1 text-[10px] font-semibold text-slate-950"
+                              style={{ backgroundColor: `${color}2A` }}
+                            >
+                              {item.itemNumber}
+                            </span>
+                          </td>
                         )
                       }
 
-                      return <BodyCell key={field.id}>{formatFieldValue(field, raw)}</BodyCell>
+                      if (def.kind === 'field' && editing) {
+                        const field = fieldByKey.get(def.key) ?? def.field
+                        const value =
+                          draft && def.key in draft ? draft[def.key] : initialCellValue(field, raw)
+                        return (
+                          <td
+                            key={def.key}
+                            style={stickyStyle}
+                            className={`${cellClass} ${draft && def.key in draft ? 'bg-amber-50/70' : ''}`}
+                          >
+                            <EditableCell
+                              field={field}
+                              value={value}
+                              onChange={(next) => setCell(item, field, next)}
+                              error={status.fieldErrors?.[def.key]}
+                              disabled={status.saving}
+                              synergyOptions={synergyOptions.filter((t) => t !== item.discipline)}
+                            />
+                            {status.fieldErrors?.[def.key] ? (
+                              <p className="mt-1 max-w-[220px] text-[10px] text-rose-600">
+                                {status.fieldErrors[def.key]}
+                              </p>
+                            ) : null}
+                          </td>
+                        )
+                      }
+
+                      if (def.kind === 'field' && def.field.inputType === 'boolean') {
+                        const v = initialCellValue(def.field, item)
+                        return (
+                          <td key={def.key} style={stickyStyle} className={`${cellClass} text-center text-sm font-semibold text-slate-800`}>
+                            {v === true ? 'Y' : v === false ? 'N' : '-'}
+                          </td>
+                        )
+                      }
+
+                      return (
+                        <td key={def.key} style={stickyStyle} className={cellClass}>
+                          {masterCellText(def, item) || '-'}
+                        </td>
+                      )
                     })}
-                    <BodyCell>{item.userEmail}</BodyCell>
+                    {editing ? (
+                      <td className="sticky right-0 z-10 border-b border-l border-slate-200 bg-white px-2 py-2 align-top">
+                        <RowActions
+                          dirty={Boolean(draft)}
+                          saving={Boolean(status.saving)}
+                          error={status.error}
+                          onSave={() => void saveRow(item.id)}
+                          onRevert={() => revertRow(item.id)}
+                        />
+                      </td>
+                    ) : null}
                   </tr>
                 )
               })}
@@ -444,64 +552,88 @@ export default function MasterViewTab({ project, permissions }: Props) {
           </table>
         </div>
       )}
+
+      <Modal
+        open={confirmDone}
+        onClose={() => setConfirmDone(false)}
+        title="Discard unsaved changes?"
+        size="sm"
+        footer={
+          <div className="flex justify-end gap-2">
+            <button
+              type="button"
+              onClick={() => setConfirmDone(false)}
+              className="rounded-xl border border-slate-200 bg-white px-4 py-2 text-sm font-medium text-slate-700"
+            >
+              Keep editing
+            </button>
+            <button
+              type="button"
+              onClick={discardAndFinish}
+              className="rounded-xl bg-rose-600 px-4 py-2 text-sm font-medium text-white"
+            >
+              Discard
+            </button>
+          </div>
+        }
+      >
+        <p className="text-sm text-slate-600">
+          {dirtyIds.length} {dirtyIds.length === 1 ? 'row has' : 'rows have'} unsaved changes.
+        </p>
+      </Modal>
     </div>
   )
 }
 
-function HeaderCell({
-  children,
-  className = '',
-  sticky = false,
-  left,
+function RowActions({
+  dirty,
+  saving,
+  error,
+  onSave,
+  onRevert,
 }: {
-  children: React.ReactNode
-  className?: string
-  sticky?: boolean
-  left?: number
+  dirty: boolean
+  saving: boolean
+  error?: string
+  onSave: () => void
+  onRevert: () => void
 }) {
+  if (saving) return <span className="text-[11px] text-slate-500">Saving…</span>
   return (
-    <th
-      style={sticky ? { left } : undefined}
-      className={`border-b border-r border-slate-200 px-2 py-3 text-[10px] font-semibold uppercase tracking-[0.14em] text-slate-600 ${
-        sticky ? 'sticky z-20 bg-slate-100' : ''
-      } ${className}`}
-    >
-      {children}
-    </th>
+    <div className="space-y-1">
+      {dirty ? (
+        <div className="flex gap-1">
+          <button
+            type="button"
+            onClick={onSave}
+            className="rounded-lg bg-black px-2.5 py-1 text-[11px] font-medium text-white"
+          >
+            Save
+          </button>
+          <button
+            type="button"
+            onClick={onRevert}
+            className="rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-medium text-slate-600"
+          >
+            Revert
+          </button>
+        </div>
+      ) : null}
+      {error ? (
+        <p role="alert" className="max-w-[160px] text-[10px] text-rose-600">
+          {error}
+        </p>
+      ) : null}
+    </div>
   )
 }
 
-function BodyCell({
-  children,
-  centered = false,
-  sticky = false,
-  left,
-  tint,
-}: {
-  children: React.ReactNode
-  centered?: boolean
-  sticky?: boolean
-  left?: number
-  /** Row tint (translucent hex). A sticky cell must be opaque or the cells
-   *  scrolling under it show through, so the tint is laid over white. */
-  tint?: string
-}) {
+function EmptyState({ children, tone = 'gray' }: { children: React.ReactNode; tone?: 'gray' | 'amber' | 'rose' }) {
+  const border = tone === 'amber' ? 'border-amber-300' : tone === 'rose' ? 'border-rose-300' : 'border-gray-300'
+  const text = tone === 'rose' ? 'text-rose-600' : 'text-gray-500'
   return (
-    <td
-      style={
-        sticky
-          ? {
-              left,
-              backgroundImage: tint ? `linear-gradient(${tint}, ${tint})` : undefined,
-              backgroundColor: '#fff',
-            }
-          : undefined
-      }
-      className={`border-b border-r border-slate-200 px-2 py-3 align-top ${
-        sticky ? 'sticky z-10' : ''
-      } ${centered ? 'text-center text-sm font-semibold text-slate-800' : ''}`}
-    >
-      {children}
-    </td>
+    <div className={`rounded-[1.5rem] border border-dashed ${border} bg-white p-12 text-center`}>
+      <p className={`text-sm ${text}`}>{children}</p>
+    </div>
   )
 }

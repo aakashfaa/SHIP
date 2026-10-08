@@ -1,8 +1,6 @@
 'use client'
 
-import { AnimatePresence, motion } from 'framer-motion'
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { createPortal } from 'react-dom'
 import {
   addLineItemToChunkProject,
   addLineItemsToChunkProject,
@@ -11,14 +9,33 @@ import {
   getChunkPhasesForProject,
   getChunkProjectsForProject,
   getCostSettingsForProject,
+  getFormFieldsForProject,
   getLineItemsForProject,
   getPhaseDependenciesForProject,
   getPhaseTemplates,
   removeLineItemFromChunkProject,
+  replaceChunkPhases,
   updateChunkProject,
   updateChunkProjectItemQuantity,
+  updateLineItem,
 } from '@/lib/store'
+import { useAuth } from '@/lib/auth-context'
+import Modal from '@/components/ui/Modal'
+import EditableCell from '@/components/project-workspace/master-view/EditableCell'
+import {
+  buildRowPatch,
+  initialCellValue,
+  sameCellValue,
+  validateRowDraft,
+  type CellValue,
+  type RowDraft,
+} from '@/components/project-workspace/master-view/cell-edit'
 import { useAsyncData } from '@/lib/useAsyncData'
+import { formatFieldValue, getFieldValue } from '@/lib/form-values'
+import { useEffectiveViewSettings } from '@/lib/use-effective-view-settings'
+import { visibleColumns } from '@/lib/view-settings'
+import { CHUNKING_COLUMN_KEYS, getChunkingColumns } from '@/lib/view-columns/chunking'
+import ColumnsFilter from './view-filter/ColumnsFilter'
 import {
   QUANTITY_PARSE_MESSAGES,
   formatCurrency,
@@ -29,6 +46,7 @@ import {
 import {
   ChunkPhase,
   ChunkProject,
+  FormField,
   LineItem,
   PhaseDependency,
   PhaseTemplate,
@@ -36,6 +54,10 @@ import {
   ProjectCostSettings,
 } from '@/lib/types'
 import PhaseEditor from '@/components/project-workspace/PhaseEditor'
+import {
+  layoutTemplatePhases,
+  resolveProjectTemplate,
+} from '@/components/project-workspace/cost-model/phase-layout'
 import type { ProjectPermissions } from '@/lib/project-role'
 
 type Props = {
@@ -108,6 +130,15 @@ function getDisciplineStyles(discipline: string) {
   )
 }
 
+/** Answer edits that commit the moment they change: there is no "still
+ *  typing" state for a tick box or a dropdown. Everything else -- dates
+ *  included, since typing one by keyboard passes through invalid years --
+ *  commits when focus leaves the cell (or on Enter). */
+const COMMIT_ON_CHANGE = new Set<FormField['inputType']>(['boolean', 'select'])
+
+/** What is left to do for a package whose creation half-failed. */
+type CreateRepair = { chunkId: string; needsPhases: boolean; lineItemIds: string[] }
+
 function itemNumberSort(a: string, b: string) {
   const aMatch = a.match(/^([A-Z]+)(\d+)$/i)
   const bMatch = b.match(/^([A-Z]+)(\d+)$/i)
@@ -158,6 +189,7 @@ export default function ChunkingTab({ project, permissions }: Props) {
   )
   const {
     data: allLineItems,
+    setData: setAllLineItems,
     error: lineItemsError,
   } = useAsyncData<LineItem[]>(
     async () => {
@@ -194,7 +226,24 @@ export default function ChunkingTab({ project, permissions }: Props) {
     [project.id],
     null
   )
+  const { data: formFields } = useAsyncData<FormField[]>(
+    () => getFormFieldsForProject(project.id),
+    [project.id],
+    []
+  )
+  // Project default, or this person's own Filter choice on top of it.
+  const phasingView = useEffectiveViewSettings(project.id, 'chunking', permissions.isAdmin)
+  const columnCatalog = useMemo(() => getChunkingColumns(formFields), [formFields])
+  const columns = useMemo(
+    () => visibleColumns(columnCatalog, phasingView.effective.hiddenColumns),
+    [columnCatalog, phasingView.effective.hiddenColumns]
+  )
+  const fieldByKey = useMemo(() => new Map(formFields.map((f) => [f.key, f])), [formFields])
   const [isCreateDialogOpen, setIsCreateDialogOpen] = useState(false)
+  // Set when a package was created but a later step failed: the dialog
+  // closes (retrying Create would make a duplicate) and the page offers to
+  // finish just the failed steps on THAT package.
+  const [createRepair, setCreateRepair] = useState<CreateRepair | null>(null)
   const [newChunkName, setNewChunkName] = useState('')
   const [selectedLineItemIds, setSelectedLineItemIds] = useState<string[]>([])
   const [searchQuery, setSearchQuery] = useState('')
@@ -211,6 +260,30 @@ export default function ChunkingTab({ project, permissions }: Props) {
   const [actionError, setActionError] = useState<string | null>(null)
   const [quantityDrafts, setQuantityDrafts] = useState<Record<string, string>>({})
   const [quantityErrors, setQuantityErrors] = useState<Record<string, string>>({})
+
+  const { user } = useAuth()
+  const synergyOptions = useMemo(
+    () => Array.from(new Set(project.consultants.map((c) => c.type))),
+    [project.consultants]
+  )
+  // Line-item answers edited in place (same pieces as Master View's edit
+  // mode). Drafts are mirrored in a ref so a blur handler reads what was
+  // typed, not the value from the render it was created in.
+  const [answersEditingChunkId, setAnswersEditingChunkId] = useState<string | null>(null)
+  const [answerDrafts, setAnswerDrafts] = useState<Record<string, RowDraft>>({})
+  const [answerStatus, setAnswerStatus] = useState<
+    Record<string, { saving?: boolean; error?: string }>
+  >({})
+  const answerDraftsRef = useRef<Record<string, RowDraft>>({})
+  const lineItemsRef = useRef(allLineItems)
+  const answerSaveChains = useRef(new Map<string, Promise<void>>())
+  // The value each cell is saving right now, so the blur that follows a
+  // dropdown's commit-on-change does not send the same write twice.
+  const answerInFlight = useRef(new Map<string, CellValue>())
+
+  useEffect(() => {
+    lineItemsRef.current = allLineItems
+  }, [allLineItems])
 
   const isMountedRef = useRef(true)
   const quantityTimers = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map())
@@ -256,34 +329,98 @@ export default function ChunkingTab({ project, permissions }: Props) {
     setSelectedLineItemIds([])
   }
 
+  /**
+   * The remaining steps of a package creation: its phases from the project's
+   * one phase template (Cost model; DCAMM if unset, then one Construction
+   * phase), then its line items. Returns what is still left if a step fails.
+   */
+  async function finishPackage(repair: CreateRepair): Promise<CreateRepair | null> {
+    let left = repair
+    try {
+      if (left.needsPhases) {
+        const template = resolveProjectTemplate(
+          phaseTemplates,
+          costSettings?.defaultPhaseTemplateId ?? null
+        )
+        await replaceChunkPhases(left.chunkId, layoutTemplatePhases(template, 0))
+        left = { ...left, needsPhases: false }
+      }
+      if (left.lineItemIds.length > 0) {
+        await addLineItemsToChunkProject(left.chunkId, left.lineItemIds)
+        left = { ...left, lineItemIds: [] }
+      }
+      return null
+    } catch (err) {
+      throw Object.assign(err instanceof Error ? err : new Error(String(err)), { left })
+    }
+  }
+
   async function handleCreateChunk() {
     if (!newChunkName.trim()) return
 
     setActionError(null)
+    setCreateRepair(null)
     setIsCreatingChunk(true)
+    let created: ChunkProject | null = null
     try {
-      const created = await createChunkProject({
+      created = await createChunkProject({
         projectId: project.id,
         name: newChunkName.trim(),
       })
-
-      if (selectedLineItemIds.length > 0) {
-        await addLineItemsToChunkProject(created.id, selectedLineItemIds)
-      }
+      await finishPackage({
+        chunkId: created.id,
+        needsPhases: true,
+        lineItemIds: selectedLineItemIds,
+      })
 
       if (!isMountedRef.current) return
-
-      setNewChunkName('')
-      setSelectedLineItemIds([])
-      setSearchQuery('')
-      setIsCreateDialogOpen(false)
+      handleCloseCreateDialog()
       reloadChunks()
+      reloadPhases()
       setExpandedChunkId(created.id)
     } catch (err) {
       if (!isMountedRef.current) return
-      setActionError(err instanceof Error ? err.message : 'Failed to create package.')
+      const message = err instanceof Error ? err.message : 'Failed to create package.'
+      if (created) {
+        // The package exists. Close the dialog so Create cannot make a
+        // second one, open the package, and offer to finish it.
+        const left = (err as { left?: CreateRepair }).left ?? {
+          chunkId: created.id,
+          needsPhases: true,
+          lineItemIds: selectedLineItemIds,
+        }
+        handleCloseCreateDialog()
+        reloadChunks()
+        reloadPhases()
+        setExpandedChunkId(created.id)
+        setCreateRepair(left)
+        setActionError(`${created.chunkNumber} was created, but not finished: ${message}`)
+      } else {
+        setActionError(message)
+      }
     } finally {
       if (isMountedRef.current) setIsCreatingChunk(false)
+    }
+  }
+
+  async function handleRetryCreate() {
+    if (!createRepair) return
+    setIsCreatingChunk(true)
+    try {
+      await finishPackage(createRepair)
+      if (!isMountedRef.current) return
+      setCreateRepair(null)
+      setActionError(null)
+    } catch (err) {
+      if (!isMountedRef.current) return
+      setCreateRepair((err as { left?: CreateRepair }).left ?? createRepair)
+      setActionError(err instanceof Error ? err.message : 'Failed to finish the package.')
+    } finally {
+      if (isMountedRef.current) {
+        setIsCreatingChunk(false)
+        reloadChunks()
+        reloadPhases()
+      }
     }
   }
 
@@ -444,6 +581,122 @@ export default function ChunkingTab({ project, permissions }: Props) {
     quantityTimers.current.set(key, timer)
   }
 
+  /* ------------------------------------------------ line-item answers -- */
+
+  const myEmail = user?.email?.toLowerCase() ?? null
+
+  /**
+   * Exactly what line_items_update (migration 0009) allows: admins and
+   * editors any row in the project, a consultant only rows they submitted,
+   * a viewer nothing. False while the role is still loading.
+   */
+  function canEditAnswers(item: LineItem): boolean {
+    if (permissions.loading || permissions.isViewer) return false
+    if (permissions.canEdit) return true
+    return (
+      permissions.canContribute && myEmail !== null && item.userEmail.toLowerCase() === myEmail
+    )
+  }
+
+  function setAnswerDraft(item: LineItem, field: FormField, value: CellValue) {
+    const initial = initialCellValue(field, item)
+    const row = { ...(answerDraftsRef.current[item.id] ?? {}) }
+    if (sameCellValue(value, initial)) delete row[field.key]
+    else row[field.key] = value
+    const next = { ...answerDraftsRef.current }
+    if (Object.keys(row).length > 0) next[item.id] = row
+    else delete next[item.id]
+    answerDraftsRef.current = next
+    setAnswerDrafts(next)
+    const statusKey = `${item.id}:${field.key}`
+    setAnswerStatus((prev) => {
+      if (!prev[statusKey]?.error) return prev
+      const copy = { ...prev }
+      delete copy[statusKey]
+      return copy
+    })
+  }
+
+  /**
+   * Saves one changed answer through the same validation and patch builder
+   * as Master View (master-view/cell-edit.ts). The ECC is re-derived by the
+   * database trigger from the saved cost, and the returned row replaces the
+   * old one, so the package totals above re-price from it.
+   *
+   * Saves for one row run one at a time: a custom-field patch carries the
+   * row's whole customFields object, so two in flight at once would let the
+   * second undo the first.
+   */
+  function commitAnswer(itemId: string, field: FormField) {
+    const value = answerDraftsRef.current[itemId]?.[field.key]
+    if (value === undefined) return
+    const statusKey = `${itemId}:${field.key}`
+    const inFlight = answerInFlight.current.get(statusKey)
+    if (inFlight !== undefined && sameCellValue(inFlight, value)) return
+    const draft: RowDraft = { [field.key]: value }
+    const errors = validateRowDraft(formFields, draft)
+    if (errors[field.key]) {
+      setAnswerStatus((prev) => ({ ...prev, [statusKey]: { error: errors[field.key] } }))
+      return
+    }
+    setAnswerStatus((prev) => ({ ...prev, [statusKey]: { saving: true } }))
+    answerInFlight.current.set(statusKey, value)
+
+    const run = async () => {
+      const item = lineItemsRef.current.find((row) => row.id === itemId)
+      if (!item) {
+        answerInFlight.current.delete(statusKey)
+        return
+      }
+      try {
+        const updated = await updateLineItem(itemId, buildRowPatch(item, formFields, draft))
+        if (!updated) throw new Error('Not saved: you no longer have access to this item.')
+        lineItemsRef.current = lineItemsRef.current.map((row) =>
+          row.id === updated.id ? updated : row
+        )
+        if (!isMountedRef.current) return
+        setAllLineItems((prev) => prev.map((row) => (row.id === updated.id ? updated : row)))
+        // Drop the draft only if nothing new was typed while saving.
+        const current = answerDraftsRef.current[itemId]
+        if (current && field.key in current && sameCellValue(current[field.key], value)) {
+          const row = { ...current }
+          delete row[field.key]
+          const next = { ...answerDraftsRef.current }
+          if (Object.keys(row).length > 0) next[itemId] = row
+          else delete next[itemId]
+          answerDraftsRef.current = next
+          setAnswerDrafts(next)
+        }
+        setAnswerStatus((prev) => {
+          const copy = { ...prev }
+          delete copy[statusKey]
+          return copy
+        })
+      } catch (err) {
+        if (!isMountedRef.current) return
+        setAnswerStatus((prev) => ({
+          ...prev,
+          [statusKey]: { error: err instanceof Error ? err.message : 'Failed to save.' },
+        }))
+      } finally {
+        if (answerInFlight.current.get(statusKey) === value) answerInFlight.current.delete(statusKey)
+      }
+    }
+
+    const chained = (answerSaveChains.current.get(itemId) ?? Promise.resolve()).then(run)
+    answerSaveChains.current.set(itemId, chained)
+  }
+
+  function toggleAnswersEditing(chunkId: string) {
+    const closing = answersEditingChunkId === chunkId
+    setAnswersEditingChunkId(closing ? null : chunkId)
+    // Anything still showing is either saved already or failed validation;
+    // leaving edit mode drops the failed text rather than keeping it hidden.
+    answerDraftsRef.current = {}
+    setAnswerDrafts({})
+    setAnswerStatus({})
+  }
+
   const lineItemMap = useMemo(
     () => new Map(allLineItems.map((item) => [item.id, item])),
     [allLineItems]
@@ -487,15 +740,13 @@ export default function ChunkingTab({ project, permissions }: Props) {
       <div className="flex flex-col gap-4 rounded-[1.75rem] border border-slate-200 bg-white/86 p-5 shadow-sm md:flex-row md:items-center md:justify-between">
         <div>
           <h2 className="text-xl font-semibold tracking-tight text-slate-950">Packages</h2>
-          <p className="mt-1 text-sm text-slate-500">
-            Group line items into package chunks and manage quantities in place.
-          </p>
         </div>
 
         <div className="flex flex-wrap items-center gap-3">
           <div className="rounded-full bg-slate-100 px-3 py-2 text-xs font-medium text-slate-600">
             {chunkProjects.length} Packages
           </div>
+          <ColumnsFilter view={phasingView} columns={columnCatalog} />
           {canEdit || permissionsLoading ? (
             <button
               type="button"
@@ -516,6 +767,16 @@ export default function ChunkingTab({ project, permissions }: Props) {
             lineItemsError?.message ||
             phasesError?.message ||
             'Something went wrong.'}
+          {createRepair && actionError ? (
+            <button
+              type="button"
+              onClick={() => void handleRetryCreate()}
+              disabled={isCreatingChunk}
+              className="ml-3 rounded-full border border-red-300 bg-white px-3 py-1 text-xs font-semibold text-red-700 transition hover:bg-red-100 disabled:opacity-50"
+            >
+              {isCreatingChunk ? 'Retrying…' : 'Retry'}
+            </button>
+          ) : null}
         </div>
       ) : null}
 
@@ -575,6 +836,9 @@ export default function ChunkingTab({ project, permissions }: Props) {
               (d) =>
                 !(chunkPhaseIds.has(d.predecessorPhaseId) && chunkPhaseIds.has(d.successorPhaseId))
             ).length
+
+            const answersEditing = answersEditingChunkId === chunk.id
+            const anyAnswerEditable = linkedItems.some((entry) => canEditAnswers(entry.item))
 
             const availableItems = allLineItems.filter(
               (item) => !chunk.itemLinks.some((link) => link.lineItemId === item.id)
@@ -719,6 +983,23 @@ export default function ChunkingTab({ project, permissions }: Props) {
                 </div>
 
                 <div className="px-6 py-6">
+                  {linkedItems.length > 0 && (anyAnswerEditable || answersEditing) ? (
+                    <div className="mb-3 flex justify-end">
+                      <button
+                        type="button"
+                        onClick={() => toggleAnswersEditing(chunk.id)}
+                        aria-pressed={answersEditing}
+                        aria-label={`${answersEditing ? 'Done editing' : 'Edit'} answers in package ${chunk.chunkNumber}`}
+                        className={`rounded-full border px-3 py-1 text-xs font-semibold transition ${
+                          answersEditing
+                            ? 'border-slate-900 bg-slate-950 text-white'
+                            : 'border-slate-200 bg-white text-slate-700 hover:border-slate-300'
+                        }`}
+                      >
+                        {answersEditing ? 'Done' : 'Edit answers'}
+                      </button>
+                    </div>
+                  ) : null}
                   {linkedItems.length === 0 ? (
                     <div className="rounded-[1.5rem] border border-dashed border-slate-200 px-4 py-10 text-center text-sm text-slate-400">
                       Empty
@@ -726,36 +1007,17 @@ export default function ChunkingTab({ project, permissions }: Props) {
                   ) : (
                     <div className="overflow-hidden rounded-[1.6rem] border border-slate-200 bg-white">
                       <div className="overflow-x-auto">
-                        <table className="min-w-[1220px] border-collapse text-sm">
+                        <table className="min-w-full border-collapse text-sm">
                           <thead>
                             <tr className="bg-slate-950 text-left">
-                              <th className="px-4 py-3 text-[11px] font-semibold uppercase tracking-[0.18em] text-white/70">
-                                Discipline
-                              </th>
-                              <th className="px-4 py-3 text-[11px] font-semibold uppercase tracking-[0.18em] text-white/70">
-                                #
-                              </th>
-                              <th className="px-4 py-3 text-[11px] font-semibold uppercase tracking-[0.18em] text-white/70">
-                                Name
-                              </th>
-                              <th className="px-4 py-3 text-[11px] font-semibold uppercase tracking-[0.18em] text-white/70">
-                                Desc
-                              </th>
-                              <th className="px-4 py-3 text-[11px] font-semibold uppercase tracking-[0.18em] text-white/70">
-                                Category
-                              </th>
-                              <th className="px-4 py-3 text-[11px] font-semibold uppercase tracking-[0.18em] text-white/70">
-                                Timeline
-                              </th>
-                              <th className="px-4 py-3 text-[11px] font-semibold uppercase tracking-[0.18em] text-white/70">
-                                Cost
-                              </th>
-                              <th className="px-4 py-3 text-[11px] font-semibold uppercase tracking-[0.18em] text-white/70">
-                                Notes
-                              </th>
-                              <th className="px-4 py-3 text-[11px] font-semibold uppercase tracking-[0.18em] text-white/70">
-                                Qty
-                              </th>
+                              {columns.map((column) => (
+                                <th
+                                  key={column.key}
+                                  className="px-4 py-3 text-[11px] font-semibold uppercase tracking-[0.18em] text-white/70"
+                                >
+                                  {column.label}
+                                </th>
+                              ))}
                             </tr>
                           </thead>
                           <tbody>
@@ -775,73 +1037,165 @@ export default function ChunkingTab({ project, permissions }: Props) {
                                   key={item.id}
                                   className={`border-t border-slate-100 ${styles.surface} ${styles.row}`}
                                 >
-                                  <td className="px-4 py-3 align-top">
-                                    <span
-                                      className={`inline-flex rounded-full border px-2.5 py-1 text-[11px] font-semibold ${styles.badge}`}
-                                    >
-                                      {item.discipline}
-                                    </span>
-                                  </td>
-                                  <td className="px-4 py-3 align-top font-medium text-slate-950">
-                                    {item.itemNumber}
-                                  </td>
-                                  <td className="px-4 py-3 align-top font-medium text-slate-950">
-                                    {item.name}
-                                  </td>
-                                  <td className="px-4 py-3 align-top text-slate-600">
-                                    {item.shortDescription || '-'}
-                                  </td>
-                                  <td className="px-4 py-3 align-top text-slate-600">
-                                    {item.category}
-                                  </td>
-                                  <td className="px-4 py-3 align-top text-slate-600">
-                                    {item.timelinePriority}
-                                  </td>
-                                  <td className="px-4 py-3 align-top text-slate-600">
-                                    <div>{item.relativeFirstCost}</div>
-                                    <div className="mt-1 text-xs text-slate-500">
-                                      Base: {item.estimatedFirstCost || '-'}
-                                    </div>
-                                    <div className="mt-1 text-xs font-semibold text-slate-700">
-                                      Total: {formatCurrency(lineItemTotal)}
-                                    </div>
-                                  </td>
-                                  <td className="max-w-[340px] px-4 py-3 align-top text-slate-600">
-                                    <div className="whitespace-pre-wrap">
-                                      {item.supportingNotes || '-'}
-                                    </div>
-                                  </td>
-                                  <td className="px-4 py-3 align-top">
-                                    <input
-                                      aria-label={`Quantity for ${item.itemNumber}`}
-                                      aria-invalid={quantityError ? true : undefined}
-                                      value={effectiveQuantity}
-                                      onChange={(e) =>
-                                        handleQuantityChange(chunk.id, item.id, e.target.value)
-                                      }
-                                      // Quantity multiplies straight into the
-                                      // package ECC, so it is a cost edit even
-                                      // though it looks like a table cell.
-                                      readOnly={!canEdit}
-                                      placeholder="Qty"
-                                      title={quantityError}
-                                      className={`w-28 rounded-[0.95rem] border bg-white px-3 py-2 text-sm outline-none transition focus:border-teal-500 focus:ring-2 focus:ring-teal-100 ${
-                                        quantityError ? 'border-red-300' : 'border-slate-200'
-                                      }`}
-                                    />
-                                    {quantityError ? (
-                                      <div
-                                        role="alert"
-                                        className="mt-1 max-w-[11rem] text-xs text-red-600"
+                                  {columns.map((column) => {
+                                    if (column.key === CHUNKING_COLUMN_KEYS.itemNumber) {
+                                      return (
+                                        <td
+                                          key={column.key}
+                                          className="px-4 py-3 align-top font-medium text-slate-950"
+                                        >
+                                          {item.itemNumber}
+                                        </td>
+                                      )
+                                    }
+                                    const editField =
+                                      answersEditing && canEditAnswers(item)
+                                        ? fieldByKey.get(column.key)
+                                        : undefined
+                                    if (editField) {
+                                      const statusKey = `${item.id}:${editField.key}`
+                                      const status = answerStatus[statusKey]
+                                      const draftRow = answerDrafts[item.id]
+                                      const dirty = Boolean(draftRow && editField.key in draftRow)
+                                      const value = dirty
+                                        ? draftRow[editField.key]
+                                        : initialCellValue(editField, item)
+                                      return (
+                                        <td
+                                          key={column.key}
+                                          onBlur={(event) => {
+                                            // Focus moving inside the cell (a
+                                            // multiselect's popover) is not leaving it.
+                                            if (
+                                              !event.currentTarget.contains(
+                                                event.relatedTarget as Node | null
+                                              )
+                                            ) {
+                                              commitAnswer(item.id, editField)
+                                            }
+                                          }}
+                                          onKeyDown={(event) => {
+                                            if (
+                                              event.key === 'Enter' &&
+                                              !(event.target instanceof HTMLTextAreaElement)
+                                            ) {
+                                              commitAnswer(item.id, editField)
+                                            }
+                                          }}
+                                          className={`min-w-[140px] max-w-[340px] px-4 py-3 align-top ${
+                                            dirty ? 'bg-amber-50/70' : ''
+                                          }`}
+                                        >
+                                          <EditableCell
+                                            field={editField}
+                                            value={value}
+                                            onChange={(next) => {
+                                              setAnswerDraft(item, editField, next)
+                                              if (COMMIT_ON_CHANGE.has(editField.inputType)) {
+                                                commitAnswer(item.id, editField)
+                                              }
+                                            }}
+                                            error={status?.error}
+                                            disabled={status?.saving}
+                                            synergyOptions={synergyOptions.filter(
+                                              (t) => t !== item.discipline
+                                            )}
+                                          />
+                                          {status?.error ? (
+                                            <p className="mt-1 max-w-[220px] text-[10px] text-rose-600">
+                                              {status.error}
+                                            </p>
+                                          ) : null}
+                                        </td>
+                                      )
+                                    }
+                                    if (column.key === CHUNKING_COLUMN_KEYS.name) {
+                                      return (
+                                        <td
+                                          key={column.key}
+                                          className="px-4 py-3 align-top font-medium text-slate-950"
+                                        >
+                                          {item.name}
+                                        </td>
+                                      )
+                                    }
+                                    if (column.key === CHUNKING_COLUMN_KEYS.total) {
+                                      return (
+                                        <td
+                                          key={column.key}
+                                          className="px-4 py-3 align-top font-semibold text-slate-700"
+                                        >
+                                          {formatCurrency(lineItemTotal)}
+                                        </td>
+                                      )
+                                    }
+                                    if (column.key === CHUNKING_COLUMN_KEYS.quantity) {
+                                      return (
+                                        <td key={column.key} className="px-4 py-3 align-top">
+                                          <input
+                                            aria-label={`Quantity for ${item.itemNumber}`}
+                                            aria-invalid={quantityError ? true : undefined}
+                                            value={effectiveQuantity}
+                                            onChange={(e) =>
+                                              handleQuantityChange(chunk.id, item.id, e.target.value)
+                                            }
+                                            // Quantity multiplies straight into the
+                                            // package ECC, so it is a cost edit even
+                                            // though it looks like a table cell.
+                                            readOnly={!canEdit}
+                                            placeholder="Qty"
+                                            title={quantityError}
+                                            className={`w-28 rounded-[0.95rem] border bg-white px-3 py-2 text-sm outline-none transition focus:border-teal-500 focus:ring-2 focus:ring-teal-100 ${
+                                              quantityError ? 'border-red-300' : 'border-slate-200'
+                                            }`}
+                                          />
+                                          {quantityError ? (
+                                            <div
+                                              role="alert"
+                                              className="mt-1 max-w-[11rem] text-xs text-red-600"
+                                            >
+                                              {quantityError}
+                                            </div>
+                                          ) : quantityInputFeedback(effectiveQuantity).kind === 'ok' ? (
+                                            // Echo the parsed value ("1,200" -> "= 1,200") so a
+                                            // quantity that feeds straight into the ECC is
+                                            // confirmed as read, not just accepted (M-10).
+                                            <div className="mt-1 text-xs text-slate-500">
+                                              {quantityInputFeedback(effectiveQuantity).message}
+                                            </div>
+                                          ) : null}
+                                        </td>
+                                      )
+                                    }
+
+                                    // Not a form field: the system stamps it from
+                                    // the submitter, so it is read off the item.
+                                    if (column.key === CHUNKING_COLUMN_KEYS.discipline) {
+                                      return (
+                                        <td key={column.key} className="px-4 py-3 align-top">
+                                          <span
+                                            className={`inline-flex rounded-full border px-2.5 py-1 text-[11px] font-semibold ${styles.badge}`}
+                                          >
+                                            {item.discipline || '-'}
+                                          </span>
+                                        </td>
+                                      )
+                                    }
+
+                                    const field = fieldByKey.get(column.key)
+                                    if (!field) return <td key={column.key} className="px-4 py-3" />
+                                    const text = formatFieldValue(field, getFieldValue(item, field), {
+                                      empty: '-',
+                                    })
+                                    return (
+                                      <td
+                                        key={column.key}
+                                        className="max-w-[340px] px-4 py-3 align-top text-slate-600"
                                       >
-                                        {quantityError}
-                                      </div>
-                                    ) : quantityInputFeedback(effectiveQuantity).kind === 'ok' ? (
-                                      <div className="mt-1 text-xs text-slate-500">
-                                        {quantityInputFeedback(effectiveQuantity).message}
-                                      </div>
-                                    ) : null}
-                                  </td>
+                                        <div className="whitespace-pre-wrap">{text}</div>
+                                      </td>
+                                    )
+                                  })}
                                 </tr>
                               )
                             })}
@@ -972,14 +1326,9 @@ export default function ChunkingTab({ project, permissions }: Props) {
 
                     <div className="mt-6">
                       <PhaseEditor
-                        chunkProjectId={chunk.id}
                         phases={chunkPhases}
-                        templates={phaseTemplates}
-                        defaultTemplateId={costSettings?.defaultPhaseTemplateId ?? null}
                         eccBase={chunkEccBase}
                         tpcFactor={costSettings?.tpcFactor ?? 1}
-                        readOnly={!canEdit}
-                        onChanged={reloadPhases}
                       />
                     </div>
                   </div>
@@ -990,184 +1339,161 @@ export default function ChunkingTab({ project, permissions }: Props) {
         </div>
       )}
 
-      {typeof document !== 'undefined'
-        ? createPortal(
-            <AnimatePresence>
-              {isCreateDialogOpen ? (
-                <motion.div
-                  initial={{ opacity: 0 }}
-                  animate={{ opacity: 1 }}
-                  exit={{ opacity: 0 }}
-                  className="fixed inset-0 z-[90] bg-black/42"
+      <Modal
+        open={isCreateDialogOpen}
+        onClose={handleCloseCreateDialog}
+        title="New package"
+        size="lg"
+        dismissable={!isCreatingChunk}
+        footer={
+          <>
+            <span className="mr-auto rounded-full border border-amber-200 bg-amber-50 px-3 py-1.5 text-xs font-semibold text-amber-800">
+              {selectedLineItemIds.length} selected
+            </span>
+            <button
+              type="button"
+              onClick={handleCloseCreateDialog}
+              disabled={isCreatingChunk}
+              className="rounded-[1rem] border border-slate-200 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 transition hover:border-slate-300 disabled:opacity-40"
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              onClick={handleCreateChunk}
+              disabled={!newChunkName.trim() || isCreatingChunk}
+              className="rounded-[1rem] bg-[linear-gradient(135deg,#0f172a_0%,#1e293b_48%,#0f766e_100%)] px-5 py-2.5 text-sm font-medium text-white shadow-lg transition hover:-translate-y-[1px] disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              {isCreatingChunk ? 'Creating…' : 'Create'}
+            </button>
+          </>
+        }
+      >
+        <div className="space-y-4">
+          {actionError && isCreateDialogOpen ? (
+            <div
+              role="alert"
+              className="rounded-[1.2rem] border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700"
+            >
+              {actionError}
+            </div>
+          ) : null}
+
+          <input
+            id="chunk-project-name"
+            aria-label="Package name"
+            value={newChunkName}
+            onChange={(e) => setNewChunkName(e.target.value)}
+            placeholder="Package name"
+            autoFocus
+            className="w-full rounded-[1.2rem] border border-slate-200 bg-white px-4 py-3 text-base outline-none transition focus:border-teal-500 focus:ring-2 focus:ring-teal-100"
+          />
+
+          <>
+              <div className="flex flex-col gap-2 sm:flex-row">
+                <input
+                  id="chunk-line-item-search"
+                  aria-label="Search line items"
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  placeholder="Search"
+                  className="flex-1 rounded-[1.2rem] border border-slate-200 bg-white px-4 py-2.5 text-sm outline-none transition focus:border-teal-500 focus:ring-2 focus:ring-teal-100"
+                />
+                <button
+                  type="button"
+                  onClick={handleSelectAllFiltered}
+                  disabled={filteredLineItems.length === 0}
+                  className="rounded-[1.2rem] border border-slate-200 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 transition hover:border-slate-300 disabled:cursor-not-allowed disabled:opacity-40"
                 >
-                  <div className="flex min-h-full items-center justify-center p-4 md:p-6">
-                    <motion.div
-                      initial={{ opacity: 0, y: 24, scale: 0.98 }}
-                      animate={{ opacity: 1, y: 0, scale: 1 }}
-                      exit={{ opacity: 0, y: 12, scale: 0.98 }}
-                      transition={{ duration: 0.24 }}
-                      className="w-full max-w-4xl overflow-hidden rounded-[2.25rem] bg-white shadow-2xl"
-                    >
-                <div className="flex items-center justify-between border-b border-slate-100 px-6 py-5">
-                  <div>
-                    <p className="text-sm text-slate-500">New Package</p>
-                    <div className="text-xl font-semibold tracking-tight text-slate-950">
-                      Select line items
-                    </div>
+                  All
+                </button>
+                <button
+                  type="button"
+                  onClick={handleClearSelection}
+                  disabled={selectedLineItemIds.length === 0}
+                  className="rounded-[1.2rem] border border-slate-200 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 transition hover:border-slate-300 disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  Clear
+                </button>
+              </div>
+
+              <div className="grid gap-2">
+                {filteredLineItems.length === 0 ? (
+                  <div className="rounded-[1.4rem] border border-dashed border-slate-200 px-4 py-10 text-center text-sm text-slate-400">
+                    Nothing found
                   </div>
-                  <button
-                    type="button"
-                    onClick={handleCloseCreateDialog}
-                    className="rounded-full border border-slate-200 bg-white px-4 py-2 text-sm font-medium text-slate-700 transition hover:border-slate-300"
-                  >
-                    Close
-                  </button>
-                </div>
+                ) : (
+                  filteredLineItems.map((item) => {
+                    const selected = selectedLineItemIds.includes(item.id)
+                    const styles = getDisciplineStyles(item.discipline)
 
-                <div className="max-h-[80vh] overflow-y-auto p-6">
-                  <div className="space-y-4">
-                    {actionError && isCreateDialogOpen ? (
-                      <div className="rounded-[1.4rem] border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
-                        {actionError}
-                      </div>
-                    ) : null}
-
-                    <div className="flex flex-wrap items-end gap-4">
-                      <div className="min-w-[320px] flex-1">
+                    return (
+                      <label
+                        key={item.id}
+                        className={`group flex cursor-pointer items-start gap-4 rounded-[1.2rem] border px-4 py-3 transition ${
+                          selected
+                            ? 'border-slate-900 bg-slate-950 text-white shadow-lg'
+                            : `border-slate-200 ${styles.surface} ${styles.row}`
+                        }`}
+                      >
                         <input
-                          id="chunk-project-name"
-                          value={newChunkName}
-                          onChange={(e) => setNewChunkName(e.target.value)}
-                          placeholder="Package name"
-                          className="w-full rounded-[1.35rem] border border-slate-200 bg-white/95 px-5 py-4 text-base outline-none transition focus:border-teal-500 focus:ring-2 focus:ring-teal-100"
+                          type="checkbox"
+                          checked={selected}
+                          onChange={() => handleToggleSelectedLineItem(item.id)}
+                          className="mt-1 h-4 w-4 rounded border-slate-300"
                         />
-                      </div>
 
-                      <div className="rounded-full border border-amber-200 bg-amber-50 px-3 py-2 text-xs font-semibold text-amber-800">
-                        {selectedLineItemIds.length} selected
-                      </div>
-                    </div>
-
-                    <div className="rounded-[1.8rem] border border-slate-200 bg-white/88 p-4 shadow-sm">
-                      <div className="flex flex-col gap-3 lg:flex-row">
-                        <input
-                          id="chunk-line-item-search"
-                          value={searchQuery}
-                          onChange={(e) => setSearchQuery(e.target.value)}
-                          placeholder="Search"
-                          className="flex-1 rounded-[1.2rem] border border-slate-200 bg-white px-4 py-3 text-sm outline-none transition focus:border-teal-500 focus:ring-2 focus:ring-teal-100"
-                        />
-                        <button
-                          type="button"
-                          onClick={handleSelectAllFiltered}
-                          disabled={filteredLineItems.length === 0}
-                          className="rounded-[1.2rem] border border-slate-200 bg-white px-4 py-3 text-sm font-medium text-slate-700 transition hover:border-slate-300 disabled:cursor-not-allowed disabled:opacity-40"
-                        >
-                          All
-                        </button>
-                        <button
-                          type="button"
-                          onClick={handleClearSelection}
-                          disabled={selectedLineItemIds.length === 0}
-                          className="rounded-[1.2rem] border border-slate-200 bg-white px-4 py-3 text-sm font-medium text-slate-700 transition hover:border-slate-300 disabled:cursor-not-allowed disabled:opacity-40"
-                        >
-                          Clear
-                        </button>
-                        <button
-                          type="button"
-                          onClick={handleCreateChunk}
-                          disabled={!newChunkName.trim() || isCreatingChunk}
-                          className="rounded-[1.2rem] bg-[linear-gradient(135deg,#0f172a_0%,#1e293b_48%,#0f766e_100%)] px-5 py-3 text-sm font-medium text-white shadow-lg transition hover:-translate-y-[1px] disabled:cursor-not-allowed disabled:bg-slate-300"
-                        >
-                          {isCreatingChunk ? 'Creating…' : 'Create'}
-                        </button>
-                      </div>
-
-                      <div className="mt-4 grid gap-2">
-                        {filteredLineItems.length === 0 ? (
-                          <div className="rounded-[1.4rem] border border-dashed border-slate-200 px-4 py-10 text-center text-sm text-slate-400">
-                            Nothing found
+                        <div className="min-w-0 flex-1">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span
+                              className={`h-2.5 w-2.5 rounded-full ${
+                                selected ? 'bg-white' : styles.dot
+                              }`}
+                            />
+                            <span
+                              className={`rounded-full border px-2.5 py-1 text-[11px] font-semibold ${
+                                selected
+                                  ? 'border-white/20 bg-white/10 text-white'
+                                  : styles.badge
+                              }`}
+                            >
+                              {item.itemNumber}
+                            </span>
+                            <span
+                              className={`rounded-full border px-2.5 py-1 text-[11px] font-semibold ${
+                                selected
+                                  ? 'border-white/20 bg-white/10 text-white/90'
+                                  : 'border-slate-200 bg-slate-50 text-slate-700'
+                              }`}
+                            >
+                              {item.discipline}
+                            </span>
                           </div>
-                        ) : (
-                          filteredLineItems.map((item) => {
-                            const selected = selectedLineItemIds.includes(item.id)
-                            const styles = getDisciplineStyles(item.discipline)
-
-                            return (
-                              <label
-                                key={item.id}
-                                className={`group flex cursor-pointer items-start gap-4 rounded-[1.4rem] border px-4 py-4 transition ${
-                                  selected
-                                    ? 'border-slate-900 bg-slate-950 text-white shadow-lg'
-                                    : `border-slate-200 ${styles.surface} ${styles.row}`
-                                }`}
-                              >
-                                <input
-                                  type="checkbox"
-                                  checked={selected}
-                                  onChange={() => handleToggleSelectedLineItem(item.id)}
-                                  className="mt-1 h-4 w-4 rounded border-slate-300"
-                                />
-
-                                <div className="min-w-0 flex-1">
-                                  <div className="flex flex-wrap items-center gap-2">
-                                    <span
-                                      className={`h-2.5 w-2.5 rounded-full ${
-                                        selected ? 'bg-white' : styles.dot
-                                      }`}
-                                    />
-                                    <span
-                                      className={`rounded-full border px-2.5 py-1 text-[11px] font-semibold ${
-                                        selected
-                                          ? 'border-white/20 bg-white/10 text-white'
-                                          : styles.badge
-                                      }`}
-                                    >
-                                      {item.itemNumber}
-                                    </span>
-                                    <span
-                                      className={`rounded-full border px-2.5 py-1 text-[11px] font-semibold ${
-                                        selected
-                                          ? 'border-white/20 bg-white/10 text-white/90'
-                                          : 'border-slate-200 bg-slate-50 text-slate-700'
-                                      }`}
-                                    >
-                                      {item.discipline}
-                                    </span>
-                                  </div>
-                                  <div
-                                    className={`mt-3 text-sm font-semibold ${
-                                      selected ? 'text-white' : 'text-slate-950'
-                                    }`}
-                                  >
-                                    {item.name}
-                                  </div>
-                                  {item.shortDescription ? (
-                                    <div
-                                      className={`mt-1 text-sm ${
-                                        selected ? 'text-white/70' : 'text-slate-500'
-                                      }`}
-                                    >
-                                      {item.shortDescription}
-                                    </div>
-                                  ) : null}
-                                </div>
-                              </label>
-                            )
-                          })
-                        )}
-                      </div>
-                      </div>
-                    </div>
-                  </div>
-                    </motion.div>
-                  </div>
-                </motion.div>
-              ) : null}
-            </AnimatePresence>,
-            document.body
-          )
-        : null}
+                          <div
+                            className={`mt-2 text-sm font-semibold ${
+                              selected ? 'text-white' : 'text-slate-950'
+                            }`}
+                          >
+                            {item.name}
+                          </div>
+                          {item.shortDescription ? (
+                            <div
+                              className={`mt-1 text-sm ${
+                                selected ? 'text-white/70' : 'text-slate-500'
+                              }`}
+                            >
+                              {item.shortDescription}
+                            </div>
+                          ) : null}
+                        </div>
+                      </label>
+                    )
+                  })
+                )}
+              </div>
+            </>
+        </div>
+      </Modal>
     </div>
   )
 }
