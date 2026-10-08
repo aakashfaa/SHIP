@@ -1,17 +1,19 @@
 'use client'
 
 import { AnimatePresence, motion } from 'framer-motion'
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useId, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import {
   createLineItem,
   deleteLineItem,
   fieldOptions,
+  getChunkProjectsForProject,
   getFormFieldsForProject,
   getLineItemsForProjectUser,
   updateLineItem,
   visibleFormFields,
 } from '@/lib/store'
+import { COST_PARSE_MESSAGES, formatCostAmount, parseCostAmount } from '@/lib/costs'
 import { useAsyncData } from '@/lib/useAsyncData'
 import type { ProjectPermissions } from '@/lib/project-role'
 import {
@@ -21,6 +23,42 @@ import {
   Project,
   SafeUser,
 } from '@/lib/types'
+
+/*
+ * Number and cost text handling (M-06, M-09, D-9, D-16).
+ *
+ * The old number input stored `Number(next) || 0` on every keystroke, so
+ * typing "12." re-rendered as "12" and then "125", "-" became 0 and
+ * "1,200" became 200, and a blank was saved as 0. The draft now carries the
+ * RAW STRING the person typed, and it is parsed exactly once: on blur (to
+ * show an inline error) and on save (to convert, or to block).
+ *   blank          -> null  (D-9: unanswered; 0 stays "zero")
+ *   "1,200" / "-5" -> the number
+ *   anything else  -> an inline error and the save is blocked
+ */
+type Parsed<T> = { ok: true; value: T } | { ok: false; error: string }
+
+const PLAIN_NUMBER = /^[-+]?(\d+\.?\d*|\.\d+)$/
+
+function parseNumberText(text: string): Parsed<number | null> {
+  const cleaned = text.replace(/[,\s]/g, '')
+  if (cleaned === '') return { ok: true, value: null }
+  if (!PLAIN_NUMBER.test(cleaned)) {
+    return { ok: false, error: 'Enter a number, like 12.5 or -200.' }
+  }
+  const n = Number(cleaned)
+  if (!Number.isFinite(n)) return { ok: false, error: 'That number is too large.' }
+  return { ok: true, value: n }
+}
+
+/** Cost text through lib/costs.ts's strict parser (M-09, D-16): blank is
+ *  unanswered, unreadable / negative / absurd amounts are errors that block
+ *  the save. Never falls back to $0. */
+function parseCostText(text: string): Parsed<number | null> {
+  const r = parseCostAmount(text)
+  if (!r.ok) return { ok: false, error: COST_PARSE_MESSAGES[r.reason] }
+  return { ok: true, value: r.amount }
+}
 
 type Props = {
   project: Project
@@ -191,7 +229,8 @@ function defaultValueForField(field: FormField): unknown {
     case 'multiselect':
       return []
     case 'number':
-      return 0
+      // Blank, not 0 (D-9): an unanswered number is NULL, and 0 means zero.
+      return ''
     case 'select':
       return fieldOptions(field)[0] ?? ''
     default:
@@ -308,7 +347,9 @@ function groupIntoSteps(fields: FormField[]): FormStep[] {
 function isFieldValueEmpty(field: FormField, value: unknown): boolean {
   if (field.inputType === 'multiselect') return !Array.isArray(value) || value.length === 0
   if (field.inputType === 'boolean') return value === undefined || value === null || value === ''
-  if (field.inputType === 'number') return value === undefined || value === null || value === ''
+  if (field.inputType === 'number') {
+    return value === undefined || value === null || (typeof value === 'string' && value.trim() === '')
+  }
   return typeof value !== 'string' || value.trim() === ''
 }
 
@@ -322,6 +363,65 @@ function findMissingRequired(
 function requiredMessage(missing: FormField[]): string {
   const names = missing.map((field) => field.label).join(', ')
   return missing.length === 1 ? `"${names}" is required.` : `${names} are required.`
+}
+
+/** Format errors for the number and currency fields in `fields`, keyed by
+ *  field id. Required-ness is checked separately (findMissingRequired). */
+function findFormatErrors(
+  fields: FormField[],
+  getValue: (field: FormField) => unknown
+): Record<string, string> {
+  const errors: Record<string, string> = {}
+  for (const field of fields) {
+    const value = getValue(field)
+    if (typeof value !== 'string') continue
+    if (field.inputType === 'number') {
+      const r = parseNumberText(value)
+      if (!r.ok) errors[field.id] = r.error
+    } else if (field.inputType === 'currency') {
+      const r = parseCostText(value)
+      if (!r.ok) errors[field.id] = r.error
+    }
+  }
+  return errors
+}
+
+/** Converts the raw typed strings to what gets saved: number fields to
+ *  `number | null`, currency fields to their trimmed text (the DB and
+ *  lib/cost-model parse the shorthand). Only call after findFormatErrors
+ *  came back empty. */
+function normalizeDraft(draft: DraftLineItem, fields: FormField[]): DraftLineItem {
+  return fields.reduce((acc, field) => {
+    const value = getFieldValue(acc, field)
+    if (field.inputType === 'number' && typeof value === 'string') {
+      const r = parseNumberText(value)
+      return setFieldValue(acc, field, r.ok ? r.value : null)
+    }
+    if (field.inputType === 'currency' && typeof value === 'string') {
+      return setFieldValue(acc, field, value.trim())
+    }
+    return acc
+  }, draft)
+}
+
+/** M-23: names what a line-item delete takes with it. The FK on
+ *  chunk_project_items cascades, so the item also leaves every package. */
+function deleteConsequence(
+  item: LineItem,
+  chunks: { chunkNumber: string; itemLinks: { lineItemId: string }[] }[],
+  chunksUnknown: boolean
+): string {
+  const label = item.name || item.itemNumber
+  const inPackages = chunks
+    .filter((c) => c.itemLinks.some((l) => l.lineItemId === item.id))
+    .map((c) => c.chunkNumber)
+  if (chunksUnknown) {
+    return `Delete '${label}'? It may also be removed from packages it is in. This can't be undone.`
+  }
+  if (inPackages.length === 0) {
+    return `Delete '${label}'? It isn't in any package. This can't be undone.`
+  }
+  return `Delete '${label}'? It is also removed from packages ${inPackages.join(', ')}. This can't be undone.`
 }
 
 function ChoicePills<T extends string>({
@@ -369,11 +469,13 @@ function FormFieldControl({
   value,
   onChange,
   variant,
+  error,
 }: {
   field: FormField
   value: unknown
   onChange: (value: unknown) => void
   variant: 'wizard' | 'inline'
+  error?: string
 }) {
   const stringValue = typeof value === 'string' ? value : value == null ? '' : String(value)
 
@@ -395,29 +497,30 @@ function FormFieldControl({
       )
 
     case 'currency':
-      // Free text on purpose: estimated_first_cost's "1.2m" / "850k"
-      // shorthand is parsed downstream (lib/cost-model.ts), never here.
+      // Text on purpose: the "1.2m" / "850k" shorthand is what gets stored
+      // (parsed downstream by lib/cost-model.ts); CostField only validates it
+      // and previews the converted amount.
       return (
-        <InputField
+        <CostField
           label={field.label}
           value={stringValue}
           onChange={onChange}
-          placeholder="1.2m, 850k, $2,400,000"
           helpText={field.helpText}
+          error={error}
         />
       )
 
-    case 'number': {
-      const numeric = typeof value === 'number' ? value : Number(value) || 0
+    case 'number':
+      // Raw string stays in the draft while typing; parsed on blur / save.
       return (
-        <InputField
+        <NumberField
           label={field.label}
-          value={numeric === 0 ? '' : String(numeric)}
-          onChange={(next) => onChange(Number(next) || 0)}
+          value={stringValue}
+          onChange={onChange}
           helpText={field.helpText}
+          error={error}
         />
       )
-    }
 
     case 'date':
       return (
@@ -478,12 +581,14 @@ function LineItemFields({
   onChange,
   variant,
   synergyOptions,
+  errorFor,
 }: {
   fields: FormField[]
   getValue: (field: FormField) => unknown
   onChange: (field: FormField, value: unknown) => void
   variant: 'wizard' | 'inline'
   synergyOptions: string[]
+  errorFor?: (field: FormField) => string | undefined
 }) {
   const gridFields = fields.filter((f) => f.inputType !== 'boolean' && f.inputType !== 'multiselect')
   const booleanFields = fields.filter((f) => f.inputType === 'boolean')
@@ -500,6 +605,7 @@ function LineItemFields({
               value={getValue(field)}
               onChange={(value) => onChange(field, value)}
               variant={variant}
+              error={errorFor?.(field)}
             />
           ))}
         </div>
@@ -611,6 +717,18 @@ export default function AddDataTab({ project, user, permissions }: Props) {
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null)
   const [savingEditId, setSavingEditId] = useState<string | null>(null)
   const [actionError, setActionError] = useState<string | null>(null)
+  // Inline field errors keyed `${scope}|${field.id}`; scope is 'new' for the
+  // wizard or the line item's id for an expanded row.
+  const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({})
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null)
+
+  // Which packages each line item sits in, so the delete confirm can name
+  // what else disappears (M-23). A failed read degrades to a generic warning.
+  const {
+    data: chunkProjects,
+    error: chunksError,
+    reload: reloadChunks,
+  } = useAsyncData(() => getChunkProjectsForProject(project.id), [project.id], [])
 
   const isMountedRef = useRef(true)
   useEffect(() => {
@@ -642,10 +760,35 @@ export default function AddDataTab({ project, user, permissions }: Props) {
     setIsCreating(false)
   }
 
+  function setScopeErrors(scope: string, errors: Record<string, string>) {
+    setFieldErrors((prev) => {
+      const next: Record<string, string> = {}
+      for (const [k, v] of Object.entries(prev)) if (!k.startsWith(`${scope}|`)) next[k] = v
+      for (const [id, msg] of Object.entries(errors)) next[`${scope}|${id}`] = msg
+      return next
+    })
+  }
+
+  function clearFieldError(scope: string, field: FormField) {
+    setFieldErrors((prev) => {
+      const key = `${scope}|${field.id}`
+      if (!(key in prev)) return prev
+      const next = { ...prev }
+      delete next[key]
+      return next
+    })
+  }
+
   function goNext() {
-    const missing = findMissingRequired(steps[step]?.fields ?? [], (field) =>
-      getFieldValue(draft, field)
-    )
+    const stepFields = steps[step]?.fields ?? []
+    const getValue = (field: FormField) => getFieldValue(draft, field)
+    const formatErrors = findFormatErrors(stepFields, getValue)
+    setScopeErrors('new', formatErrors)
+    if (Object.keys(formatErrors).length > 0) {
+      setActionError('Fix the highlighted fields before continuing.')
+      return
+    }
+    const missing = findMissingRequired(stepFields, getValue)
     if (missing.length > 0) {
       setActionError(requiredMessage(missing))
       return
@@ -665,6 +808,8 @@ export default function AddDataTab({ project, user, permissions }: Props) {
       await deleteLineItem(id)
       if (!isMountedRef.current) return
       reloadLineItems()
+      reloadChunks()
+      setConfirmDeleteId(null)
       setEditingDrafts((prev) => {
         const next = { ...prev }
         delete next[id]
@@ -680,7 +825,18 @@ export default function AddDataTab({ project, user, permissions }: Props) {
   }
 
   async function saveLineItem() {
-    const missing = findMissingRequired(visibleFields, (field) => getFieldValue(draft, field))
+    const getValue = (field: FormField) => getFieldValue(draft, field)
+    const formatErrors = findFormatErrors(visibleFields, getValue)
+    setScopeErrors('new', formatErrors)
+    const badField = visibleFields.find((f) => formatErrors[f.id])
+    if (badField) {
+      // The bad field may be on an earlier step; take the person to it.
+      const badStep = steps.findIndex((s) => s.fields.some((f) => f.id === badField.id))
+      if (badStep >= 0) setStep(badStep)
+      setActionError('Fix the highlighted fields before saving.')
+      return
+    }
+    const missing = findMissingRequired(visibleFields, getValue)
     if (missing.length > 0) {
       setActionError(requiredMessage(missing))
       return
@@ -689,7 +845,7 @@ export default function AddDataTab({ project, user, permissions }: Props) {
     setActionError(null)
     setIsSavingNew(true)
     try {
-      const created = await createLineItem(draftForCreate(draft))
+      const created = await createLineItem(draftForCreate(normalizeDraft(draft, fields)))
       if (!isMountedRef.current) return
       reloadLineItems()
       setExpandedId(created.id)
@@ -740,6 +896,7 @@ export default function AddDataTab({ project, user, permissions }: Props) {
   }
 
   function resetEditingDraft(item: LineItem) {
+    setScopeErrors(item.id, {})
     setEditingDrafts((prev) => ({
       ...prev,
       [item.id]: makeEditableDraft(item),
@@ -750,7 +907,14 @@ export default function AddDataTab({ project, user, permissions }: Props) {
     const currentDraft = editingDrafts[lineItemId]
     if (!currentDraft) return
 
-    const missing = findMissingRequired(visibleFields, (field) => getFieldValue(currentDraft, field))
+    const getValue = (field: FormField) => getFieldValue(currentDraft, field)
+    const formatErrors = findFormatErrors(visibleFields, getValue)
+    setScopeErrors(lineItemId, formatErrors)
+    if (Object.keys(formatErrors).length > 0) {
+      setActionError('Fix the highlighted fields before saving.')
+      return
+    }
+    const missing = findMissingRequired(visibleFields, getValue)
     if (missing.length > 0) {
       setActionError(requiredMessage(missing))
       return
@@ -759,7 +923,10 @@ export default function AddDataTab({ project, user, permissions }: Props) {
     setActionError(null)
     setSavingEditId(lineItemId)
     try {
-      const updated = await updateLineItem(lineItemId, draftForUpdate(currentDraft))
+      const updated = await updateLineItem(
+        lineItemId,
+        draftForUpdate(normalizeDraft(currentDraft, fields))
+      )
       if (!updated) return
       if (!isMountedRef.current) return
 
@@ -885,23 +1052,54 @@ export default function AddDataTab({ project, user, permissions }: Props) {
                             <LineItemFields
                               fields={visibleFields}
                               getValue={(field) => getFieldValue(editDraft, field)}
-                              onChange={(field, value) => updateEditingField(item.id, field, value)}
+                              onChange={(field, value) => {
+                                clearFieldError(item.id, field)
+                                updateEditingField(item.id, field, value)
+                              }}
                               variant="inline"
                               synergyOptions={synergyOptions}
+                              errorFor={(field) => fieldErrors[`${item.id}|${field.id}`]}
                             />
                           ) : (
                             <p className="text-sm text-gray-400">No form fields configured.</p>
                           )}
 
                           <div className="flex flex-wrap justify-between gap-3">
-                            <button
-                              type="button"
-                              onClick={() => handleDelete(item.id)}
-                              disabled={pendingDeleteId === item.id}
-                              className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm font-medium text-red-700 transition hover:bg-red-100 disabled:cursor-not-allowed disabled:opacity-50"
-                            >
-                              {pendingDeleteId === item.id ? 'Deleting…' : 'Delete Line Item'}
-                            </button>
+                            {confirmDeleteId === item.id ? (
+                              <div
+                                role="alertdialog"
+                                aria-label="Confirm delete line item"
+                                className="max-w-xl rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800"
+                              >
+                                <p>{deleteConsequence(item, chunkProjects, Boolean(chunksError))}</p>
+                                <div className="mt-3 flex gap-2">
+                                  <button
+                                    type="button"
+                                    onClick={() => handleDelete(item.id)}
+                                    disabled={pendingDeleteId === item.id}
+                                    className="rounded-xl bg-red-600 px-3 py-2 text-sm font-medium text-white disabled:cursor-not-allowed disabled:opacity-50"
+                                  >
+                                    {pendingDeleteId === item.id ? 'Deleting…' : 'Yes, delete'}
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => setConfirmDeleteId(null)}
+                                    disabled={pendingDeleteId === item.id}
+                                    className="rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm font-medium text-slate-700"
+                                  >
+                                    Cancel
+                                  </button>
+                                </div>
+                              </div>
+                            ) : (
+                              <button
+                                type="button"
+                                onClick={() => setConfirmDeleteId(item.id)}
+                                className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm font-medium text-red-700 transition hover:bg-red-100"
+                              >
+                                Delete Line Item
+                              </button>
+                            )}
 
                             <div className="flex flex-wrap gap-3">
                               <button
@@ -994,11 +1192,13 @@ export default function AddDataTab({ project, user, permissions }: Props) {
                                 <LineItemFields
                                   fields={currentStep.fields}
                                   getValue={(field) => getFieldValue(draft, field)}
-                                  onChange={(field, value) =>
+                                  onChange={(field, value) => {
+                                    clearFieldError('new', field)
                                     setDraft((prev) => setFieldValue(prev, field, value))
-                                  }
+                                  }}
                                   variant="wizard"
                                   synergyOptions={synergyOptions}
+                                  errorFor={(field) => fieldErrors[`new|${field.id}`]}
                                 />
                               </div>
                             </motion.div>
@@ -1060,6 +1260,11 @@ function InputField({
   id,
   placeholder,
   helpText,
+  inputMode,
+  onBlur,
+  error,
+  prefix,
+  below,
 }: {
   label: string
   value: string
@@ -1067,21 +1272,124 @@ function InputField({
   id?: string
   placeholder?: string
   helpText?: string
+  inputMode?: 'decimal' | 'text'
+  onBlur?: () => void
+  error?: string | null
+  prefix?: string
+  below?: React.ReactNode
 }) {
+  // Labels were never tied to their inputs (no id); useId fixes that for free.
+  const autoId = useId()
+  const inputId = id ?? autoId
   return (
     <div>
-      <label htmlFor={id} className="mb-2 block text-sm font-medium text-gray-700">
+      <label htmlFor={inputId} className="mb-2 block text-sm font-medium text-gray-700">
         {label}
       </label>
-      <input
-        id={id}
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        placeholder={placeholder}
-        className="w-full rounded-2xl border border-gray-200 bg-white px-4 py-3 text-sm outline-none transition focus:border-black"
-      />
+      <div className="relative">
+        {prefix ? (
+          <span className="pointer-events-none absolute left-4 top-1/2 -translate-y-1/2 text-sm text-gray-400">
+            {prefix}
+          </span>
+        ) : null}
+        <input
+          id={inputId}
+          type="text"
+          inputMode={inputMode}
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          onBlur={onBlur}
+          placeholder={placeholder}
+          aria-invalid={error ? true : undefined}
+          className={`w-full rounded-2xl border bg-white py-3 text-sm outline-none transition focus:border-black ${
+            prefix ? 'pl-8 pr-4' : 'px-4'
+          } ${error ? 'border-red-400' : 'border-gray-200'}`}
+        />
+      </div>
+      {below}
+      {error ? (
+        <p role="alert" className="mt-1 text-xs text-red-600">
+          {error}
+        </p>
+      ) : null}
       {helpText ? <p className="mt-1 text-xs text-gray-500">{helpText}</p> : null}
     </div>
+  )
+}
+
+/** Plain number field: raw text in, parsed on blur/save (M-06). No `$`. */
+function NumberField({
+  label,
+  value,
+  onChange,
+  helpText,
+  error,
+}: {
+  label: string
+  value: string
+  onChange: (value: string) => void
+  helpText?: string
+  error?: string
+}) {
+  const [touched, setTouched] = useState(false)
+  const parsed = parseNumberText(value)
+  const shown = error ?? (touched && !parsed.ok ? parsed.error : null)
+  return (
+    <InputField
+      label={label}
+      value={value}
+      onChange={onChange}
+      onBlur={() => setTouched(true)}
+      inputMode="decimal"
+      helpText={helpText}
+      error={shown}
+    />
+  )
+}
+
+/** Cost field (M-09, D-16): `$` prefix, shorthand accepted, live converted
+ *  amount underneath, a plain number gets thousands separators on blur. */
+function CostField({
+  label,
+  value,
+  onChange,
+  helpText,
+  error,
+}: {
+  label: string
+  value: string
+  onChange: (value: string) => void
+  helpText?: string
+  error?: string
+}) {
+  const [touched, setTouched] = useState(false)
+  const parsed = parseCostText(value)
+  const shown = error ?? (touched && !parsed.ok ? parsed.error : null)
+
+  function handleBlur() {
+    setTouched(true)
+    if (parsed.ok && parsed.value !== null && /^[\s$\d,.]+$/.test(value)) {
+      onChange(parsed.value.toLocaleString('en-US', { maximumFractionDigits: 2 }))
+    }
+  }
+
+  return (
+    <InputField
+      label={label}
+      value={value}
+      onChange={onChange}
+      onBlur={handleBlur}
+      inputMode="text"
+      prefix="$"
+      placeholder="1.2m, 850k, 2,400,000"
+      helpText={helpText}
+      error={shown}
+      below={
+        parsed.ok && parsed.value !== null ? (
+          <p className="mt-1 text-xs font-medium text-slate-600">= {formatCostAmount(parsed.value)}</p>
+        ) : null
+      }
+    />
   )
 }
 
@@ -1102,13 +1410,15 @@ function TextAreaField({
   placeholder?: string
   helpText?: string
 }) {
+  const autoId = useId()
+  const textId = id ?? autoId
   return (
     <div>
-      <label htmlFor={id} className="mb-2 block text-sm font-medium text-gray-700">
+      <label htmlFor={textId} className="mb-2 block text-sm font-medium text-gray-700">
         {label}
       </label>
       <textarea
-        id={id}
+        id={textId}
         value={value}
         onChange={(e) => onChange(e.target.value)}
         rows={rows}

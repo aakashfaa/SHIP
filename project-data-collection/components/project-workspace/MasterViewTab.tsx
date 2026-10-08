@@ -78,6 +78,10 @@ function formatFieldValue(field: FormField, value: unknown): string {
   return String(value)
 }
 
+/** Left offsets (px) of the sticky columns: 8px colour stripe, then # (72),
+ *  Discipline (128), Name (200). Widths are fixed in the cells below. */
+const STICKY_LEFT = { number: 8, discipline: 80, name: 208 } as const
+
 function columnWidthClass(field: FormField): string {
   if (field.inputType === 'textarea') return 'min-w-[200px]'
   if (field.inputType === 'boolean') return 'w-[104px]'
@@ -139,6 +143,19 @@ export default function MasterViewTab({ project, permissions }: Props) {
   )
 
   const visibleFields = useMemo(() => visibleFormFields(formFields), [formFields])
+
+  // M-19: #, Discipline and Name stay pinned on the left while the rest of
+  // the (very wide) matrix scrolls. Name is pulled out of the field order and
+  // rendered directly after Discipline so the three sticky offsets are
+  // contiguous; every other field keeps its sort order after Organization.
+  const nameField = useMemo(
+    () => visibleFields.find((f) => f.storage === 'column' && f.key === 'name') ?? null,
+    [visibleFields]
+  )
+  const scrollingFields = useMemo(
+    () => visibleFields.filter((f) => f !== nameField),
+    [visibleFields, nameField]
+  )
 
   // Empty rather than crashing: an unseeded project has no columns to build,
   // and the right response is pointing at Settings, not a hardcoded list of
@@ -212,33 +229,39 @@ export default function MasterViewTab({ project, permissions }: Props) {
   }, [deferredQuery, disciplineFilter, lineItems, orgFilter, sortKey])
 
   function exportMatrixOnly() {
-    const matrixHtml = exportRef.current?.innerHTML
-    if (!matrixHtml) return
+    const table = exportRef.current?.querySelector('table')
+    if (!table) return
 
+    // M-20: the print document is built with DOM APIs only. project.name
+    // goes in through textContent, never into an HTML string, so a project
+    // named an <img onerror=...> tag prints as text instead of running in
+    // this origin. The window is same-origin about:blank, so it is detached
+    // from us (opener = null) before anything is written to it; the
+    // 'noopener' window feature is not usable here because it makes
+    // window.open return null, and we need the handle to fill the document.
     const printWindow = window.open('', '_blank', 'width=1500,height=900')
     if (!printWindow) return
+    printWindow.opener = null
 
-    printWindow.document.write(`
-      <html>
-        <head>
-          <title>${project.name} - Master View</title>
-          <style>
-            * { box-sizing: border-box; }
-            body { margin: 24px; font-family: Arial, Helvetica, sans-serif; color: #0f172a; }
-            table { width: 100%; border-collapse: collapse; table-layout: fixed; font-size: 10px; }
-            th, td { border: 1px solid #dbe1ea; padding: 8px 6px; vertical-align: top; word-break: break-word; }
-            th { background: #e2e8f0; text-transform: uppercase; letter-spacing: .04em; font-size: 9px; }
-          </style>
-        </head>
-        <body>
-          <h1>${project.name}</h1>
-          <p>Master View export</p>
-          ${matrixHtml}
-        </body>
-      </html>
-    `)
+    const doc = printWindow.document
+    doc.title = `${project.name} - Master View`
 
-    printWindow.document.close()
+    const style = doc.createElement('style')
+    style.textContent = `
+      * { box-sizing: border-box; }
+      body { margin: 24px; font-family: Arial, Helvetica, sans-serif; color: #0f172a; }
+      table { width: 100%; border-collapse: collapse; table-layout: fixed; font-size: 10px; }
+      th, td { border: 1px solid #dbe1ea; padding: 8px 6px; vertical-align: top; word-break: break-word; }
+      th { background: #e2e8f0; text-transform: uppercase; letter-spacing: .04em; font-size: 9px; }
+    `
+    doc.head.appendChild(style)
+
+    const heading = doc.createElement('h1')
+    heading.textContent = project.name
+    const subtitle = doc.createElement('p')
+    subtitle.textContent = 'Master View export'
+    doc.body.append(heading, subtitle, doc.importNode(table, true))
+
     printWindow.focus()
     printWindow.print()
   }
@@ -349,16 +372,25 @@ export default function MasterViewTab({ project, permissions }: Props) {
       ) : (
         <div
           ref={exportRef}
-          className="overflow-hidden rounded-[2rem] border border-slate-200 bg-white shadow-sm"
+          className="overflow-x-auto rounded-[2rem] border border-slate-200 bg-white shadow-sm"
         >
-          <table className="w-full border-collapse text-[11px] leading-4 text-slate-700">
+          <table className="w-full min-w-max border-collapse text-[11px] leading-4 text-slate-700">
             <thead>
               <tr className="bg-slate-100 text-left">
-                <th className="w-2 border-b border-r border-slate-200 p-0" />
-                <HeaderCell className="w-[72px]">#</HeaderCell>
-                <HeaderCell className="min-w-[128px]">Discipline</HeaderCell>
+                <th className="sticky left-0 z-20 w-2 min-w-2 border-b border-r border-slate-200 bg-slate-100 p-0" />
+                <HeaderCell sticky left={STICKY_LEFT.number} className="w-[72px] min-w-[72px]">
+                  #
+                </HeaderCell>
+                <HeaderCell sticky left={STICKY_LEFT.discipline} className="w-[128px] min-w-[128px]">
+                  Discipline
+                </HeaderCell>
+                {nameField ? (
+                  <HeaderCell sticky left={STICKY_LEFT.name} className="w-[200px] min-w-[200px]">
+                    {nameField.label}
+                  </HeaderCell>
+                ) : null}
                 <HeaderCell className="min-w-[144px]">Organization</HeaderCell>
-                {visibleFields.map((field) => (
+                {scrollingFields.map((field) => (
                   <HeaderCell key={field.id} className={columnWidthClass(field)}>
                     {field.label}
                   </HeaderCell>
@@ -372,8 +404,8 @@ export default function MasterViewTab({ project, permissions }: Props) {
 
                 return (
                   <tr key={item.id} style={{ backgroundColor: colorTint(color, '10') }}>
-                    <td className="w-2 p-0" style={{ backgroundColor: color }} />
-                    <BodyCell>
+                    <td className="sticky left-0 z-10 w-2 min-w-2 p-0" style={{ backgroundColor: color }} />
+                    <BodyCell sticky left={STICKY_LEFT.number} tint={colorTint(color, '10')}>
                       <span
                         className="inline-flex rounded-full px-2 py-1 text-[10px] font-semibold text-slate-950"
                         style={{ backgroundColor: colorTint(color, '2A') }}
@@ -381,9 +413,16 @@ export default function MasterViewTab({ project, permissions }: Props) {
                         {item.itemNumber}
                       </span>
                     </BodyCell>
-                    <BodyCell>{item.discipline}</BodyCell>
+                    <BodyCell sticky left={STICKY_LEFT.discipline} tint={colorTint(color, '10')}>
+                      {item.discipline}
+                    </BodyCell>
+                    {nameField ? (
+                      <BodyCell sticky left={STICKY_LEFT.name} tint={colorTint(color, '10')}>
+                        {formatFieldValue(nameField, getFieldValue(item, nameField))}
+                      </BodyCell>
+                    ) : null}
                     <BodyCell>{item.companyName}</BodyCell>
-                    {visibleFields.map((field) => {
+                    {scrollingFields.map((field) => {
                       const raw = getFieldValue(item, field)
 
                       if (field.inputType === 'boolean') {
@@ -412,12 +451,21 @@ export default function MasterViewTab({ project, permissions }: Props) {
 function HeaderCell({
   children,
   className = '',
+  sticky = false,
+  left,
 }: {
   children: React.ReactNode
   className?: string
+  sticky?: boolean
+  left?: number
 }) {
   return (
-    <th className={`border-b border-r border-slate-200 px-2 py-3 text-[10px] font-semibold uppercase tracking-[0.14em] text-slate-600 ${className}`}>
+    <th
+      style={sticky ? { left } : undefined}
+      className={`border-b border-r border-slate-200 px-2 py-3 text-[10px] font-semibold uppercase tracking-[0.14em] text-slate-600 ${
+        sticky ? 'sticky z-20 bg-slate-100' : ''
+      } ${className}`}
+    >
       {children}
     </th>
   )
@@ -426,15 +474,32 @@ function HeaderCell({
 function BodyCell({
   children,
   centered = false,
+  sticky = false,
+  left,
+  tint,
 }: {
   children: React.ReactNode
   centered?: boolean
+  sticky?: boolean
+  left?: number
+  /** Row tint (translucent hex). A sticky cell must be opaque or the cells
+   *  scrolling under it show through, so the tint is laid over white. */
+  tint?: string
 }) {
   return (
     <td
+      style={
+        sticky
+          ? {
+              left,
+              backgroundImage: tint ? `linear-gradient(${tint}, ${tint})` : undefined,
+              backgroundColor: '#fff',
+            }
+          : undefined
+      }
       className={`border-b border-r border-slate-200 px-2 py-3 align-top ${
-        centered ? 'text-center text-sm font-semibold text-slate-800' : ''
-      }`}
+        sticky ? 'sticky z-10' : ''
+      } ${centered ? 'text-center text-sm font-semibold text-slate-800' : ''}`}
     >
       {children}
     </td>
