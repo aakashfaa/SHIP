@@ -123,7 +123,11 @@ update ship.line_items li
        ) as v(item_number, energy, cost)
  where li.project_id = 'federal-campus-master-plan'
    and li.item_number = v.item_number
-   and li.annual_energy_savings = 0;
+   -- Blank or zero only, so a hand-edited value survives a re-seed. Since
+   -- 0014 (D-9) blank is NULL and is the column default, and migrations run
+   -- before seeds, so a bare "= 0" here matched nothing and the fixture lost
+   -- every saving (the Energy chart read "Saved 0").
+   and coalesce(li.annual_energy_savings, 0) = 0;
 
 -- ---------------------------------------------------------------------
 -- Phases

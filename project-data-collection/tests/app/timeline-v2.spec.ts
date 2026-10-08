@@ -79,11 +79,13 @@ test('timeline renders packages, costs and the energy chart', async ({ page }) =
   await expect(page).toHaveScreenshot('timeline-collapsed.png', { fullPage: true })
 })
 
-test('expanding a package reveals its phases and the dependency arrows', async ({ page }) => {
+test('expanding a package reveals its phases', async ({ page }) => {
   await openTimeline(page)
 
-  // Expand every package so design-ahead-of-construction and the links between
-  // them are all visible in one frame. Re-resolving the locator each iteration
+  // Expand every package so design-ahead-of-construction is visible in one
+  // frame. The seeded FS link is still in the data, but no arrow is drawn:
+  // dependency links are switched off (DEPENDENCY_LINKS_ENABLED, D-14) until
+  // there is a UI to create them, and this baseline records that. Re-resolving the locator each iteration
   // rather than holding an nth() handle: expanding a row inserts phase rows
   // into the DOM, which invalidates positional handles taken beforehand.
   for (const chunkNumber of ['PP10', 'PP11', 'PP12', 'PP13', 'PP14']) {

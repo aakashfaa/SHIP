@@ -42,9 +42,33 @@ Strictly in order. Each file assumes the previous one has been applied.
 | 9 | `migrations/0009_ship_roles_and_suggestions.sql` | `project_roles`, `suggestions`; `project_role()` and the whole authority-helper family; **rewrites the entire policy surface** created by 0002/0006/0007/0008 from `FOR ALL` to one policy per command. The biggest, most security-sensitive file in the set — read its header before touching anything downstream of it. |
 | 10 | `migrations/0010_ship_scenarios.sql` | `scenarios`; `baseline_fingerprint()` / `create_scenario()` / `publish_scenario()` / `rebase_scenario()` — the what-if sandbox. |
 | 11 | `migrations/0011_ship_scenario_authority.sql` | Closes a privilege-escalation bug: tightens `create_scenario()` to `can_contribute_project()` and `publish_scenario()` to `can_edit_project()` (0010 shipped both checking only `can_read_project()`, which a `viewer` also satisfies). |
-| 12 | `seeds/001_seed.sql` | The `lib/mock-*.ts` fixtures + **the counter backfill**. |
-| 13 | `seeds/002_v2_phases.sql` | Fixture cost/energy settings, phases and phase dependencies for the v2 Timeline demo. Exists because the CLI applies migrations before seeds, so 0007's own backfill is a no-op on a fresh database — see Gotchas. |
-| 14 | `seeds/003_v2_taxonomy.sql` | Fixture taxonomy rows for all seeded projects, for the same reason 002 exists: 0008's backfill has nothing to join against on a fresh database. |
+| 12 | `migrations/0012_ship_form_builder.sql` | `form_fields`, `form_field_options`; the line-item form becomes per-project data. |
+| 13 | `migrations/0013_access_hardening.sql` | Roster removal revokes `project_roles`; `update_project()` lets a project admin manage their own project and refuses stale saves (40001); `claim_invite()` needs a confirmed email and is idempotent; `pending_invites.project_id` + a guard so only a platform admin can mint a platform-admin invite; `project_access_notices`; `grant usage on schema ship to service_role` (the invite route's writes could never have worked without it). |
+| 14 | `migrations/0014_line_item_integrity.sql` | System columns immutable for non-platform-admins (`42501 "<column> can't be changed"`), `project_id` for everyone; `chunk_project_items` same-project trigger (**deletes existing cross-project links**); numbering skips taken numbers; `annual_energy_savings` / `annual_cost_savings` and built-in dropdowns nullable, default NULL. |
+| 15 | `migrations/0015_scenario_hardening.sql` | `scenarios.base_payload`; three-way `rebase_scenario()`; `save_scenario_payload()`; owner may update only `name`/`description`/`visibility`; `publish_scenario()` needs the owner or a shared what-if and writes only changed rows. |
+| 16 | `migrations/0016_form_builder_hardening.sql` | Only the seeder creates built-in / column-backed fields; column keys allow-listed (**deletes forged rows**); `guard_form_field` lets a whole-project delete cascade. |
+| 17 | `migrations/0017_bulk_write_rpcs.sql` | `reorder_form_fields()` / `reorder_field_options()`. |
+| 18 | `migrations/0018_project_lifecycle.sql` | `create_project()` also creates cost and energy settings rows and fixes the start year; backfills existing projects from `created_at`; then `NOT NULL`. |
+| 19 | `migrations/0019_cost_parser.sql` | Strict `parse_cost_input()` (matches `lib/costs.ts`, 76 parity cases) and **recomputes every `ecc_amount`**: legacy text it cannot read becomes NULL and is flagged. |
+| 20 | `migrations/0020_canonical_time_unit.sql` | **Converts every stored schedule position to months, in place.** `ship.schema_conversions` (run-once marker), `ship.time_unit_conversion_log` (the factor per project). See the warning below. |
+| 21 | `seeds/001_seed.sql` | The `lib/mock-*.ts` fixtures + **the counter backfill**. |
+| 22 | `seeds/002_v2_phases.sql` | Fixture cost/energy settings, phases (in months) and phase dependencies for the v2 Timeline demo. Exists because the CLI applies migrations before seeds, so 0007's own backfill is a no-op on a fresh database — see Gotchas. |
+| 23 | `seeds/003_v2_taxonomy.sql` | Fixture taxonomy rows for all seeded projects, for the same reason 002 exists: 0008's backfill has nothing to join against on a fresh database. |
+| 24 | `seeds/004_v2_form.sql` | Fixture line-item forms, for the same reason: 0012's backfill has no projects on a fresh database. |
+| 25 | `seeds/005_project_settings.sql` | Cost and energy settings rows for every seeded project, for the same reason: 0018's backfill has no projects on a fresh database. |
+
+> **Take a snapshot of the hosted database before applying 0020.** It
+> rewrites `chunk_phases.start_slot` / `duration_slots`,
+> `phase_dependencies.lag_slots`, `phase_template_steps.default_duration_slots`
+> and the phases inside `scenarios.payload` / `base_payload` in place,
+> multiplying each project's values by the months-per-slot of the zoom it was
+> being priced at (5-year 60, 3-year 36, Year 12, Quarter 3, Month 1; built-in
+> templates 12). The column names keep the word "slots" but hold months
+> afterwards. It runs once (a `schema_conversions` row guards it), so
+> re-running it is a no-op — but a half-understood restore is not, which is
+> why the snapshot is the real rollback. The app code from the same commit
+> reads months; do not deploy that code before 0020, or 0020 without that
+> code.
 
 ### How to apply
 
@@ -66,17 +90,35 @@ psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f supabase/migrations/0008_ship_taxo
 psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f supabase/migrations/0009_ship_roles_and_suggestions.sql
 psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f supabase/migrations/0010_ship_scenarios.sql
 psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f supabase/migrations/0011_ship_scenario_authority.sql
+psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f supabase/migrations/0012_ship_form_builder.sql
+psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f supabase/migrations/0013_access_hardening.sql
+psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f supabase/migrations/0014_line_item_integrity.sql
+psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f supabase/migrations/0015_scenario_hardening.sql
+psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f supabase/migrations/0016_form_builder_hardening.sql
+psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f supabase/migrations/0017_bulk_write_rpcs.sql
+psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f supabase/migrations/0018_project_lifecycle.sql
+psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f supabase/migrations/0019_cost_parser.sql
+# Snapshot first (see the warning above).
+psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f supabase/migrations/0020_canonical_time_unit.sql
+# Seeds are fixtures: local/dev databases only, never the hosted project.
 psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f supabase/seeds/001_seed.sql
 psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f supabase/seeds/002_v2_phases.sql
 psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f supabase/seeds/003_v2_taxonomy.sql
+psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f supabase/seeds/004_v2_form.sql
+psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f supabase/seeds/005_project_settings.sql
 ```
+
+After 0013 (and after any migration that adds a function or column the app
+calls), reload PostgREST's schema cache — `notify pgrst, 'reload schema';` —
+or the new RPCs answer 404. `PREFLIGHT.md` §7 lists the hosted auth settings
+0013 and the email work depend on.
 
 These files are intentionally **not** in `supabase/migrations/` in the
 CLI's timestamped `<YYYYMMDDHHMMSS>_name.sql` format, because
 `supabase db push` / `db reset` operate on the whole database and this
 database is shared. Apply them deliberately, by hand.
 
-> `0006` through `0011` are developed and applied against the **local**
+> `0006` through `0020` are developed and applied against the **local**
 > Docker stack only (`supabase/LOCAL-DEV.md`). Each says so in its own
 > header. They have not been applied to the remote project
 > (`gfopaidnirrtyvfmgqwi`) and must not be until that is a separate,
@@ -142,6 +184,25 @@ select count(*) from auth.users;                                  -- unchanged
 ### Partial rollback — undo one file at a time
 
 Reverse order. Each block is a single transaction.
+
+**0013–0020 are forward-only fixes.** Most of them `create or replace` a
+function that an earlier file defined, and the "undo" for those is to re-run
+the earlier file — which puts back the hole the audit found (a removed
+consultant keeping access, a viewer's rebase reading the live plan, the
+lenient cost parser). Several also change data in ways no script can
+reverse. Restore from the pre-0020 snapshot rather than unpicking them. What
+each one leaves behind if you do need to know:
+
+| File | Not reversible by SQL | Objects it adds |
+| --- | --- | --- |
+| 0020 | Every schedule value was multiplied by a factor. Reverse by hand, per project, by dividing by `time_unit_conversion_log.months_per_slot` (built-in templates: 12) — tables *and* scenario payloads — then delete the `schema_conversions` row. Only do this together with the pre-0020 app code. | `schema_conversions`, `time_unit_conversion_log` |
+| 0019 | Every `ecc_amount` was recomputed; unreadable text is now NULL. Re-running 0006's parser recomputes them the old (wrong) way. | — |
+| 0018 | Backfilled settings rows and start years; `NOT NULL` on the start year. | — |
+| 0017 | — | `reorder_form_fields`, `reorder_field_options` (drop to undo; the up/down arrows then fail again) |
+| 0016 | Deleted forged built-in / column-backed `form_fields` rows. | `check_form_field_column_key` + trigger |
+| 0015 | — (`base_payload` is a new column, default `'{}'`) | `save_scenario_payload`, `schedule_snapshot`, `schedule_fingerprint`, `touch_scenario_updated_at` + trigger |
+| 0014 | Deleted cross-project `chunk_project_items` links; savings that were 0 stay 0, new blanks are NULL. | `guard_line_item_system_columns`, `check_chunk_item_same_project` + triggers |
+| 0013 | Revoked `project_roles` rows for people already off a roster. | `project_access_notices`, `pending_invites.project_id`, `guard_pending_invite_role` + trigger, `uid_is_platform_admin`, service-role grants |
 
 **Undo `seeds/003_v2_taxonomy.sql`:**
 
@@ -404,7 +465,7 @@ above.
 
 ## What lives where
 
-### Tables (22, all in `ship`)
+### Tables (27, all in `ship`)
 
 #### v1 (0001) — 11 tables
 
@@ -437,6 +498,20 @@ above.
 | `project_roles` | 0009 | Per-project authority: `(project_id, email) → admin/editor/consultant/viewer`. Keyed on email, like `project_members`, for the same reason. |
 | `suggestions` | 0009 | A proposed patch to someone else's `line_items` row. Applied only by `apply_suggestion()`, never by a direct UPDATE. |
 | `scenarios` | 0010 | A branched, in-jsonb copy of a project's schedule (what-if sandbox). Published back or discarded; never a `scenario_id` column on the live tables — see the 0010 header for why. |
+
+#### Later (0012–0020) — 5 more tables
+
+| Table | Added by | Purpose |
+| --- | --- | --- |
+| `form_fields` | 0012 | The per-project line-item form: built-in (column-backed) and custom fields, in order. |
+| `form_field_options` | 0012 | Dropdown options for a form field, in order. |
+| `project_access_notices` | 0013 | "You've been added to <project>" for an invitee who already had an account; shown as a toast at next sign-in. A user reads and marks seen only their own; the service role inserts. |
+| `schema_conversions` | 0020 | One row per one-off data conversion, so it can never run twice. No client grants. |
+| `time_unit_conversion_log` | 0020 | The months-per-slot factor each project was multiplied by. Audit trail and the way back. No client grants. |
+
+Since 0020 the `*_slots` columns (`chunk_phases.start_slot` / `duration_slots`,
+`phase_dependencies.lag_slots`, `phase_template_steps.default_duration_slots`)
+hold **months**, whatever their names say.
 
 ### RPCs
 

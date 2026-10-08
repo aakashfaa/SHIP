@@ -41,6 +41,40 @@ function expandIncludes(sql) {
   )
 }
 
+/**
+ * The tests act as the seeded users, and several of them need those users'
+ * ship.profiles rows (is_admin() reads profiles.role). Those rows are minted
+ * by claim_invite() on first sign-in, so straight after `npm run db:reset`
+ * nobody has one and every platform-admin assertion fails. Claim them here
+ * exactly the way a first sign-in does. claim_invite() is idempotent, so this
+ * is a no-op once they exist, and it is committed (not rolled back) just as a
+ * real sign-in would be.
+ */
+const SEEDED = [
+  'admin@gmail.com',
+  'planning@atlasmech.com',
+  'consultant1@gmail.com',
+  'electrical@voltworks.com',
+]
+const claimSql = SEEDED.map(
+  (email) => `begin;
+select set_config('request.jwt.claims', json_build_object('sub', u.id, 'email', u.email, 'role', 'authenticated')::text, true)
+  from auth.users u where lower(u.email) = '${email}';
+set local role authenticated;
+select ship.claim_invite();
+commit;`
+).join('\n')
+const claim = spawnSync(
+  'docker',
+  ['exec', '-i', container, 'psql', '-U', 'postgres', '-d', 'postgres', '-X', '-q', '-v', 'ON_ERROR_STOP=1', '-o', '/dev/null'],
+  { input: claimSql, encoding: 'utf8' }
+)
+if (claim.status !== 0) {
+  console.error('Could not claim the seeded users\' profiles (run npm run db:users first):')
+  console.error(String(claim.stderr ?? ''))
+  process.exit(1)
+}
+
 let failed = 0
 for (const file of files) {
   const sql = helpers + '\n' + expandIncludes(readFileSync(join(here, file), 'utf8'))

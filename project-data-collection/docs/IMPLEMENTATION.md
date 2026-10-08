@@ -4,9 +4,11 @@ Companion to [`SPEC-v2-phasing-and-cost-model.md`](./SPEC-v2-phasing-and-cost-mo
 The spec says what we agreed to build and who asked for each piece. This says
 what actually exists, where it lives, and what will bite you.
 
-Status: **everything in the build order except the suggestions UI and PDF
-export.** Those two are deliberately parked — see [Not built](#not-built).
-Migrations `0006`–`0011`, 53 unit tests, 22 Playwright tests.
+Status: **everything in the build order except the suggestions UI.** That is
+deliberately parked — see [Not built](#not-built). Migrations `0006`–`0020`
+(0013–0020 are the pre-launch audit fixes — see
+[Pre-launch hardening](#pre-launch-hardening-00130020)), 226 unit tests, 140 SQL
+assertions, 38 Playwright tests.
 
 Nothing here has been applied to the remote Supabase project. All of it runs
 against a local Docker stack ([`supabase/LOCAL-DEV.md`](../supabase/LOCAL-DEV.md)).
@@ -32,11 +34,28 @@ Four accounts, one per project role, password `localdev123` for all:
 Signing in as each is the fastest way to see the permission work: the same
 Timeline renders four different ways.
 
+If `.env.local` holds a real `RESEND_API_KEY`, `npm run dev` sends real email
+and builds links from its `APP_URL`. To keep local mail in Mailpit, blank them
+for the process: `RESEND_API_KEY= APP_URL=http://localhost:3000 npm run dev`.
+
 ```bash
-npm run test:all     # typecheck + 53 unit tests + 22 Playwright tests
-npm run check:parser # SQL/TS cost-parser parity
+npm run test:all     # typecheck + 226 unit tests + 38 Playwright tests
+npm run check:parser # SQL/TS cost-parser parity (76 cases)
 npm run db:reset     # wipe and re-seed
+node supabase/tests/run.mjs   # 140 SQL assertions, run as the seeded roles
 ```
+
+Run `npm run db:reset` before `npm test`. Every visual baseline encodes the
+seeded dollar figures, and `timeline-v2.spec.ts` refuses to go on unless the
+federal plan totals **$56,003,188**. The specs that write (what-ifs, drags,
+invites, line items, packages, field order) put everything back, so the suite
+runs twice in a row against one reset. Only the item and package number
+counters move on, because numbers are never reused.
+
+The suite never sends real email. `playwright.config.ts` starts its own
+`next start` with `RESEND_API_KEY` blank, `APP_URL` pointing at the test server
+and `MAILPIT_URL` set, overriding whatever `.env.local` holds, and it refuses
+to reuse a server it did not start.
 
 ---
 
@@ -44,7 +63,7 @@ npm run db:reset     # wipe and re-seed
 
 ```
 line items ──┐
-             ├─► package (chunk_project) ──► phases ──► timeline slots ──► money
+             ├─► package (chunk_project) ──► phases ──► months on the timeline ──► money
 quantity ────┘                                 │
                                                └──► construction ends ──► energy step
 ```
@@ -70,11 +89,14 @@ editing can double-count a line item.
 | Every Supabase read/write | `lib/store.ts` |
 | Caller's role on a project | `lib/project-role.ts` |
 | Timeline (grid, bars, arrows, chart, sandbox) | `components/project-workspace/TimelineTab.tsx` + `timeline/` |
+| Form field values for export / Master View | `lib/form-values.ts` |
+| Auth emails (invite, added-to-project, confirm, reset) | `lib/email/` + `app/api/admin/invite`, `app/api/auth/*`, `app/auth/*` |
 | Phase editing | `components/project-workspace/PhaseEditor.tsx` |
 | Cost + energy parameters | `components/project-workspace/CostModelTab.tsx` |
 | Vocabularies editor | `components/project-workspace/TaxonomyEditor.tsx` |
 | Excel export | `lib/export/` + `app/api/projects/[id]/export/xlsx/route.ts` |
-| Schema | `supabase/migrations/0006`–`0011` |
+| Schema | `supabase/migrations/0006`–`0020` |
+| SQL regression tests | `supabase/tests/` (`node supabase/tests/run.mjs`) |
 
 `lib/cost-model.ts` has **no React and no Supabase imports**, and that is a hard
 rule rather than a preference. The Timeline tab, the Excel route and (when it
@@ -82,8 +104,8 @@ lands) the PDF route must produce the same numbers, and the only way to
 guarantee that is for all three to call the same pure functions. The client is
 handing the Excel output to a state agency; "the screen said one thing and the
 export said another" is not a bug we get to have. It also means the engine is
-unit-testable without a browser or a database — `tests/unit/cost-model.test.ts`,
-53 assertions.
+unit-testable without a browser or a database — `tests/unit/cost-model.test.ts`
+and `tests/unit/waveb-months.test.ts`.
 
 ---
 
@@ -95,14 +117,39 @@ tpc_base(package)   = ecc_base × tpc_factor                        -- default 1
 cost_base(phase)    = tpc_base × phase.pct_of_tpc
 
 years_out(phase)    = (timeline_anchor_year − base_year)
-                    + slot_to_years( basis == 'midpoint'
-                                     ? start + duration/2
-                                     : start )
+                    + ( basis == 'midpoint'
+                        ? start_month + duration_months/2
+                        : start_month ) / 12
 
 escalation(phase)   = Π over each year y in [0, years_out) of (1 + rate_for(y))
 cost_esc(phase)     = cost_base × escalation
-per_slot(phase)     = cost_esc / duration                          -- straight line
+per_month(phase)    = cost_esc / duration_months                   -- straight line
 ```
+
+**Schedules are stored in months, and the zoom never touches money (0020).**
+Phase start, duration and dependency lag used to be stored in "slots" whose
+size the zoom set, so dragging the Zoom slider re-priced the whole plan and the
+Excel export (the federal seed read $179.7M at 5-year zoom, $56.0M at Year and
+$43.3M at Month). The columns `start_slot` / `duration_slots` / `lag_slots`
+keep their names but now hold **months**. The engine reads only months; a
+column at any zoom is just a span of months, and its total is the overlap of
+each phase with that span. Zoom is per-viewer view state: anyone, viewers
+included, can change it, and it writes nothing. The project's stored zoom is
+only the view a page opens at. Drags snap to one column of the current zoom
+and store months; the phase editor takes durations in months.
+
+**Fiscal years and quarters are counted month by month.**
+`computeFiscalYearTotals` is the one function behind the Timeline's "By fiscal
+year" strip (with Q1–Q4) and the export's Annual Cost Summary. The grid's
+column headers show the calendar span and the fiscal span it covers
+(`CY2026 / FY26–27`), so a column total and an FY total are different, honest
+numbers. The FY cards add up to the headline exactly.
+
+**The horizon extends to the furthest phase** (`resolveHorizon`, M-27). It is
+never shorter than the project's Timeline Length, and the screen and the
+workbook both say when it has been stretched. Before this, money scheduled past
+the end counted in the headline but fell out of the columns, the FY strip and
+the Annual Summary.
 
 Five things in there are load-bearing and easy to get wrong:
 
@@ -125,8 +172,8 @@ end of a fifteen-year plan is not.
 priced in 2026 used on a plan anchored at 2028 already carries two years before
 anyone drags anything. Easy to forget; there is a test for it.
 
-**Column totals are computed by interval overlap, not integer rounding.** Bars
-can sit on fractional slots. A total that does not match the sum of the bars
+**Column totals are computed by interval overlap, not integer rounding.** A
+phase rarely lines up with a column (a 7-month phase at Year zoom). A total that does not match the sum of the bars
 above it is exactly the kind of discrepancy that destroys trust in a costing
 tool, so there is an explicit invariant test.
 
@@ -155,6 +202,12 @@ Four **per-project** roles, resolved by `ship.project_role()`:
 gate in the UI is re-made in the database on the way to the data. The reason to
 gate in the UI at all is that a button whose every save is silently filtered to
 zero rows reads as the app being broken.
+
+A project `admin` (not only a platform admin) can rename their project, edit
+its roster and invite people to it (0013, D-8). Only a platform admin can make
+someone a platform admin. Removing an email from the roster now revokes that
+person's `project_roles` row; before 0013 a "removed" consultant kept full
+access.
 
 Two things worth knowing:
 
@@ -185,6 +238,56 @@ now checks `can_edit_project`, `create_scenario` checks
 The lesson worth carrying: a `SECURITY DEFINER` function is a hole straight
 through RLS, so its own authorization check *is* the policy. Audit those
 separately from the policies.
+
+---
+
+## Pre-launch hardening (0013–0020)
+
+The pre-launch audit found holes in
+access, integrity, money and auth. What changed, by area:
+
+**Migrations.** Apply in order after 0012; [`supabase/README.md`](../supabase/README.md)
+has rollback notes for each.
+
+| File | What it does |
+|---|---|
+| `0013_access_hardening` | roster removal revokes access; project admins manage their own project (D-8); stale roster saves refused (40001); `claim_invite` needs a confirmed email; `project_access_notices` for the added-to-project toast; service role gets `ship` usage |
+| `0014_line_item_integrity` | system columns (item number, company, discipline, `ecc_amount`…) immutable for non-platform-admins, `project_id` for everyone; packages cannot link another project's items; blank savings and dropdowns are NULL, not 0 (D-9) |
+| `0015_scenario_hardening` | `base_payload` makes rebase a real three-way merge; payload writes go through `save_scenario_payload`; publish needs the owner or a shared what-if |
+| `0016_form_builder_hardening` | only the seeder creates built-in fields; column keys allow-listed; projects with built-ins can be deleted |
+| `0017_bulk_write_rpcs` | `reorder_form_fields` / `reorder_field_options` (the up/down arrows always failed before) |
+| `0018_project_lifecycle` | every project gets cost, energy and timeline rows with a fixed year, so totals no longer move on 1 January |
+| `0019_cost_parser` | strict `parse_cost_input`; unreadable legacy text becomes NULL and is flagged |
+| `0020_canonical_time_unit` | converts every stored schedule position to months (see [The cost engine](#the-cost-engine)). **Snapshot the hosted database first; it converts in place.** Run-once, logged per project |
+
+**Auth and email.** Our server sends every auth email itself through the
+Resend REST API (`lib/email/`); nothing calls `inviteUserByEmail`, client
+`signUp` or `resetPasswordForEmail`. Without `RESEND_API_KEY` it delivers to the
+local Mailpit (outside production, or when `MAILPIT_URL` is set); in production
+it refuses rather than sending nowhere. Links are built from `APP_URL`, never
+the request's Host header. Routes:
+
+- `/auth/confirm` verifies a `token_hash` link server-side, claims the invite,
+  and sends invite and recovery links on to `/auth/set-password` (8+ characters).
+- `/auth/forgot` + `/api/auth/forgot`, `/auth/sign-up` + `/api/auth/sign-up`
+  (allow-list check, neutral answers so accounts cannot be enumerated),
+  `/api/auth/resend-confirmation`.
+- Inviting an address that already has an account sends a plain "You've been
+  added to <project>" link and records an in-app notice, shown as a toast at
+  next sign-in. No admin is ever shown a login link for an existing account.
+- `?next=` only accepts same-site relative paths. Email confirmation is on,
+  minimum password 8 (`supabase/config.toml`; `supabase/PREFLIGHT.md` §7 lists
+  the hosted settings).
+
+**UI.** Deletes (line items, packages, phases, what-ifs) are a two-step inline
+confirm. Number fields keep what was typed and parse on blur; cost fields take
+`$`, thousands separators and k / M / B shorthand with a live "= $1,200,000"
+preview. Master View scrolls horizontally with #, Discipline and Item name
+pinned, and its PDF export no longer runs a project name as HTML. What-if drags
+no longer wipe earlier moves, and the Excel export follows the open what-if.
+
+**Next.js 16.4** (16.2.0 carried about 30 advisories). `allowedDevOrigins`
+lets `next dev` pages opened at 127.0.0.1 hydrate.
 
 ---
 
@@ -219,11 +322,18 @@ campus. Those four `LineItem` fields are now `string`. The unions survive as the
 | Gate | What it covers |
 |---|---|
 | `npm run typecheck` | app + test configs separately |
-| `npm run test:unit` | 53 assertions on the cost engine |
-| `npm run check:parser` | 30 inputs through both cost parsers |
-| `npm run test` | 22 Playwright tests, incl. per-role visual baselines |
+| `npm run lint` | eslint-config-next 16.4, incl. the react-hooks rules |
+| `npm run test:unit` | 226 tests: cost engine, months/zoom invariants, parsers, export, mappers, auth helpers, what-if merge |
+| `npm run check:parser` | 76 inputs through both cost parsers |
+| `node supabase/tests/run.mjs` | 140 SQL assertions over 0013–0020, as the seeded roles, each file one rolled-back transaction |
+| `npm run test` | 38 Playwright tests, incl. per-role visual baselines, invite and reset email round trips, what-if drags, delete confirms, form reorder |
 
-**`check:parser` exists because the same parse happens twice.**
+**`check:parser` exists because the same parse happens twice.** (Since 0019
+both parsers are strict: `[$] NUMBER [k|m|b|thousand|million|billion]`, no
+negatives, and anything else is *unreadable* — `ecc_amount` NULL, flagged in
+the UI and the export — rather than a silent $0. The old lenient parser read
+"1.2 million" as $1.20 and "TBD" as $0, and both copies agreed, which is why
+parity alone did not catch it.)
 `estimated_first_cost` is free text so an estimator can type `$1.2m`;
 `ecc_amount` is the parsed numeric the database sums. `lib/costs.ts` and
 `ship.parse_cost_input()` must agree or the UI and the export disagree about
@@ -247,6 +357,22 @@ Things that cost time once and will cost it again.
 any backfill inside a migration is a no-op on a fresh database. That is why
 `seeds/002_v2_phases.sql` and `003_v2_taxonomy.sql` exist — they are the fixture
 equivalents of backfills in 0007 and 0008.
+
+**A seed guard on a column that became nullable silently stops matching.**
+0014 made `annual_energy_savings` blank by default (NULL, D-9). The energy
+seed's `where … annual_energy_savings = 0` then matched no rows, and the
+federal fixture lost every saving: the chart read "Saved 0" while the dollar
+total, and so the fixture guard, stayed correct. Guard with `coalesce(…, 0)`.
+
+**Profiles exist only after a first sign-in.** `npm run db:reset` creates
+`auth.users`, not `ship.profiles`; `claim_invite()` mints those on sign-in.
+`supabase/tests/run.mjs` claims the four seeded users itself before it runs,
+or every platform-admin assertion fails on a fresh database.
+
+**`next start` is production.** With NODE_ENV=production, `lib/email` needs
+`APP_URL` and uses Mailpit only when `MAILPIT_URL` is set. `@next/env` never
+lets a `.env` file replace a key already in the process environment, even an
+empty one, which is how the Playwright config blanks a real `RESEND_API_KEY`.
 
 **Seed the taxonomy values line items already carry, not just the defaults.**
 0008's validation trigger fails *open* only while a project has zero rows for a
@@ -287,11 +413,6 @@ policies, `apply_suggestion()` / `reject_suggestion()` RPCs, a column allowlist.
 No client code calls any of it. This is the consultant workflow from R5.2 and is
 the real gate on consultant onboarding; it is the largest remaining piece.
 
-**PDF export.** Excel is done. PDF is the smaller half — the plan is print CSS
-(`@page { size: A3 landscape }`) rather than a serverless Chromium, because the
-timeline is already a Tailwind-styled DOM that a browser print engine reproduces
-faithfully for free.
-
 **Bundling cost-efficiency logic.** Declined on the record by both Joe and
 Steve. GCs/GRs scaling with project size is real and stays a verbal conversation
 with the client.
@@ -313,14 +434,17 @@ Promoting these migrations is a separate, deliberate decision.
 Not bugs exactly, but things a reader should know before they trip over them.
 
 - **Admins and editors cannot edit other people's line items** in the UI, though
-  the database allows it. `AddDataTab` fetches own-items-only for every role.
-  Pre-existing, not caused by the v2 work, worth a ticket.
+  the database allows it. D-13 says they should, from Master View (M-62, not
+  done yet).
 - **An editor cannot see the member list.** The Settings tab is admin-gated; the
   matrix gives editors read access to members. Narrower than intended.
 - **`TaxonomyEditor` accepts a `readOnly` prop that nothing passes**, because it
   is only reachable from the admin-only Settings tab. Dead today, and a trap if
   someone surfaces the editor elsewhere without wiring it.
-- **Dependency links cannot be created or deleted from the UI.**
-  `createPhaseDependency` / `deletePhaseDependency` exist in `lib/store.ts` with
-  zero callers; the arrows render from seeded data. The policies are correct and
-  check both endpoints for whenever this ships.
+- **Dependency links are switched off.** They could not be created or deleted
+  from the UI (`createPhaseDependency` / `deletePhaseDependency` have no
+  callers), yet seeded links drew arrows and pushed bars on drag. One constant,
+  `DEPENDENCY_LINKS_ENABLED = false` in
+  `components/project-workspace/timeline/layout.ts`, turns off both the arrows
+  and the drag auto-push (D-14). No dependency code or data was removed; flip
+  it back when there is a UI to manage links.

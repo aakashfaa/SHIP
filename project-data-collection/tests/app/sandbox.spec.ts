@@ -41,7 +41,9 @@ async function discardAllScenarios(page: Page) {
     )
     if (values.length === 0) break
     await resume.selectOption(values[0])
+    // Discard is a two-step inline confirm (M-23 / D-15).
     await page.getByRole('button', { name: 'Discard' }).click()
+    await page.getByRole('button', { name: 'Yes, delete this what-if' }).click()
     await expect(page.getByText('Local copy')).toBeHidden()
   }
 }
@@ -112,7 +114,10 @@ test('discarding a what-if leaves the live plan untouched', async ({ page }) => 
   await page.getByRole('button', { name: 'Start', exact: true }).click()
   await expect(page.getByText('Local copy')).toBeVisible()
 
+  // Discard asks first (M-23 / D-15); the what-if survives until confirmed.
   await page.getByRole('button', { name: 'Discard' }).click()
+  await expect(page.getByText('Local copy')).toBeVisible()
+  await page.getByRole('button', { name: 'Yes, delete this what-if' }).click()
   await expect(page.getByText('Local copy')).toBeHidden()
 
   // Reload rather than trusting client state: the assertion is about what is

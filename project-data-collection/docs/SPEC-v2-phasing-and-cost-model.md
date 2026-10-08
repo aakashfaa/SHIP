@@ -309,6 +309,14 @@ project
 | `duration_slots` | numeric | ≥ 1 |
 | `duration_locked` | boolean | R4.2 — blocks resize |
 
+> **Storage is now months (migration 0020, decision D-1).** As built, a "slot" meant one
+> column at whatever zoom the project had, so moving the Zoom slider re-priced the plan.
+> `start_slot`, `duration_slots` and `phase_dependencies.lag_slots` keep their names but hold
+> **months**; the zoom is per-viewer display only and writes nothing. Read "slot" in the
+> formulas below as "month" for storage and pricing, and "column" for what the grid draws.
+> Fiscal-year totals are counted month by month, with fiscal quarters (D-11). See
+> [`IMPLEMENTATION.md`](./IMPLEMENTATION.md#the-cost-engine).
+
 `kind` drives three behaviours and must not be conflated with `name`: it decides bar colour,
 whether the phase contributes to energy onset (`construction` only, R7.4), and which default
 escalation basis applies.

@@ -108,7 +108,28 @@ export default defineConfig({
     // noise that has nothing to do with the app.
     command: `npm run build && npx next start --port ${PORT}`,
     url: BASE_URL,
-    reuseExistingServer: !process.env.CI,
+    // `next start` runs with NODE_ENV=production, where lib/email refuses to
+    // guess: links need a fixed APP_URL, and with no RESEND_API_KEY mail goes
+    // to Mailpit only when MAILPIT_URL is set explicitly.
+    //
+    // These override .env.local too, and that matters: .env.local may carry
+    // the REAL RESEND_API_KEY and the production APP_URL. Playwright starts
+    // the server with { ...process.env, ...env } and @next/env never lets a
+    // .env file replace a key that is already in the process environment,
+    // even as an empty string. So RESEND_API_KEY: '' means the suite sends
+    // to the local Mailpit only -- never real mail to throwaway test
+    // addresses, whose bounces would damage the sending domain -- and every
+    // link points at this test server, not production.
+    env: {
+      APP_URL: BASE_URL,
+      MAILPIT_URL: process.env.MAILPIT_URL ?? 'http://127.0.0.1:55424',
+      RESEND_API_KEY: '',
+    },
+    // Never reuse a server we did not start: one launched by hand would have
+    // read .env.local (real Resend key, production APP_URL) instead of the
+    // overrides above. If :3100 is busy the run fails loudly; stop that
+    // server and run again.
+    reuseExistingServer: false,
     timeout: 300_000,
     stdout: 'ignore',
     stderr: 'pipe',
