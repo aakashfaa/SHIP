@@ -58,6 +58,7 @@ type Props = {
   permissionsLoading: boolean
   onHoverSlot: (slot: number | null) => void
   onToggleExpand: (chunkProjectId: string) => void
+  onSetAllExpanded: (open: boolean) => void
   onPhasePointerDown: (
     event: ReactPointerEvent<HTMLDivElement>,
     phase: ChunkPhase,
@@ -84,6 +85,7 @@ export default function TimelineGrid({
   permissionsLoading,
   onHoverSlot,
   onToggleExpand,
+  onSetAllExpanded,
   onPhasePointerDown,
   onSelectLink,
 }: Props) {
@@ -105,7 +107,23 @@ export default function TimelineGrid({
               ? 'Checking your access…'
               : readOnly
                 ? 'Read-only. Ask an editor for access to reschedule.'
-                : 'Expand a package to schedule its phases. Drag to move, drag an edge to resize.'}
+                : 'Click a package to open its phases, then drag a phase bar to move it or drag its edge to resize.'}
+          </div>
+          <div className="mt-3 flex gap-2">
+            <button
+              type="button"
+              onClick={() => onSetAllExpanded(true)}
+              className="rounded-full border border-slate-300 bg-white px-3 py-1 text-[11px] font-semibold text-slate-700 transition hover:border-slate-400"
+            >
+              Open all
+            </button>
+            <button
+              type="button"
+              onClick={() => onSetAllExpanded(false)}
+              className="rounded-full border border-slate-300 bg-white px-3 py-1 text-[11px] font-semibold text-slate-700 transition hover:border-slate-400"
+            >
+              Close all
+            </button>
           </div>
         </div>
 
@@ -178,10 +196,10 @@ export default function TimelineGrid({
                 className="grid border-b border-slate-200"
                 style={{
                   gridTemplateColumns: `${LABEL_COLUMN_WIDTH}px ${width}px`,
-                  minHeight: PACKAGE_ROW_HEIGHT,
+                  height: PACKAGE_ROW_HEIGHT,
                 }}
               >
-                <div className="border-r border-slate-200 bg-white px-5 py-4">
+                <div className="overflow-hidden border-r border-slate-200 bg-white px-5 py-3">
                   <div className="flex items-center gap-2">
                     <button
                       type="button"
@@ -216,15 +234,21 @@ export default function TimelineGrid({
                 <div
                   className="relative bg-white"
                   style={{
-                    minHeight: PACKAGE_ROW_HEIGHT,
                     backgroundImage: `repeating-linear-gradient(to right, transparent 0, transparent ${
                       CELL_WIDTH - 1
                     }px, rgba(148,163,184,0.24) ${CELL_WIDTH - 1}px, rgba(148,163,184,0.24) ${CELL_WIDTH}px)`,
                   }}
                 >
+                  {/* The collapsed bar is a summary, not a drag target -- the
+                      phases are what get scheduled. It used to say "expand to
+                      schedule" without being clickable, which read as a broken
+                      drag; now clicking it opens the phases. */}
                   {!expanded && phases.length > 0 ? (
-                    <div
-                      className="absolute flex items-center rounded-[0.9rem] border border-slate-700 bg-[linear-gradient(135deg,rgba(15,23,42,0.94)_0%,rgba(30,41,59,0.92)_50%,rgba(14,116,144,0.9)_100%)] px-3 text-white shadow-lg"
+                    <button
+                      type="button"
+                      onClick={() => onToggleExpand(pkg.chunkProjectId)}
+                      aria-expanded={false}
+                      className="absolute flex cursor-pointer items-center rounded-[0.9rem] border border-slate-700 bg-[linear-gradient(135deg,rgba(15,23,42,0.94)_0%,rgba(30,41,59,0.92)_50%,rgba(14,116,144,0.9)_100%)] px-3 text-left text-white shadow-lg transition hover:brightness-110 focus:outline-none focus-visible:ring-2 focus-visible:ring-teal-300"
                       style={{
                         ...barRect(spanStart, spanEnd - spanStart, PACKAGE_ROW_HEIGHT),
                         position: 'absolute',
@@ -232,11 +256,35 @@ export default function TimelineGrid({
                     >
                       <div className="min-w-0 flex-1">
                         <div className="truncate text-xs font-semibold">{pkg.name}</div>
-                        <div className="text-[10px] text-white/70">
-                          {phases.length} phases · expand to schedule
+                        <div className="truncate text-[10px] text-white/70">
+                          {phases.length} phases ·{' '}
+                          {readOnly ? 'click to show phases' : 'click to show and move phases'}
                         </div>
                       </div>
-                    </div>
+                    </button>
+                  ) : null}
+
+                  {/* While open, the package row keeps an outline of the whole
+                      package so it is obvious what the phases below belong to
+                      and how to fold them back into one bar. */}
+                  {expanded && phases.length > 0 ? (
+                    <button
+                      type="button"
+                      onClick={() => onToggleExpand(pkg.chunkProjectId)}
+                      aria-expanded={true}
+                      className="absolute flex cursor-pointer items-center rounded-[0.9rem] border-2 border-dashed border-slate-400 bg-slate-50/80 px-3 text-left text-slate-700 transition hover:border-slate-600 hover:bg-slate-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-teal-300"
+                      style={{
+                        ...barRect(spanStart, spanEnd - spanStart, PACKAGE_ROW_HEIGHT),
+                        position: 'absolute',
+                      }}
+                    >
+                      <div className="min-w-0 flex-1">
+                        <div className="truncate text-xs font-semibold">{pkg.name}</div>
+                        <div className="truncate text-[10px] text-slate-500">
+                          Whole package · click to close back into one bar
+                        </div>
+                      </div>
+                    </button>
                   ) : null}
                 </div>
               </div>

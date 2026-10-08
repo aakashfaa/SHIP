@@ -232,6 +232,9 @@ export default function DependencyArrows({ links, width, height, onSelectLink }:
               className={onSelectLink ? 'pointer-events-stroke cursor-pointer' : undefined}
               onClick={onSelectLink ? () => onSelectLink(link.id) : undefined}
             />
+            {/* A white halo under the line, so a link that ends on a collapsed
+                package's dark summary bar stays visible. */}
+            <path d={d} fill="none" stroke="white" strokeWidth={4} strokeOpacity={0.9} />
             <path
               d={d}
               fill="none"

@@ -17,8 +17,11 @@
 export const CELL_WIDTH = 92
 export const LABEL_COLUMN_WIDTH = 300
 
-/** Height of a collapsed package row (summary bar only). */
-export const PACKAGE_ROW_HEIGHT = 92
+/** Height of a package row. Rendered as a FIXED height, not a minimum: the
+ *  dependency arrows are positioned from this number, so a row that grows to
+ *  fit its label (e.g. the "Phases total" warning) pushes every bar below it
+ *  out from under its arrows. Sized to fit the tallest label. */
+export const PACKAGE_ROW_HEIGHT = 132
 /** Height of one expanded phase sub-row. */
 export const PHASE_ROW_HEIGHT = 52
 

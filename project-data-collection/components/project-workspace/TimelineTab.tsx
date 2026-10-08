@@ -471,10 +471,11 @@ export default function TimelineTab({ project, permissions }: Props) {
   /**
    * Pixel rects for every phase, keyed by phase id.
    *
-   * A phase inside a COLLAPSED package has no bar of its own, so it maps to
-   * its package's summary bar. Without that, every dependency touching a
-   * collapsed package would simply vanish — which reads as "the tool lost my
-   * link" rather than "that row is collapsed".
+   * A phase inside a COLLAPSED package has no bar of its own, so it is drawn
+   * on its package's summary bar -- but at the phase's OWN horizontal extent.
+   * Mapping it to the whole summary bar made a link into a package's
+   * construction phase land on the package's first study month, which looked
+   * like a backward link and routed as a loop.
    */
   const phaseRects = useMemo(() => {
     const rects = new Map<string, { x: number; y: number; width: number; height: number }>()
@@ -493,12 +494,8 @@ export default function TimelineTab({ project, permissions }: Props) {
         continue
       }
 
-      if (row.phases.length === 0) continue
-      const spanStart = Math.min(...row.phases.map((p) => p.startSlot))
-      const spanEnd = Math.max(...row.phases.map((p) => p.startSlot + p.durationSlots))
-      const rect = barRect(spanStart, spanEnd - spanStart, PACKAGE_ROW_HEIGHT)
-
       for (const phase of row.phases) {
+        const rect = barRect(phase.startSlot, phase.durationSlots, PACKAGE_ROW_HEIGHT)
         rects.set(phase.id, {
           x: rect.left,
           y: row.top + rect.top,
@@ -714,6 +711,13 @@ export default function TimelineTab({ project, permissions }: Props) {
       return next
     })
   }, [])
+
+  const handleSetAllExpanded = useCallback(
+    (open: boolean) => {
+      setExpanded(open ? new Set(rows.map((row) => row.summary.input.chunkProjectId)) : new Set())
+    },
+    [rows]
+  )
 
   /**
    * Drag / resize a phase bar.
@@ -1123,6 +1127,7 @@ export default function TimelineTab({ project, permissions }: Props) {
               permissionsLoading={permissions.loading}
               onHoverSlot={setHoveredSlot}
               onToggleExpand={handleToggleExpand}
+              onSetAllExpanded={handleSetAllExpanded}
               onPhasePointerDown={handlePhasePointerDown}
               onSelectLink={() => undefined}
             />

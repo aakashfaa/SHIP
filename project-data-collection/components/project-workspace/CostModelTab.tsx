@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { createContext, useContext, useEffect, useMemo, useRef, useState } from 'react'
 import { formatCurrency } from '@/lib/costs'
 import { escalationFactor, type CostSettings } from '@/lib/cost-model'
 import {
@@ -38,6 +38,19 @@ import type {
 
 const PERSIST_DEBOUNCE_MS = 600
 
+/** Per-browser preference, not a project setting: one person finding the
+ *  explanations noisy says nothing about what the next reader needs. */
+const SHOW_DESCRIPTIONS_KEY = 'ship.costModel.showDescriptions'
+
+/** Off by default -- the explanatory copy is for a first read, and the tab
+ *  with all of it showing is too dense to work in. */
+const DescriptionsContext = createContext(false)
+
+/** Explanatory copy that only renders while "Show descriptions" is on. */
+function Description({ children }: { children: React.ReactNode }) {
+  return useContext(DescriptionsContext) ? <>{children}</> : null
+}
+
 type Props = {
   project: Project
   permissions: ProjectPermissions
@@ -52,11 +65,14 @@ function Field({
   hint?: string
   children: React.ReactNode
 }) {
+  const showDescriptions = useContext(DescriptionsContext)
   return (
     <label className="block">
       <span className="text-xs font-medium text-slate-600">{label}</span>
       <div className="mt-1">{children}</div>
-      {hint ? <p className="mt-1.5 text-[11px] leading-snug text-slate-400">{hint}</p> : null}
+      {hint && showDescriptions ? (
+        <p className="mt-1.5 text-[11px] leading-snug text-slate-400">{hint}</p>
+      ) : null}
     </label>
   )
 }
@@ -95,6 +111,29 @@ export default function CostModelTab({ project, permissions }: Props) {
   const [savedAt, setSavedAt] = useState<number | null>(null)
   const [overrideYear, setOverrideYear] = useState('')
   const [overrideRate, setOverrideRate] = useState('')
+  // Reading storage in the initialiser cannot cause a hydration mismatch here:
+  // the first render (server and client alike) is the loading placeholder,
+  // which does not show the toggle.
+  const [showDescriptions, setShowDescriptions] = useState(() => {
+    if (typeof window === 'undefined') return false
+    try {
+      return window.localStorage.getItem(SHOW_DESCRIPTIONS_KEY) === '1'
+    } catch {
+      return false
+    }
+  })
+
+  function toggleDescriptions() {
+    setShowDescriptions((prev) => {
+      const next = !prev
+      try {
+        window.localStorage.setItem(SHOW_DESCRIPTIONS_KEY, next ? '1' : '0')
+      } catch {
+        // Storage blocked: the toggle still works for this visit.
+      }
+      return next
+    })
+  }
 
   const isMountedRef = useRef(true)
   const costTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -247,7 +286,8 @@ export default function CostModelTab({ project, permissions }: Props) {
      * `min-w-0` because a fieldset carries a default `min-width: min-content`
      * that would otherwise stop the grids inside it from shrinking.
      */
-    <fieldset disabled={readOnly} className="m-0 min-w-0 border-0 p-0 space-y-5">
+    <DescriptionsContext.Provider value={showDescriptions}>
+    <div className="space-y-5">
       {!permissions.loading && readOnly ? (
         <div className="rounded-[1.25rem] border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
           <span className="font-medium">Read-only.</span> You can see every
@@ -255,21 +295,48 @@ export default function CostModelTab({ project, permissions }: Props) {
           editor or admin can change them.
         </div>
       ) : null}
+      {/* Outside the fieldset: the descriptions toggle is a view preference,
+          so it has to work for read-only roles too. */}
       <div className="rounded-[1.75rem] border border-slate-200 bg-white/86 p-5 shadow-sm">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div>
             <h2 className="text-xl font-semibold tracking-tight text-slate-950">Cost Model</h2>
-            <p className="mt-1 max-w-2xl text-sm text-slate-500">
-              The assumptions behind every figure on the Timeline. These are this
-              project&apos;s settings, not the tool&apos;s — the defaults are one firm&apos;s
-              working numbers and are meant to be changed.
-            </p>
+            <Description>
+              <p className="mt-1 max-w-2xl text-sm text-slate-500">
+                The assumptions behind every figure on the Timeline. These are this
+                project&apos;s settings, not the tool&apos;s — the defaults are one firm&apos;s
+                working numbers and are meant to be changed.
+              </p>
+            </Description>
           </div>
-          {savedAt ? (
-            <span className="rounded-full bg-emerald-50 px-3 py-1 text-[11px] font-medium text-emerald-800">
-              Saved
-            </span>
-          ) : null}
+          <div className="flex items-center gap-3">
+            {savedAt ? (
+              <span className="rounded-full bg-emerald-50 px-3 py-1 text-[11px] font-medium text-emerald-800">
+                Saved
+              </span>
+            ) : null}
+            <button
+              type="button"
+              role="switch"
+              aria-checked={showDescriptions}
+              onClick={toggleDescriptions}
+              className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 transition hover:border-slate-300 focus:outline-none focus-visible:ring-2 focus-visible:ring-teal-200"
+            >
+              <span
+                aria-hidden="true"
+                className={`relative inline-block h-4 w-7 rounded-full transition ${
+                  showDescriptions ? 'bg-teal-600' : 'bg-slate-300'
+                }`}
+              >
+                <span
+                  className={`absolute top-0.5 h-3 w-3 rounded-full bg-white shadow transition-all ${
+                    showDescriptions ? 'left-3.5' : 'left-0.5'
+                  }`}
+                />
+              </span>
+              Show descriptions
+            </button>
+          </div>
         </div>
 
         {saveError ? (
@@ -279,14 +346,18 @@ export default function CostModelTab({ project, permissions }: Props) {
         ) : null}
       </div>
 
+    <fieldset disabled={readOnly} className="m-0 min-w-0 border-0 p-0 space-y-5">
+
       {/* ------------------------------------------------ total project cost -- */}
       <section className="rounded-[1.75rem] border border-slate-200 bg-white/86 p-5 shadow-sm">
         <h3 className="text-sm font-semibold text-slate-950">Total Project Cost</h3>
-        <p className="mt-1 text-xs text-slate-500">
-          Soft costs — design fees, owner&apos;s contingency, FF&amp;E, OPM fees, permitting,
-          commissioning — all ride inside this multiplier and land on construction rather
-          than being separately schedulable.
-        </p>
+        <Description>
+          <p className="mt-1 text-xs text-slate-500">
+            Soft costs — design fees, owner&apos;s contingency, FF&amp;E, OPM fees, permitting,
+            commissioning — all ride inside this multiplier and land on construction rather
+            than being separately schedulable.
+          </p>
+        </Description>
 
         <div className="mt-4 grid gap-4 md:grid-cols-3">
           <Field
@@ -375,7 +446,7 @@ export default function CostModelTab({ project, permissions }: Props) {
                 </tr>
               </tbody>
             </table>
-            {selectedTemplate.description ? (
+            {selectedTemplate.description && showDescriptions ? (
               <p className="border-t border-slate-100 bg-white px-4 py-2 text-[11px] text-slate-500">
                 {selectedTemplate.description}
               </p>
@@ -387,11 +458,13 @@ export default function CostModelTab({ project, permissions }: Props) {
       {/* ------------------------------------------------------- escalation -- */}
       <section className="rounded-[1.75rem] border border-slate-200 bg-white/86 p-5 shadow-sm">
         <h3 className="text-sm font-semibold text-slate-950">Escalation</h3>
-        <p className="mt-1 text-xs text-slate-500">
-          Line-item costs are stored un-escalated. Escalation is applied per phase, from
-          where that phase sits on the timeline — which is why moving a bar changes what it
-          costs.
-        </p>
+        <Description>
+          <p className="mt-1 text-xs text-slate-500">
+            Line-item costs are stored un-escalated. Escalation is applied per phase, from
+            where that phase sits on the timeline — which is why moving a bar changes what it
+            costs.
+          </p>
+        </Description>
 
         <div className="mt-4 grid gap-4 md:grid-cols-2 xl:grid-cols-4">
           <Field label="Mode">
@@ -482,11 +555,13 @@ export default function CostModelTab({ project, permissions }: Props) {
         {/* ------------------------------------------------ per-year overrides */}
         <div className="mt-5 rounded-[1.25rem] border border-slate-200 bg-slate-50/70 p-4">
           <div className="text-xs font-semibold text-slate-700">Per-year overrides</div>
-          <p className="mt-1 text-[11px] text-slate-500">
-            A single rate cannot express what an estimator actually knows — the next year or
-            two are forecastable and year twelve is not. Pin the years you have a view on;
-            the rest fall back to {costRow.escalationAnnualPercent}%.
-          </p>
+          <Description>
+            <p className="mt-1 text-[11px] text-slate-500">
+              A single rate cannot express what an estimator actually knows — the next year or
+              two are forecastable and year twelve is not. Pin the years you have a view on;
+              the rest fall back to {costRow.escalationAnnualPercent}%.
+            </p>
+          </Description>
 
           {costRow.rateOverrides.length > 0 ? (
             <div className="mt-3 flex flex-wrap gap-2">
@@ -575,20 +650,24 @@ export default function CostModelTab({ project, permissions }: Props) {
               </div>
             ))}
           </div>
-          <p className="mt-2 text-[11px] text-slate-400">
-            Amber means past the confidence horizon — a range to discuss, not a number to
-            budget against.
-          </p>
+          <Description>
+            <p className="mt-2 text-[11px] text-slate-400">
+              Amber means past the confidence horizon — a range to discuss, not a number to
+              budget against.
+            </p>
+          </Description>
         </div>
       </section>
 
       {/* ----------------------------------------------------------- energy -- */}
       <section className="rounded-[1.75rem] border border-slate-200 bg-white/86 p-5 shadow-sm">
         <h3 className="text-sm font-semibold text-slate-950">Energy</h3>
-        <p className="mt-1 text-xs text-slate-500">
-          Savings roll up from line items into packages and come online when a
-          package&apos;s construction finishes.
-        </p>
+        <Description>
+          <p className="mt-1 text-xs text-slate-500">
+            Savings roll up from line items into packages and come online when a
+            package&apos;s construction finishes.
+          </p>
+        </Description>
 
         <div className="mt-4 grid gap-4 md:grid-cols-3">
           <Field
@@ -643,5 +722,7 @@ export default function CostModelTab({ project, permissions }: Props) {
         </div>
       </section>
     </fieldset>
+    </div>
+    </DescriptionsContext.Provider>
   )
 }
