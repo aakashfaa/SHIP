@@ -42,10 +42,11 @@
  */
 
 import type { ShipSupabaseClient } from '../supabase/client'
-import { parseCostInput, parseQuantityInput } from '../costs'
+import { parseCostAmount, parseCostInput, parseQuantity, parseQuantityInput } from '../costs'
+import { formatFieldValue, getFieldValue, orderedVisibleFields } from '../form-values'
 import {
-  DEFAULT_COST_SETTINGS,
   DEFAULT_ENERGY_SETTINGS,
+  applyScenarioOverlay,
   computeEnergySeries,
   computeFiscalYearTotals,
   computeSlotCosts,
@@ -65,28 +66,49 @@ import {
   rowToChunkProject,
   rowToCostSettings,
   rowToEnergySettings,
+  rowToFormField,
   rowToLineItem,
   rowToProject,
+  rowToScenario,
   rowToTimelineSettings,
   type ChunkPhaseRow,
   type ChunkProjectRow,
   type EscalationRateOverrideRow,
+  type FormFieldRow,
   type LineItemRow,
   type ProjectCostSettingsRow,
   type ProjectEnergySettingsRow,
   type ProjectRow,
+  type ScenarioRow,
   type TimelineSettingsRow,
 } from '../mappers'
 import type {
   ChunkPhase,
   ChunkProject,
+  FormField,
   LineItem,
   Project,
   ProjectCostSettings,
   ProjectEnergySettings,
   ProjectTimelineSettings,
+  Scenario,
   TimelineInterval,
 } from '../types'
+
+/**
+ * The export cannot be produced as asked, for a reason the caller can fix
+ * (missing settings, a what-if that no longer exists). Carries an HTTP
+ * status so the route can answer with it instead of a generic 500.
+ */
+export class ExportBlockedError extends Error {
+  readonly status: number
+
+  constructor(message: string, status: number) {
+    super(message)
+    this.name = 'ExportBlockedError'
+    this.status = status
+  }
+}
 
 /* ------------------------------------------------------------- fetching -- */
 
@@ -226,6 +248,60 @@ async function fetchTimelineSettings(
   return rowToTimelineSettings(data as unknown as TimelineSettingsRow | null, projectId)
 }
 
+/** The project's form definition (migration 0012) -- the Line Items sheet's
+ *  columns come from here (M-28), same select as lib/store.ts. */
+async function fetchFormFields(
+  supabase: ShipSupabaseClient,
+  projectId: string
+): Promise<FormField[]> {
+  const { data, error } = await supabase
+    .from('form_fields')
+    .select('*, form_field_options(*)')
+    .eq('project_id', projectId)
+    .order('sort_order', { ascending: true })
+
+  if (error) fail(`Failed to load form fields for "${projectId}"`, error)
+
+  return ((data ?? []) as unknown as FormFieldRow[]).map(rowToFormField)
+}
+
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+/**
+ * The what-if to export (M-24), read through RLS like everything else here:
+ * a private scenario that belongs to someone else is simply not returned,
+ * and comes back as "not found" -- the same as one that never existed.
+ * Scoped to the project too, so a scenario id from another project can't be
+ * laid over this one's phases.
+ */
+async function fetchScenarioForExport(
+  supabase: ShipSupabaseClient,
+  projectId: string,
+  scenarioId: string
+): Promise<Scenario> {
+  // A malformed id would make Postgres raise 22P02 (a 500); it is a 404.
+  if (!UUID_PATTERN.test(scenarioId)) {
+    throw new ExportBlockedError('That what-if scenario was not found.', 404)
+  }
+
+  const { data, error } = await supabase
+    .from('scenarios')
+    .select('*')
+    .eq('id', scenarioId)
+    .eq('project_id', projectId)
+    .maybeSingle()
+
+  if (error) fail(`Failed to load scenario "${scenarioId}"`, error)
+  if (!data) {
+    throw new ExportBlockedError(
+      'That what-if scenario was not found, or you no longer have access to it.',
+      404
+    )
+  }
+
+  return rowToScenario(data as unknown as ScenarioRow)
+}
+
 /* --------------------------------------------------------- engine wiring -- */
 
 /**
@@ -270,11 +346,12 @@ function toEnginePhase(phase: ChunkPhase): Phase {
   }
 }
 
-function toCostSettings(row: ProjectCostSettings | null): CostSettings {
-  if (!row) return DEFAULT_COST_SETTINGS
+/** `baseYear` is passed in already checked: the export never prices from a
+ *  stand-in year (M-25) -- see the guard in buildProjectReportData. */
+function toCostSettings(row: ProjectCostSettings, baseYear: number): CostSettings {
   return {
     tpcFactor: row.tpcFactor,
-    baseYear: row.baseYear,
+    baseYear,
     escalationMode: row.escalationMode,
     escalationAnnualPercent: row.escalationAnnualPercent,
     escalationStepYears: row.escalationStepYears,
@@ -303,22 +380,20 @@ function formatFiscalYear(year: number): string {
 
 /* ------------------------------------------------------------- shaping -- */
 
-export type ReportLineItem = {
-  itemNumber: string
-  name: string
-  discipline: string
-  companyName: string
-  category: string
-  timelinePriority: string
-  buildingAreaImpacted: string
-  buildingLevelImpacted: string
-  relativeFirstCost: string
-  estimatedFirstCost: string
-  eccAmount: number
-  annualEnergySavings: number
-  annualCostSavings: number
-  energyNotes: string
-  supportingNotes: string
+export type ReportCellValue = string | number
+
+export type ReportColumn = {
+  header: string
+  width: number
+  /** Excel number format hint; text columns leave it unset. */
+  format?: 'currency' | 'number'
+}
+
+/** A sheet whose columns are data, not code -- the Line Items sheet's
+ *  columns come from the project's form definition (M-28). */
+export type ReportTable = {
+  columns: ReportColumn[]
+  rows: ReportCellValue[][]
 }
 
 export type ReportPackage = {
@@ -358,45 +433,209 @@ export type ReportEnergyPoint = {
 
 export type ProjectReportData = {
   project: { id: string; name: string }
+  /** The what-if this export priced, or null for the live plan (M-24). */
+  scenario: { id: string; name: string } | null
   generatedAt: string
   energyUnitLabel: string
   energyBaselineAnnual: number | null
-  lineItems: ReportLineItem[]
+  /**
+   * Plain-sentence warnings the workbook must carry, e.g. "3 line items have
+   * an unreadable cost (A4, M2, E7); they count as $0." Empty when clean.
+   */
+  notices: string[]
+  /** Item numbers whose estimated first cost can't be read (M-09). */
+  unreadableCostItems: string[]
+  /** Package links whose quantity can't be read (M-10). */
+  unreadableQuantityLinks: number
+  lineItems: ReportTable
   packages: ReportPackage[]
   phases: ReportPhase[]
   annualCostSummary: ReportAnnualTotal[]
   energySummary: ReportEnergyPoint[]
 }
 
+export type BuildReportOptions = {
+  /** Price this what-if instead of the live plan (M-24). */
+  scenarioId?: string | null
+}
+
+/* ---------------------------------------------------- line-item columns -- */
+
+const ECC_COLUMN: ReportColumn = { header: 'ECC Amount', width: 16, format: 'currency' }
+
+/** Line items whose cost text is present but unreadable get this in the ECC
+ *  column instead of a number -- never a silent $0 (M-09). */
+export const UNREADABLE_CELL = 'Unreadable'
+
+function columnWidth(field: FormField): number {
+  switch (field.inputType) {
+    case 'textarea':
+      return 32
+    case 'boolean':
+      return 14
+    case 'number':
+    case 'currency':
+      return 18
+    case 'multiselect':
+      return 26
+    default:
+      return 22
+  }
+}
+
+/** Money-valued built-in number fields. Everything else numeric is a plain
+ *  number (D-16: "plain number fields stay plain numbers"). */
+const CURRENCY_NUMBER_KEYS = new Set(['annual_cost_savings'])
+
+function eccCell(item: LineItem): ReportCellValue {
+  const parsed = parseCostAmount(item.estimatedFirstCost)
+  if (!parsed.ok) return UNREADABLE_CELL
+  if (parsed.amount === null) return ''
+  // The stored ecc_amount and the live parse agree by construction (0019 +
+  // check:parser); the stored value is what the totals use, so show it.
+  return item.eccAmount || parsed.amount
+}
+
+function fieldCell(item: LineItem, field: FormField): ReportCellValue {
+  const value = getFieldValue(item, field)
+  if (field.inputType === 'number') {
+    if (typeof value === 'number' && Number.isFinite(value)) return value
+    const n = typeof value === 'string' && value.trim() !== '' ? Number(value) : NaN
+    return Number.isFinite(n) ? n : formatFieldValue(field, value)
+  }
+  if (field.inputType === 'currency' && field.key !== 'estimated_first_cost') {
+    // A custom currency field: a number when readable, the text as typed
+    // when not (so nothing typed is lost from the deliverable).
+    const parsed = parseCostAmount(typeof value === 'string' ? value : String(value ?? ''))
+    if (parsed.ok && parsed.amount !== null) return parsed.amount
+  }
+  return formatFieldValue(field, value)
+}
+
+/**
+ * The Line Items sheet, built from the project's VISIBLE form fields in form
+ * order, with their current labels -- custom fields included, hidden ones
+ * left out (M-28). Before this it was a hardcoded list of fifteen built-ins
+ * with hardcoded labels: custom fields never reached the client and a field
+ * an admin had hidden still did.
+ *
+ * Three system columns lead (they are not form fields, they are who/what
+ * the row is), and "ECC Amount" -- the parsed per-unit cost every total is
+ * built from -- sits right after the estimated-cost field, or at the end if
+ * that field is hidden. D-4: nothing else is added or removed.
+ */
+export function buildLineItemTable(
+  lineItems: readonly LineItem[],
+  formFields: readonly FormField[]
+): ReportTable {
+  type Spec = { column: ReportColumn; value: (item: LineItem) => ReportCellValue }
+
+  const specs: Spec[] = [
+    { column: { header: 'Item #', width: 10 }, value: (item) => item.itemNumber },
+    { column: { header: 'Discipline', width: 18 }, value: (item) => item.discipline },
+    { column: { header: 'Company', width: 20 }, value: (item) => item.companyName },
+  ]
+
+  let eccPlaced = false
+  for (const field of orderedVisibleFields(formFields)) {
+    const isMoneyNumber = field.inputType === 'number' && CURRENCY_NUMBER_KEYS.has(field.key)
+    const isCustomCurrency = field.inputType === 'currency' && field.key !== 'estimated_first_cost'
+    specs.push({
+      column: {
+        header: field.label.trim() || field.key,
+        width: columnWidth(field),
+        format: isMoneyNumber || isCustomCurrency ? 'currency' : field.inputType === 'number' ? 'number' : undefined,
+      },
+      value: (item) => fieldCell(item, field),
+    })
+    if (field.key === 'estimated_first_cost') {
+      specs.push({ column: ECC_COLUMN, value: eccCell })
+      eccPlaced = true
+    }
+  }
+  if (!eccPlaced) specs.push({ column: ECC_COLUMN, value: eccCell })
+
+  return {
+    columns: specs.map((spec) => spec.column),
+    rows: lineItems.map((item) => specs.map((spec) => spec.value(item))),
+  }
+}
+
+function listItemNumbers(numbers: readonly string[]): string {
+  const shown = numbers.slice(0, 10).join(', ')
+  return numbers.length > 10 ? `${shown} and ${numbers.length - 10} more` : shown
+}
+
+/* ------------------------------------------------------------- building -- */
+
 export async function buildProjectReportData(
   supabase: ShipSupabaseClient,
-  project: Project
+  project: Project,
+  options: BuildReportOptions = {}
 ): Promise<ProjectReportData> {
-  const [lineItems, chunkProjects, chunkPhases, costSettingsRow, energySettingsRow, timelineSettings] =
-    await Promise.all([
-      fetchLineItems(supabase, project.id),
-      fetchChunkProjects(supabase, project.id),
-      fetchChunkPhases(supabase, project.id),
-      fetchCostSettings(supabase, project.id),
-      fetchEnergySettings(supabase, project.id),
-      fetchTimelineSettings(supabase, project.id),
-    ])
+  const scenarioId = options.scenarioId?.trim() || null
 
-  const costSettings = toCostSettings(costSettingsRow)
+  const [
+    lineItems,
+    chunkProjects,
+    chunkPhases,
+    costSettingsRow,
+    energySettingsRow,
+    timelineSettings,
+    formFields,
+    scenario,
+  ] = await Promise.all([
+    fetchLineItems(supabase, project.id),
+    fetchChunkProjects(supabase, project.id),
+    fetchChunkPhases(supabase, project.id),
+    fetchCostSettings(supabase, project.id),
+    fetchEnergySettings(supabase, project.id),
+    fetchTimelineSettings(supabase, project.id),
+    fetchFormFields(supabase, project.id),
+    scenarioId ? fetchScenarioForExport(supabase, project.id, scenarioId) : Promise.resolve(null),
+  ])
+
+  // M-25: a deliverable is never priced from a year nobody set. The screen
+  // can show a labelled stand-in while settings load; a workbook handed to a
+  // state agency cannot, so refuse with something the user can act on.
+  const baseYear = costSettingsRow.baseYear
+  const startCalendarYear = timelineSettings.startCalendarYear
+  if (baseYear === null || startCalendarYear === null) {
+    // The base year has an input on the Cost Model tab; the timeline start
+    // year has none in the app (migration 0018 stores it at creation and
+    // backfills older projects), so a missing one goes to an admin.
+    const steps = [
+      baseYear === null ? 'the base year is not set (Cost Model tab)' : null,
+      startCalendarYear === null
+        ? 'the timeline start year is not set (ask a platform admin to fix the project settings)'
+        : null,
+    ].filter(Boolean)
+    throw new ExportBlockedError(`Can't export yet: ${steps.join(', and ')}.`, 409)
+  }
+
+  const costSettings = toCostSettings(costSettingsRow, baseYear)
   const energySettings = toEnergySettings(energySettingsRow)
 
   const geometry: TimelineGeometry = {
     interval: intervalForZoom(timelineSettings.zoomLevel),
     years: timelineSettings.years,
-    startCalendarYear: timelineSettings.startCalendarYear,
+    startCalendarYear,
     fiscalYearStartMonth: timelineSettings.fiscalYearStartMonth,
     fiscalYearLabelsBy: timelineSettings.fiscalYearLabelsBy,
   }
 
   const lineItemMap = new Map(lineItems.map((item) => [item.id, item]))
 
+  // M-24: inside a what-if, the screen prices the live phases with the
+  // scenario's placements laid over them (TimelineTab `effectivePhases`).
+  // The export goes through the same rule, so the workbook, the PDF and
+  // the screen show one number.
+  const effectivePhases = scenario
+    ? applyScenarioOverlay(chunkPhases, scenario.payload.phases)
+    : chunkPhases
+
   const phasesByChunk = new Map<string, ChunkPhase[]>()
-  for (const phase of chunkPhases) {
+  for (const phase of effectivePhases) {
     phasesByChunk.set(phase.chunkProjectId, [
       ...(phasesByChunk.get(phase.chunkProjectId) ?? []),
       phase,
@@ -404,10 +643,13 @@ export async function buildProjectReportData(
   }
   for (const list of phasesByChunk.values()) list.sort((a, b) => a.sortOrder - b.sortOrder)
 
+  let unreadableQuantityLinks = 0
+
   // Package inputs, summed from line items exactly as
   // TimelineTab.tsx#packageInputs does — same fallback from the
-  // trigger-maintained `eccAmount` to a live parse of `estimatedFirstCost`
-  // for any row written before migration 0006 backfilled it.
+  // trigger-maintained `eccAmount` to a live parse of `estimatedFirstCost`.
+  // An unreadable cost or quantity contributes 0 here, as on screen, and is
+  // COUNTED so the workbook says so (M-09 / M-10).
   const packageInputs: PackageInput[] = chunkProjects.map((chunk) => {
     let eccBase = 0
     let energySavingsAnnual = 0
@@ -416,12 +658,14 @@ export async function buildProjectReportData(
     for (const link of chunk.itemLinks) {
       const item = lineItemMap.get(link.lineItemId)
       if (!item) continue
+      if (!parseQuantity(link.quantity).ok) unreadableQuantityLinks += 1
       const quantity = parseQuantityInput(link.quantity)
       const unitCost = item.eccAmount || parseCostInput(item.estimatedFirstCost)
 
       eccBase += unitCost * quantity
-      energySavingsAnnual += item.annualEnergySavings * quantity
-      annualCostSavings += item.annualCostSavings * quantity
+      // Blank (null) is "not answered" (D-9); for a sum it contributes nothing.
+      energySavingsAnnual += (item.annualEnergySavings ?? 0) * quantity
+      annualCostSavings += (item.annualCostSavings ?? 0) * quantity
     }
 
     return {
@@ -450,23 +694,29 @@ export async function buildProjectReportData(
   const yearsPerSlotValue = yearsPerSlot(geometry.interval)
   const slotCountValue = computeSlotCount(geometry.years, geometry.interval)
 
-  const reportLineItems: ReportLineItem[] = lineItems.map((item) => ({
-    itemNumber: item.itemNumber,
-    name: item.name,
-    discipline: item.discipline,
-    companyName: item.companyName,
-    category: item.category,
-    timelinePriority: item.timelinePriority,
-    buildingAreaImpacted: item.buildingAreaImpacted,
-    buildingLevelImpacted: item.buildingLevelImpacted,
-    relativeFirstCost: item.relativeFirstCost,
-    estimatedFirstCost: item.estimatedFirstCost,
-    eccAmount: item.eccAmount,
-    annualEnergySavings: item.annualEnergySavings,
-    annualCostSavings: item.annualCostSavings,
-    energyNotes: item.energyNotes,
-    supportingNotes: item.supportingNotes,
-  }))
+  const unreadableCostItems = lineItems
+    .filter((item) => !parseCostAmount(item.estimatedFirstCost).ok)
+    .map((item) => item.itemNumber || item.name || item.id)
+
+  const notices: string[] = []
+  if (scenario) {
+    notices.push(
+      `What-if scenario "${scenario.name}": these figures are the scenario's schedule, not the live plan.`
+    )
+  }
+  if (unreadableCostItems.length > 0) {
+    notices.push(
+      `${unreadableCostItems.length} line item${unreadableCostItems.length === 1 ? ' has an' : 's have an'} ` +
+        `unreadable cost (${listItemNumbers(unreadableCostItems)}); ` +
+        `${unreadableCostItems.length === 1 ? 'it counts' : 'they count'} as $0 until corrected.`
+    )
+  }
+  if (unreadableQuantityLinks > 0) {
+    notices.push(
+      `${unreadableQuantityLinks} package line${unreadableQuantityLinks === 1 ? ' has an' : 's have an'} ` +
+        `unreadable quantity; ${unreadableQuantityLinks === 1 ? 'it counts' : 'they count'} as 0 until corrected.`
+    )
+  }
 
   const reportPackages: ReportPackage[] = summaries.map((summary) => ({
     chunkNumber: summary.input.chunkNumber,
@@ -508,10 +758,14 @@ export async function buildProjectReportData(
 
   return {
     project: { id: project.id, name: project.name },
+    scenario: scenario ? { id: scenario.id, name: scenario.name } : null,
     generatedAt: new Date().toISOString(),
     energyUnitLabel: energySettings.unitLabel,
     energyBaselineAnnual: energySettings.baselineAnnual,
-    lineItems: reportLineItems,
+    notices,
+    unreadableCostItems,
+    unreadableQuantityLinks,
+    lineItems: buildLineItemTable(lineItems, formFields),
     packages: reportPackages,
     phases: reportPhases,
     annualCostSummary,

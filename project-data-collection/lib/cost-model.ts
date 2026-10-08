@@ -769,12 +769,26 @@ export function wouldCreateCycle(
 
 /* ------------------------------------------------------------- defaults -- */
 
-/** Mirrors the column defaults in migration 0006. Used when a project has no
- *  settings row yet, which is a supported state — nothing has to be created up
- *  front for the app to render. */
+/**
+ * A FIXED stand-in base year for rendering before a project's real settings
+ * have loaded (or, before migration 0018, for a project that has none).
+ *
+ * This used to be `new Date().getUTCFullYear()`, which made every total
+ * re-price itself on 1 January with nobody touching the project (M-25:
+ * bsb2301 dropped $3.02M overnight on 2027-01-01). A constant cannot drift.
+ * It is still NOT a real setting: anything that produces a deliverable (the
+ * Excel export) refuses outright when the project's base year is missing --
+ * see `ExportBlockedError` in lib/export/report-data.ts -- and the Timeline
+ * labels a stand-in as such. Never use this as a project's actual year.
+ */
+export const STAND_IN_BASE_YEAR = 2026
+
+/** Mirrors the column defaults in migration 0006, except `baseYear` -- see
+ *  STAND_IN_BASE_YEAR above. Projects always have a settings row after
+ *  migration 0018; this covers the moment before it has loaded. */
 export const DEFAULT_COST_SETTINGS: CostSettings = {
   tpcFactor: 1.33,
-  baseYear: new Date().getUTCFullYear(),
+  baseYear: STAND_IN_BASE_YEAR,
   escalationMode: 'compound_annual',
   escalationAnnualPercent: 4,
   escalationStepYears: 5,
@@ -787,4 +801,45 @@ export const DEFAULT_ENERGY_SETTINGS: EnergySettings = {
   unitLabel: 'kBtu/yr',
   baselineAnnual: null,
   interactionFactor: 1,
+}
+
+/* ------------------------------------------------------ scenario overlay -- */
+
+/** The movable part of a phase, as a what-if stores it. */
+export type PhasePlacement = {
+  id: string
+  startSlot: number
+  durationSlots: number
+  pctOfTpc: number
+  durationLocked: boolean
+}
+
+/**
+ * Lays a what-if's placements over the live phases: every phase the scenario
+ * holds takes the scenario's start, duration, % and lock; every other phase
+ * is returned unchanged, and phases the scenario mentions that no longer
+ * exist are ignored (they were deleted from the live plan).
+ *
+ * This is the ONE overlay rule. The Timeline (TimelineTab's
+ * `effectivePhases`) and the Excel export (M-24) must both price a what-if
+ * through it, or the screen, the printed PDF and the workbook disagree --
+ * which is exactly what happened when the export ignored scenarios.
+ */
+export function applyScenarioOverlay<T extends PhasePlacement>(
+  phases: readonly T[],
+  placements: readonly PhasePlacement[]
+): T[] {
+  if (placements.length === 0) return phases.slice()
+  const byId = new Map(placements.map((placement) => [placement.id, placement]))
+  return phases.map((phase) => {
+    const moved = byId.get(phase.id)
+    if (!moved) return phase
+    return {
+      ...phase,
+      startSlot: moved.startSlot,
+      durationSlots: moved.durationSlots,
+      pctOfTpc: moved.pctOfTpc,
+      durationLocked: moved.durationLocked,
+    }
+  })
 }

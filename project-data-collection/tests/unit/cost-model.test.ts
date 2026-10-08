@@ -644,3 +644,38 @@ describe('cycle prediction', () => {
     assert.equal(wouldCreateCycle('c', 'd', deps), false)
   })
 })
+
+/* ---------------------------------------------------- WS-3 (M-24, M-25) -- */
+
+describe('defaults never follow the clock (M-25)', () => {
+  test('DEFAULT_COST_SETTINGS.baseYear is the fixed stand-in, not the current year', async () => {
+    const { STAND_IN_BASE_YEAR } = await import('../../lib/cost-model.ts')
+    assert.equal(DEFAULT_COST_SETTINGS.baseYear, STAND_IN_BASE_YEAR)
+    // Re-reading the module on another day must give the same number.
+    assert.equal(Number.isInteger(DEFAULT_COST_SETTINGS.baseYear), true)
+  })
+})
+
+describe('applyScenarioOverlay (M-24)', () => {
+  test('a what-if reprices exactly as if the live phase had moved', async () => {
+    const { applyScenarioOverlay } = await import('../../lib/cost-model.ts')
+    const live: Phase = {
+      id: 'p',
+      chunkProjectId: 'c',
+      name: 'Construction',
+      kind: 'construction',
+      sortOrder: 0,
+      pctOfTpc: 1,
+      startSlot: 0,
+      durationSlots: 1,
+      durationLocked: false,
+    }
+    const [moved] = applyScenarioOverlay([live], [
+      { id: 'p', startSlot: 3, durationSlots: 2, pctOfTpc: 1, durationLocked: false },
+    ])
+    assert.deepEqual(
+      computePhaseCost(moved, 1_000_000, SETTINGS, GEOMETRY),
+      computePhaseCost({ ...live, startSlot: 3, durationSlots: 2 }, 1_000_000, SETTINGS, GEOMETRY)
+    )
+  })
+})

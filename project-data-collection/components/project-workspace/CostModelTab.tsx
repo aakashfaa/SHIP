@@ -2,7 +2,7 @@
 
 import { createContext, useContext, useEffect, useMemo, useRef, useState } from 'react'
 import { formatCurrency } from '@/lib/costs'
-import { escalationFactor, type CostSettings } from '@/lib/cost-model'
+import { STAND_IN_BASE_YEAR, escalationFactor, type CostSettings } from '@/lib/cost-model'
 import {
   clearEscalationRateOverride,
   getCostSettingsForProject,
@@ -206,7 +206,9 @@ export default function CostModelTab({ project, permissions }: Props) {
     if (!costRow) return []
     const settings: CostSettings = {
       tpcFactor: costRow.tpcFactor,
-      baseYear: costRow.baseYear,
+      // The preview is in years-out, so the calendar base year never enters
+      // escalationFactor; a missing one (M-25) must not hide the curve.
+      baseYear: costRow.baseYear ?? STAND_IN_BASE_YEAR,
       escalationMode: costRow.escalationMode,
       escalationAnnualPercent: costRow.escalationAnnualPercent,
       escalationStepYears: costRow.escalationStepYears,
@@ -381,15 +383,29 @@ export default function CostModelTab({ project, permissions }: Props) {
             label="Base year"
             hint="The year line-item costs are priced in. Escalation is measured from here, not from where the timeline starts."
           >
+            {/* M-25: a missing base year is shown as missing -- never filled in
+                with the current year, which used to re-price the whole plan
+                every 1 January. Exports refuse until it is set. */}
             <input
               type="number"
               min={1900}
               max={2200}
               step={1}
-              value={costRow.baseYear}
-              onChange={(e) => patchCost({ baseYear: Number(e.target.value) || costRow.baseYear })}
+              value={costRow.baseYear ?? ''}
+              placeholder="Not set"
+              onChange={(e) => {
+                const year = Number.parseInt(e.target.value, 10)
+                if (Number.isFinite(year) && year > 0) patchCost({ baseYear: year })
+              }}
+              aria-invalid={costRow.baseYear === null}
               className={INPUT_CLASS}
             />
+            {costRow.baseYear === null ? (
+              <p role="alert" className="mt-1 text-[11px] font-medium text-rose-600">
+                Base year not set. Totals can&apos;t be trusted and Excel export is blocked until
+                you set it.
+              </p>
+            ) : null}
           </Field>
 
           <Field
@@ -572,12 +588,17 @@ export default function CostModelTab({ project, permissions }: Props) {
                     key={override.yearOffset}
                     className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-3 py-1 text-[11px] font-medium text-slate-700"
                   >
-                    {costRow.baseYear + override.yearOffset}: {override.ratePercent}%
+                    {costRow.baseYear !== null
+                      ? costRow.baseYear + override.yearOffset
+                      : `Year +${override.yearOffset}`}
+                    : {override.ratePercent}%
                     <button
                       type="button"
                       onClick={() => handleRemoveOverride(override.yearOffset)}
                       aria-label={`Remove the ${
-                        costRow.baseYear + override.yearOffset
+                        costRow.baseYear !== null
+                          ? costRow.baseYear + override.yearOffset
+                          : `year +${override.yearOffset}`
                       } override`}
                       className="text-slate-400 transition hover:text-rose-600"
                     >

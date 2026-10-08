@@ -24,10 +24,21 @@ import type { Project } from '@/lib/types'
 
 type Props = {
   project: Project
+  /**
+   * The what-if currently on screen, if any (M-24). Excel then exports THAT
+   * schedule (`?scenario=<id>`, priced server-side through the same overlay as
+   * the Timeline), so the workbook matches the screen and the printed PDF.
+   * Omit / null for the live plan.
+   */
+  scenario?: { id: string; name: string } | null
   className?: string
 }
 
-export default function ExportBar({ project, className = '' }: Props) {
+function slugify(value: string) {
+  return value.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'project'
+}
+
+export default function ExportBar({ project, scenario = null, className = '' }: Props) {
   const [isExporting, setIsExporting] = useState(false)
   const [exportError, setExportError] = useState<string | null>(null)
 
@@ -36,7 +47,8 @@ export default function ExportBar({ project, className = '' }: Props) {
     setIsExporting(true)
 
     try {
-      const response = await fetch(`/api/projects/${project.id}/export/xlsx`)
+      const query = scenario ? `?scenario=${encodeURIComponent(scenario.id)}` : ''
+      const response = await fetch(`/api/projects/${encodeURIComponent(project.id)}/export/xlsx${query}`)
 
       if (!response.ok) {
         let message = `Export failed (${response.status})`
@@ -52,7 +64,9 @@ export default function ExportBar({ project, className = '' }: Props) {
       const blob = await response.blob()
       const url = URL.createObjectURL(blob)
       const link = document.createElement('a')
-      const slug = project.name.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-') || 'project'
+      const slug = scenario
+        ? `${slugify(project.name)}-scenario-${slugify(scenario.name)}`
+        : slugify(project.name)
 
       link.href = url
       link.download = `${slug}-export.xlsx`
@@ -82,7 +96,7 @@ export default function ExportBar({ project, className = '' }: Props) {
         disabled={isExporting}
         className="rounded-[1rem] bg-[linear-gradient(135deg,#0f172a_0%,#1e293b_48%,#0f766e_100%)] px-5 py-3 text-[11px] font-medium text-white shadow-lg transition hover:-translate-y-[1px] disabled:cursor-not-allowed disabled:opacity-60"
       >
-        {isExporting ? 'Exporting…' : 'Export Excel'}
+        {isExporting ? 'Exporting…' : scenario ? 'Export Excel (this what-if)' : 'Export Excel'}
       </button>
 
       <button

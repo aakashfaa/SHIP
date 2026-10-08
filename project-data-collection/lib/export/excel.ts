@@ -19,7 +19,7 @@
  */
 
 import ExcelJS from 'exceljs'
-import type { ProjectReportData } from './report-data'
+import type { ProjectReportData, ReportCellValue } from './report-data'
 
 const CURRENCY_FORMAT = '$#,##0'
 const HEADER_FILL: ExcelJS.Fill = {
@@ -29,6 +29,13 @@ const HEADER_FILL: ExcelJS.Fill = {
 }
 const HEADER_FONT: Partial<ExcelJS.Font> = { bold: true, color: { argb: 'FFFFFFFF' } }
 
+const BANNER_FONT: Partial<ExcelJS.Font> = { bold: true, color: { argb: 'FF7C2D12' } }
+const BANNER_FILL: ExcelJS.Fill = {
+  type: 'pattern',
+  pattern: 'solid',
+  fgColor: { argb: 'FFFEF3C7' },
+}
+
 type ColumnSpec<T> = {
   header: string
   width: number
@@ -36,35 +43,55 @@ type ColumnSpec<T> = {
   value: (row: T) => string | number | boolean
 }
 
+/**
+ * One line above the header on every sheet when the workbook needs to say
+ * something the numbers can't: which what-if it prices (M-24 -- a scenario
+ * workbook must never pass for the live plan once it is detached from the
+ * app), and any unreadable costs/quantities counted as zero (M-09/M-10).
+ * Sheet NAMES stay fixed ("Packages", ...) -- Excel forbids ':' in them and
+ * caps them at 31 characters, so "Scenario: X" can't go there; it goes in
+ * this banner, the workbook title and the file name instead.
+ */
+function bannerText(data: ProjectReportData): string | null {
+  return data.notices.length > 0 ? data.notices.join('  ') : null
+}
+
 function addSheet<T>(
   workbook: ExcelJS.Workbook,
   name: string,
   columns: ColumnSpec<T>[],
-  rows: readonly T[]
+  rows: readonly T[],
+  banner: string | null
 ): void {
   const sheet = workbook.addWorksheet(name)
 
-  sheet.columns = columns.map((col) => ({
-    header: col.header,
-    width: col.width,
-  }))
+  sheet.columns = columns.map((col) => ({ width: col.width }))
 
-  const headerRow = sheet.getRow(1)
+  if (banner) {
+    const bannerRow = sheet.addRow([banner])
+    bannerRow.getCell(1).font = BANNER_FONT
+    bannerRow.getCell(1).fill = BANNER_FILL
+    if (columns.length > 1) sheet.mergeCells(bannerRow.number, 1, bannerRow.number, columns.length)
+  }
+
+  const headerRow = sheet.addRow(columns.map((col) => col.header))
   headerRow.eachCell((cell) => {
     cell.font = HEADER_FONT
     cell.fill = HEADER_FILL
   })
 
-  // Frozen header: the header row stays visible as a client scrolls
-  // through what can be a few hundred line items.
-  sheet.views = [{ state: 'frozen', ySplit: 1 }]
+  // Frozen header (and banner): stays visible as a client scrolls through
+  // what can be a few hundred line items.
+  sheet.views = [{ state: 'frozen', ySplit: headerRow.number }]
 
   for (const row of rows) {
     const values = columns.map((col) => col.value(row))
     const addedRow = sheet.addRow(values)
 
     columns.forEach((col, index) => {
-      if (col.currency) {
+      // Only numbers get the currency format; an "Unreadable" marker in a
+      // money column stays visibly text.
+      if (col.currency && typeof values[index] === 'number') {
         addedRow.getCell(index + 1).numFmt = CURRENCY_FORMAT
       }
     })
@@ -75,39 +102,25 @@ export function buildExcelWorkbook(data: ProjectReportData): ExcelJS.Workbook {
   const workbook = new ExcelJS.Workbook()
   workbook.creator = 'SHIP'
   workbook.created = new Date(data.generatedAt)
-  workbook.title = `${data.project.name} — export`
+  workbook.title = data.scenario
+    ? `${data.project.name} — scenario: ${data.scenario.name} — export`
+    : `${data.project.name} — export`
 
-  addSheet(
+  const banner = bannerText(data)
+
+  // Columns come from the project's form definition (M-28) -- see
+  // buildLineItemTable in report-data.ts. Each row is already in column order.
+  addSheet<ReportCellValue[]>(
     workbook,
     'Line Items',
-    [
-      { header: 'Item #', width: 10, value: (r) => r.itemNumber },
-      { header: 'Name', width: 32, value: (r) => r.name },
-      { header: 'Discipline', width: 18, value: (r) => r.discipline },
-      { header: 'Company', width: 20, value: (r) => r.companyName },
-      { header: 'Category', width: 24, value: (r) => r.category },
-      { header: 'Timeline Priority', width: 20, value: (r) => r.timelinePriority },
-      { header: 'Building Area', width: 16, value: (r) => r.buildingAreaImpacted },
-      { header: 'Building Level', width: 20, value: (r) => r.buildingLevelImpacted },
-      { header: 'Relative First Cost', width: 16, value: (r) => r.relativeFirstCost },
-      { header: 'Estimated First Cost', width: 18, value: (r) => r.estimatedFirstCost },
-      {
-        header: 'ECC Amount',
-        width: 16,
-        currency: true,
-        value: (r) => r.eccAmount,
-      },
-      { header: 'Annual Energy Savings', width: 20, value: (r) => r.annualEnergySavings },
-      {
-        header: 'Annual Cost Savings',
-        width: 18,
-        currency: true,
-        value: (r) => r.annualCostSavings,
-      },
-      { header: 'Energy Notes', width: 28, value: (r) => r.energyNotes },
-      { header: 'Supporting Notes', width: 28, value: (r) => r.supportingNotes },
-    ],
-    data.lineItems
+    data.lineItems.columns.map((column, index) => ({
+      header: column.header,
+      width: column.width,
+      currency: column.format === 'currency',
+      value: (row) => row[index] ?? '',
+    })),
+    data.lineItems.rows,
+    banner
   )
 
   addSheet(
@@ -135,7 +148,8 @@ export function buildExcelWorkbook(data: ProjectReportData): ExcelJS.Workbook {
         value: (r) => (r.allocationIsIncomplete ? 'No' : 'Yes'),
       },
     ],
-    data.packages
+    data.packages,
+    banner
   )
 
   addSheet(
@@ -151,7 +165,8 @@ export function buildExcelWorkbook(data: ProjectReportData): ExcelJS.Workbook {
       { header: 'Locked', width: 10, value: (r) => (r.durationLocked ? 'Yes' : 'No') },
       { header: 'Cost', width: 18, currency: true, value: (r) => r.escalatedCost },
     ],
-    data.phases
+    data.phases,
+    banner
   )
 
   addSheet(
@@ -161,7 +176,8 @@ export function buildExcelWorkbook(data: ProjectReportData): ExcelJS.Workbook {
       { header: 'Fiscal Year', width: 14, value: (r) => r.fiscalYearLabel },
       { header: 'Total Cost', width: 18, currency: true, value: (r) => r.escalatedTotal },
     ],
-    data.annualCostSummary
+    data.annualCostSummary,
+    banner
   )
 
   addSheet(
@@ -183,7 +199,8 @@ export function buildExcelWorkbook(data: ProjectReportData): ExcelJS.Workbook {
         value: (r) => r.remainingConsumption ?? '',
       },
     ],
-    data.energySummary
+    data.energySummary,
+    banner
   )
 
   return workbook

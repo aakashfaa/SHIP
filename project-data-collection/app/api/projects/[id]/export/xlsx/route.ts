@@ -12,7 +12,11 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { createSupabaseServerClient } from '@/lib/supabase/server'
 import { buildExcelBuffer } from '@/lib/export/excel'
-import { buildProjectReportData, fetchProjectForExport } from '@/lib/export/report-data'
+import {
+  ExportBlockedError,
+  buildProjectReportData,
+  fetchProjectForExport,
+} from '@/lib/export/report-data'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
@@ -33,8 +37,14 @@ function slugifyFilename(name: string): string {
 // and would make a clean-checkout `tsc --noEmit` fail.
 type RouteParams = { params: Promise<{ id: string }> }
 
-export async function GET(_request: NextRequest, { params }: RouteParams) {
+export async function GET(request: NextRequest, { params }: RouteParams) {
   const { id: projectId } = await params
+
+  // M-24: `?scenario=<id>` exports the what-if the user is looking at, priced
+  // through the same overlay as the screen. Absent = the live plan. The id is
+  // only a lookup key: the scenario row is read through RLS below, so a
+  // private what-if belonging to someone else is "not found", not exported.
+  const scenarioId = request.nextUrl.searchParams.get('scenario')?.trim() || null
 
   const supabase = await createSupabaseServerClient()
 
@@ -83,15 +93,24 @@ export async function GET(_request: NextRequest, { params }: RouteParams) {
   }
 
   let buffer: Buffer
+  let scenarioName: string | null = null
   try {
-    const reportData = await buildProjectReportData(supabase, project)
+    const reportData = await buildProjectReportData(supabase, project, { scenarioId })
     buffer = await buildExcelBuffer(reportData)
+    scenarioName = reportData.scenario?.name ?? null
   } catch (error) {
+    // Missing base/start year (M-25) or a scenario that isn't there (M-24):
+    // a specific, fixable reason -- say it, with its own status, not a 500.
+    if (error instanceof ExportBlockedError) {
+      return NextResponse.json({ error: error.message }, { status: error.status })
+    }
     const message = error instanceof Error ? error.message : 'Failed to build export'
     return NextResponse.json({ error: message }, { status: 500 })
   }
 
-  const filename = `${slugifyFilename(project.name)}-export.xlsx`
+  const filename = scenarioName
+    ? `${slugifyFilename(project.name)}-scenario-${slugifyFilename(scenarioName)}-export.xlsx`
+    : `${slugifyFilename(project.name)}-export.xlsx`
 
   return new NextResponse(new Uint8Array(buffer), {
     status: 200,
