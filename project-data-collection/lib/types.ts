@@ -236,6 +236,9 @@ export type ChunkProject = {
   timelineStart: number
   timelineDuration: number
   createdAt: string
+  /** Display order within the project (0-based, user-owned, independent of
+   *  chunkNumber; migration 0030). Sort with lib/package-order.ts. */
+  sortOrder: number
 }
 
 export type FiscalYearLabelsBy = 'start_year' | 'end_year'

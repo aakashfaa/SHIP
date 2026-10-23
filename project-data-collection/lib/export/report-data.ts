@@ -45,6 +45,7 @@ import type { ShipSupabaseClient } from '../supabase/client'
 import { UNREADABLE_CELL, type ReportCellValue, type ReportColumn } from './line-item-cells'
 import { getMasterViewColumnDefs, masterExportCell, masterExportColumn } from '../view-columns/master'
 import { parseCostAmount, parseCostInput, parseQuantity, parseQuantityInput } from '../costs'
+import { sortPackages } from '../package-order'
 import {
   DEFAULT_ENERGY_SETTINGS,
   applyScenarioOverlay,
@@ -166,11 +167,16 @@ async function fetchChunkProjects(
     .from('chunk_projects')
     .select(CHUNK_SELECT)
     .eq('project_id', projectId)
+    // User-owned package order (0030), the same as the Packaging tab.
+    .order('sort_order', { ascending: true })
     .order('created_at', { ascending: true })
+    .order('id', { ascending: true })
 
   if (error) fail(`Failed to load packages for "${projectId}"`, error)
 
-  return ((data ?? []) as unknown as ChunkProjectRow[]).map(rowToChunkProject)
+  // Sorted here as well, so the workbook's package order never depends on
+  // the client honouring the ORDER BY.
+  return sortPackages(((data ?? []) as unknown as ChunkProjectRow[]).map(rowToChunkProject))
 }
 
 /** Same `!inner` embed trick as `lib/store.ts#getChunkPhasesForProject` —

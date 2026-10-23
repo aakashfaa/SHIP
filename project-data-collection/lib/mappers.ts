@@ -148,6 +148,8 @@ export type ChunkProjectRow = {
   timeline_start: number | string | null
   timeline_duration: number | string | null
   created_at: string
+  /** 0030. Optional so rows from before that migration still map. */
+  sort_order?: number | string | null
   chunk_project_items?: ChunkProjectItemRow[] | null
 }
 
@@ -472,6 +474,7 @@ export function rowToChunkProject(row: ChunkProjectRow): ChunkProject {
     timelineStart: timelineSegments[0].start,
     timelineDuration: timelineSegments[0].duration,
     createdAt: row.created_at,
+    sortOrder: Number(row.sort_order ?? 0) || 0,
   }
 }
 

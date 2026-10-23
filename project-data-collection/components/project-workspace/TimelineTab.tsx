@@ -56,6 +56,7 @@ import {
   updateTimelineSettingsForProject,
 } from '@/lib/store'
 import { useAsyncData } from '@/lib/useAsyncData'
+import { packagePositions } from '@/lib/package-order'
 import type { ProjectPermissions } from '@/lib/project-role'
 import type {
   ChunkPhase,
@@ -613,13 +614,16 @@ export default function TimelineTab({ project, permissions, onOpenMasterView }: 
 
   /* -------------------------------------------------------- row geometry -- */
 
+  // Rows follow the user-owned package order from the Packaging tab
+  // (sort_order, migration 0030), not start date or number.
+  const packageOrder = useMemo(() => packagePositions(chunkProjects), [chunkProjects])
+
   const rows = useMemo<RowLayout[]>(() => {
-    const sorted = summaries.slice().sort((a, b) => {
-      const aStart = phasesByChunk.get(a.input.chunkProjectId)?.[0]?.startMonth ?? 0
-      const bStart = phasesByChunk.get(b.input.chunkProjectId)?.[0]?.startMonth ?? 0
-      if (aStart !== bStart) return aStart - bStart
-      return a.input.chunkNumber.localeCompare(b.input.chunkNumber)
-    })
+    const sorted = summaries.slice().sort(
+      (a, b) =>
+        (packageOrder.get(a.input.chunkProjectId) ?? Number.MAX_SAFE_INTEGER) -
+        (packageOrder.get(b.input.chunkProjectId) ?? Number.MAX_SAFE_INTEGER)
+    )
     // A plain loop rather than a `top` captured and mutated inside `.map`,
     // which the React compiler lint rejects as a post-render reassignment.
     const laidOut: RowLayout[] = []
@@ -633,7 +637,7 @@ export default function TimelineTab({ project, permissions, onOpenMasterView }: 
       top += height
     }
     return laidOut
-  }, [summaries, phasesByChunk, expanded])
+  }, [summaries, phasesByChunk, expanded, packageOrder])
 
   const bodyHeight = rows.reduce((sum, row) => sum + row.height, 0)
 
