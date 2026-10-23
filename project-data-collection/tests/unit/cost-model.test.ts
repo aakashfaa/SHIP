@@ -673,27 +673,3 @@ describe('defaults never follow the clock (M-25)', () => {
     assert.equal(Number.isInteger(DEFAULT_COST_SETTINGS.baseYear), true)
   })
 })
-
-describe('applyScenarioOverlay (M-24)', () => {
-  test('a what-if reprices exactly as if the live phase had moved', async () => {
-    const { applyScenarioOverlay } = await import('../../lib/cost-model.ts')
-    const live: Phase = {
-      id: 'p',
-      chunkProjectId: 'c',
-      name: 'Construction',
-      kind: 'construction',
-      sortOrder: 0,
-      pctOfTpc: 1,
-      startMonth: 0,
-      durationMonths: 1,
-      durationLocked: false,
-    }
-    const [moved] = applyScenarioOverlay([live], [
-      { id: 'p', startMonth: 3 * Y, durationMonths: 2 * Y, pctOfTpc: 1, durationLocked: false },
-    ])
-    assert.deepEqual(
-      computePhaseCost(moved, 1_000_000, SETTINGS, GEOMETRY),
-      computePhaseCost({ ...live, startMonth: 3 * Y, durationMonths: 2 * Y }, 1_000_000, SETTINGS, GEOMETRY)
-    )
-  })
-})

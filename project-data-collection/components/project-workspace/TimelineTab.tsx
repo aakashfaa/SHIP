@@ -16,7 +16,6 @@ import {
 } from '@/lib/costs'
 import {
   DEFAULT_COST_SETTINGS,
-  applyScenarioOverlay,
   DEFAULT_ENERGY_SETTINGS,
   computeEnergySeries,
   computeFiscalYearTotals,
@@ -39,23 +38,23 @@ import {
   type TimelineGeometry,
 } from '@/lib/cost-model'
 import {
-  createScenario,
-  deleteScenario,
+  createVersion,
+  deleteVersion,
   getChunkPhasesForProject,
   getChunkProjectsForProject,
   getCostSettingsForProject,
   getEnergySettingsForProject,
   getLineItemsForProject,
   getPhaseDependenciesForProject,
-  getScenariosForProject,
   getTimelineSettingsForProject,
-  publishScenario,
-  rebaseScenario,
-  saveScenarioPayload,
+  getVersionsForProject,
+  renameVersion,
+  saveVersionPhases,
   updateChunkPhase,
   updateTimelineSettingsForProject,
 } from '@/lib/store'
 import { useAsyncData } from '@/lib/useAsyncData'
+import { useAuth } from '@/lib/auth-context'
 import type { ProjectPermissions } from '@/lib/project-role'
 import type {
   ChunkPhase,
@@ -67,10 +66,16 @@ import type {
   ProjectEnergySettings,
   ProjectTimelineSettings,
   Scenario,
-  ScenarioPayload,
   ScenarioPhase,
   TimelineInterval,
 } from '@/lib/types'
+import {
+  LIVE_VERSION_KEY,
+  applyVersionOverlay,
+  listVersions,
+  packagePhasesForSave,
+  replacePackagePhases,
+} from '@/lib/versions'
 import TimelineGrid, {
   phaseRowTop,
   type DragMode,
@@ -80,7 +85,7 @@ import EnergyChart from './timeline/EnergyChart'
 import type { ArrowLink } from './timeline/DependencyArrows'
 import ExportBar from './ExportBar'
 import TimelineFilter from './view-filter/TimelineFilter'
-import SandboxBar from './timeline/SandboxBar'
+import VersionBar from './timeline/VersionBar'
 import CostModelBox from './cost-model/CostModelBox'
 import { flattenFiscalQuarters } from './timeline/cost-breakdown'
 import { useEffectiveViewSettings } from '@/lib/use-effective-view-settings'
@@ -96,9 +101,7 @@ import {
   canStartDrag,
   changedPhasesForDrop,
   isNoOpDrop,
-  mergeDropIntoOverlay,
   placementForDelta,
-  summariseRebase,
   type DragOrigin,
   type Placement,
 } from './timeline/drag'
@@ -187,24 +190,38 @@ function toEnergySettings(row: ProjectEnergySettings | null): EnergySettings {
   }
 }
 
-/** Up to four names, then "and N more" -- a rebase can touch dozens of phases
- *  and the banner must stay a sentence, not a report. */
-function listNames(names: string[]): string {
-  const shown = names.slice(0, 4).join(', ')
-  return names.length > 4 ? `${shown} and ${names.length - 4} more` : shown
+/**
+ * The version this person last opened on this project's Timeline (owner:
+ * the Timeline "remembers which version you last opened", per user per
+ * project). Browser storage, so every access is guarded: private windows and
+ * blocked storage throw, and the page must work without it.
+ */
+function versionStorageKey(email: string | null | undefined, projectId: string): string {
+  return `ship:timeline-version:${email ?? 'anon'}:${projectId}`
 }
 
-function describeRebase(pulledIn: string[], kept: string[]): string {
-  const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`
-  const pulled =
-    pulledIn.length === 0
-      ? 'Nothing in the live plan needed pulling in.'
-      : `Pulled in the live plan’s newer values for ${plural(pulledIn.length, 'phase')}: ${listNames(pulledIn)}.`
-  const yours =
-    kept.length === 0
-      ? 'None of your moves differ from the live plan any more.'
-      : `Kept your ${plural(kept.length, 'move')}: ${listNames(kept)}.`
-  return `${pulled} ${yours} You can publish now.`
+function readStoredVersion(key: string): string | null {
+  try {
+    return window.localStorage.getItem(key)
+  } catch {
+    return null
+  }
+}
+
+function writeStoredVersion(key: string, value: string) {
+  try {
+    window.localStorage.setItem(key, value)
+  } catch {
+    // Not remembered; nothing else depends on it.
+  }
+}
+
+/** Resolves on the frame after the next paint: long enough for a version
+ *  switch to be on screen before the print dialog snapshots the page. */
+function afterNextPaint(): Promise<void> {
+  return new Promise((resolve) =>
+    requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
+  )
 }
 
 type Props = {
@@ -218,24 +235,9 @@ type Props = {
 
 /** The bar being dragged right now and where it currently sits. Applied on
  *  top of everything else in `effectivePhases`, so the bar follows the cursor
- *  in every mode -- including inside a what-if, where it used to sit still
- *  until the drop because the drag was written to the baseline rows that the
- *  overlay then covered up (M-05). */
+ *  in every version -- it used to sit still inside a what-if until the drop,
+ *  because the drag was written to rows the overlay then covered up (M-05). */
 type DragPreview = { phaseId: string } & Placement
-
-function toScenarioPhase(phase: ChunkPhase): ScenarioPhase {
-  return {
-    id: phase.id,
-    chunkProjectId: phase.chunkProjectId,
-    name: phase.name,
-    kind: phase.kind,
-    sortOrder: phase.sortOrder,
-    pctOfTpc: phase.pctOfTpc,
-    startMonth: phase.startMonth,
-    durationMonths: phase.durationMonths,
-    durationLocked: phase.durationLocked,
-  }
-}
 
 /** "Jul 2027 – Jun 2029 · 24 months": a phase's span in words, from months. */
 function describeSpan(
@@ -327,8 +329,31 @@ export default function TimelineTab({ project, permissions, onOpenMasterView }: 
     null
   )
 
+  /**
+   * Versions (migration 0031). One version is held in the tables loaded
+   * above; every other one is a scenario row overlaid on them in memory
+   * (lib/versions.ts). The UI treats them all as peers.
+   */
+  const {
+    data: versionData,
+    setData: setVersionData,
+    loading: versionsLoading,
+    reload: reloadVersions,
+  } = useAsyncData<{ liveName: string; scenarios: Scenario[] }>(
+    () => getVersionsForProject(project.id),
+    [project.id],
+    { liveName: 'Version 1', scenarios: [] }
+  )
+  const scenarios = versionData.scenarios
+  const setScenarios = useCallback(
+    (update: (prev: Scenario[]) => Scenario[]) =>
+      setVersionData((prev) => ({ ...prev, scenarios: update(prev.scenarios) })),
+    [setVersionData]
+  )
+
   // Phases and links too: changing the project's phase template re-applies
-  // it to every package (cost-model/CostModelEditor).
+  // it to every package (cost-model/CostModelEditor). Versions too: inside a
+  // version the popup writes that version's payload.
   const handleCostModelChanged = useCallback(() => {
     reloadCostSettings()
     reloadEnergySettings()
@@ -351,59 +376,48 @@ export default function TimelineTab({ project, permissions, onOpenMasterView }: 
   const [saveError, setSaveError] = useState<string | null>(null)
 
   /**
-   * Sandbox state.
-   *
-   * `activeScenarioId` is the branch the user is inside; null means the live
-   * plan. `overlay` holds that branch's phase placements in memory.
-   *
-   * The overlay is applied on TOP of the loaded baseline rather than replacing
-   * it, and the baseline rows are never mutated while a scenario is active.
-   * That is what makes "Back to live plan" a state change rather than a reload,
-   * and it is why discarding a scenario cannot damage anything.
+   * Which version is on screen. Owner: "All equal, pick on export" -- every
+   * version is a peer, and the Timeline remembers the one this person last
+   * opened (per user per project, browser storage). `selectedKey` is what
+   * they picked; it falls back to the version in the live tables whenever it
+   * names a version that no longer exists (deleted by a colleague, say).
    */
-  const {
-    data: scenarios,
-    setData: setScenarios,
-    reload: reloadScenarios,
-  } = useAsyncData<Scenario[]>(() => getScenariosForProject(project.id), [project.id], [])
-  const [activeScenarioId, setActiveScenarioId] = useState<string | null>(null)
+  const { user } = useAuth()
+  const storageKey = versionStorageKey(user?.email, project.id)
+  const [selectedKey, setSelectedKey] = useState<string>(LIVE_VERSION_KEY)
+  const [restoredFor, setRestoredFor] = useState<string | null>(null)
+  // Restore once the list has loaded -- state adjusted during render, not in
+  // an effect. Only ever on the client: the list loads in the browser.
+  if (!versionsLoading && restoredFor !== storageKey) {
+    setRestoredFor(storageKey)
+    const stored = readStoredVersion(storageKey)
+    if (stored && (stored === LIVE_VERSION_KEY || scenarios.some((s) => s.id === stored))) {
+      setSelectedKey(stored)
+    }
+  }
+  const versions = useMemo(
+    () => listVersions(versionData.liveName, scenarios),
+    [versionData.liveName, scenarios]
+  )
+  const activeKey = versions.some((v) => v.key === selectedKey) ? selectedKey : LIVE_VERSION_KEY
+  const activeScenarioId = activeKey === LIVE_VERSION_KEY ? null : activeKey
+  const activeVersionName =
+    versions.find((v) => v.key === activeKey)?.name ?? versionData.liveName
 
   /**
-   * Three different questions, deliberately not collapsed into one flag.
-   *
-   * `isEphemeral` -- a viewer. R5.3: "a viewer can move bars freely in an
-   *   ephemeral sandbox that is never persisted anywhere". Steve's version:
-   *   "they could even, to a certain degree, play with things a little bit,
-   *   but it won't save". So they DO get to drag; the drop just goes nowhere.
-   *
-   * `canEditBaseline` -- may change the live plan. Admin and editor.
-   *
-   * `canDrag` -- may move a bar at all, which is a different question from
-   *   both. A consultant cannot touch the baseline but CAN reschedule inside
-   *   their own what-if, because that writes the scenario row rather than
-   *   chunk_phases. Treating "cannot edit" as "cannot drag" would take the
-   *   sandbox away from the people most likely to want one.
+   * Admins and editors change versions -- the schedule, the cost model,
+   * which versions exist. Everyone else (consultants, viewers) switches
+   * between them read-only: owner, "Whole team". The old viewer "ephemeral
+   * sandbox" (drag freely, nothing saved) went with the what-if.
    */
-  const isEphemeral = permissions.isViewer
   const canEditBaseline = permissions.canEdit
-  const canDrag =
-    canEditBaseline || isEphemeral || (activeScenarioId !== null && permissions.canContribute)
-  const [overlay, setOverlay] = useState<Map<string, ScenarioPayload['phases'][number]> | null>(
-    null
-  )
-  const [sandboxBusy, setSandboxBusy] = useState(false)
-  const [conflict, setConflict] = useState<string | null>(null)
-  const [rebaseNotice, setRebaseNotice] = useState<string | null>(null)
+  const canDrag = canEditBaseline
+  const [versionBusy, setVersionBusy] = useState(false)
   const [dragPreview, setDragPreview] = useState<DragPreview | null>(null)
 
-  const phasesRef = useRef(phases)
   const isMountedRef = useRef(true)
   const pendingSettingsRef = useRef<Partial<ProjectTimelineSettings>>({})
   const settingsTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-
-  useEffect(() => {
-    phasesRef.current = phases
-  }, [phases])
 
   useEffect(() => {
     isMountedRef.current = true
@@ -415,17 +429,42 @@ export default function TimelineTab({ project, permissions, onOpenMasterView }: 
 
   /* ------------------------------------------------------- derived state -- */
 
+  const activeScenario = useMemo(
+    () => scenarios.find((s) => s.id === activeScenarioId) ?? null,
+    [scenarios, activeScenarioId]
+  )
+
+  /**
+   * The open version: its phases, links and cost model. The version held in
+   * the tables is the loaded rows as they are; any other is its payload laid
+   * over them by lib/versions.ts `applyVersionOverlay` -- the same function
+   * the Excel export calls, so the screen, the PDF and the workbook of a
+   * version price identical schedules. The loaded rows are never mutated
+   * while another version is open.
+   */
+  const versionView = useMemo(
+    () =>
+      applyVersionOverlay(
+        { phases, dependencies, costSettings: costSettingsRow },
+        activeScenario ? activeScenario.payload : null,
+        chunkProjects.map((chunk) => chunk.id)
+      ),
+    [phases, dependencies, costSettingsRow, activeScenario, chunkProjects]
+  )
+  // The open version's cost model: what the totals and the Cost model box use.
+  const versionCostRow = versionView.costSettings
+
   // Base year and start year are each allowed to be missing (null) now that
   // the mappers stop inventing "this year" for them (M-25). The engine needs
   // numbers, so each borrows the other, and the screen says so (missingYears)
   // instead of presenting a stand-in as the project's real setting.
   const standInYear =
     timelineSettings.startCalendarYear ??
-    costSettingsRow?.baseYear ??
+    versionCostRow?.baseYear ??
     DEFAULT_COST_SETTINGS.baseYear
   const costSettings = useMemo(
-    () => toCostSettings(costSettingsRow, standInYear),
-    [costSettingsRow, standInYear]
+    () => toCostSettings(versionCostRow, standInYear),
+    [versionCostRow, standInYear]
   )
   const energySettings = useMemo(() => toEnergySettings(energySettingsRow), [energySettingsRow])
 
@@ -498,29 +537,16 @@ export default function TimelineTab({ project, permissions, onOpenMasterView }: 
     ).length
   }, [chunkProjects, lineItems])
 
-  const activeScenario = useMemo(
-    () => scenarios.find((s) => s.id === activeScenarioId) ?? null,
-    [scenarios, activeScenarioId]
-  )
-
   /**
-   * The phases the screen actually draws.
-   *
-   * When a scenario is active this is the baseline with the branch's
-   * placements laid over it. Everything downstream — costs, the energy
-   * staircase, the dependency arrows, the fiscal-year totals — reads from here,
-   * so a what-if reprices the whole plan exactly as a real edit would. That is
-   * the entire point: "What if we do this?" has to produce a real number, not a
-   * preview of one.
+   * The phases the screen actually draws: the open version's (versionView)
+   * with the in-flight drag laid on LAST, so the bar follows the cursor in
+   * every version. Everything downstream — costs, the energy staircase, the
+   * dependency arrows, the fiscal-year totals — reads from here, so switching
+   * version re-prices the whole plan exactly as the export does.
    */
   const effectivePhases = useMemo<ChunkPhase[]>(() => {
-    // The same overlay rule the server-side export uses (lib/cost-model), so
-    // the screen and the Excel of a what-if price identical schedules.
-    const overlaid = overlay ? applyScenarioOverlay(phases, [...overlay.values()]) : phases
-    // The in-flight drag goes on LAST, after the overlay, so it is what the
-    // user sees whichever plan they are on.
-    if (!dragPreview) return overlaid
-    return overlaid.map((phase) =>
+    if (!dragPreview) return versionView.phases
+    return versionView.phases.map((phase) =>
       phase.id === dragPreview.phaseId
         ? {
             ...phase,
@@ -529,7 +555,7 @@ export default function TimelineTab({ project, permissions, onOpenMasterView }: 
           }
         : phase
     )
-  }, [phases, overlay, dragPreview])
+  }, [versionView, dragPreview])
 
   const phasesByChunk = useMemo(() => {
     const map = new Map<string, ChunkPhase[]>()
@@ -592,8 +618,8 @@ export default function TimelineTab({ project, permissions, onOpenMasterView }: 
   // The by-quarter strip is the same totals laid out flat, never a second sum.
   const fiscalQuarters = useMemo(() => flattenFiscalQuarters(fiscalTotals), [fiscalTotals])
   const engineDependencies = useMemo(
-    () => dependencies.map(toEngineDependency),
-    [dependencies]
+    () => versionView.dependencies.map(toEngineDependency),
+    [versionView.dependencies]
   )
 
   // With links switched off (D-14) there is nothing on screen to explain a
@@ -689,7 +715,7 @@ export default function TimelineTab({ project, permissions, onOpenMasterView }: 
 
   const links = useMemo<ArrowLink[]>(
     () =>
-      (DEPENDENCY_LINKS_ENABLED ? dependencies : []).flatMap((dep) => {
+      (DEPENDENCY_LINKS_ENABLED ? versionView.dependencies : []).flatMap((dep) => {
         const predecessor = phaseRects.get(dep.predecessorPhaseId)
         const successor = phaseRects.get(dep.successorPhaseId)
         if (!predecessor || !successor) return []
@@ -704,7 +730,7 @@ export default function TimelineTab({ project, permissions, onOpenMasterView }: 
           },
         ]
       }),
-    [dependencies, phaseRects, violatedLinkIds]
+    [versionView.dependencies, phaseRects, violatedLinkIds]
   )
 
   /* ------------------------------------------------------------ mutation -- */
@@ -712,86 +738,60 @@ export default function TimelineTab({ project, permissions, onOpenMasterView }: 
   // Refs, not state, because the pointerup handler is created once per drag and
   // would otherwise close over the values as they were when the drag started.
   const activeScenarioIdRef = useRef(activeScenarioId)
-  const overlayRef = useRef(overlay)
-  const baselinePhasesRef = useRef(phases)
   const effectivePhasesRef = useRef(effectivePhases)
-  const scenariosRef = useRef(scenarios)
 
   useEffect(() => {
     activeScenarioIdRef.current = activeScenarioId
   }, [activeScenarioId])
   useEffect(() => {
-    overlayRef.current = overlay
-  }, [overlay])
-  useEffect(() => {
     effectivePhasesRef.current = effectivePhases
   }, [effectivePhases])
-  useEffect(() => {
-    scenariosRef.current = scenarios
-  }, [scenarios])
-  useEffect(() => {
-    // Only track the baseline while we are on it. Drags no longer write to
-    // `phases` mid-gesture (they go through `dragPreview`), but a what-if's
-    // placements must still never become the "live plan" snapshot.
-    if (!activeScenarioId) baselinePhasesRef.current = phases
-  }, [phases, activeScenarioId])
 
   /**
-   * What-if saves, one at a time and in order.
+   * Version saves, one at a time and in order.
    *
    * Each drop is fire-and-forget from the drag's point of view, so two quick
    * drops would otherwise race: if the first save's response landed second it
    * would put the older payload back. Chaining them makes the server see the
-   * drops in the order the user made them, and lets Publish wait for the last
-   * one instead of publishing a payload that is one move behind.
+   * drops in the order the user made them, and lets a version switch, copy
+   * or delete wait for the last one.
    */
   const saveChainRef = useRef<Promise<void>>(Promise.resolve())
   const saveSeqRef = useRef(new Map<string, number>())
 
-  const persistOverlay = useCallback(
-    (scenarioId: string, next: Map<string, ScenarioPhase>) => {
-      const phasesPayload = [...next.values()]
+  /** Replaces one version in the list with the server's copy. */
+  const adoptScenario = useCallback(
+    (saved: Scenario) => setScenarios((prev) => prev.map((s) => (s.id === saved.id ? saved : s))),
+    [setScenarios]
+  )
+
+  /**
+   * Writes the complete phase lists of the packages a drop touched into a
+   * version (ship.save_version_phases). The list on screen is updated first,
+   * optimistically (M-30: switching away and back must show the latest
+   * moves, not the page-load copy), then the server's row is adopted unless
+   * a newer save for the same version has been queued since.
+   */
+  const persistVersionPhases = useCallback(
+    (scenarioId: string, packagePhases: ScenarioPhase[]) => {
       const seq = (saveSeqRef.current.get(scenarioId) ?? 0) + 1
       saveSeqRef.current.set(scenarioId, seq)
 
-      // M-30: keep `scenarios` in step with what is on screen, optimistically
-      // and before the round trip. "Back to live plan" then "Resume…" rebuilds
-      // the overlay from this list; when it still held the page-load payload,
-      // resuming showed none of the moves and the next drag saved that stale
-      // copy over the real one.
       setScenarios((prev) =>
         prev.map((s) =>
-          s.id === scenarioId ? { ...s, payload: { ...s.payload, phases: phasesPayload } } : s
+          s.id === scenarioId ? { ...s, payload: replacePackagePhases(s.payload, packagePhases) } : s
         )
       )
 
       const run = async () => {
-        const dependencies =
-          scenariosRef.current.find((s) => s.id === scenarioId)?.payload.dependencies ?? []
         try {
-          // Through the store, which calls ship.save_scenario_payload (owner
-          // only, server-side merge that keeps cost_settings, validates ids
-          // and ranges) rather than a raw UPDATE of the jsonb.
-          const saved = await saveScenarioPayload(scenarioId, phasesPayload, dependencies)
+          const saved = await saveVersionPhases(scenarioId, packagePhases)
           if (!isMountedRef.current) return
-          // A write that matched no row is a refusal, not a success: the old
-          // code dropped the returned row on the floor and carried on.
-          if (!saved) {
-            setSaveError(
-              "This what-if couldn't be saved. Only the person who started it can change it."
-            )
-            return
-          }
           setSaveError(null)
-          // Adopt the server's row only if no newer save for this what-if has
-          // been queued since; otherwise it would briefly undo the optimistic
-          // update above.
-          if (saveSeqRef.current.get(scenarioId) === seq) {
-            setScenarios((prev) => prev.map((s) => (s.id === saved.id ? saved : s)))
-          }
+          if (saveSeqRef.current.get(scenarioId) === seq) adoptScenario(saved)
         } catch (err) {
           if (!isMountedRef.current) return
-          setSaveError(err instanceof Error ? err.message : 'Failed to save the what-if.')
+          setSaveError(err instanceof Error ? err.message : 'Failed to save the version.')
         }
       }
 
@@ -799,7 +799,7 @@ export default function TimelineTab({ project, permissions, onOpenMasterView }: 
       saveChainRef.current = chained
       return chained
     },
-    [setScenarios]
+    [setScenarios, adoptScenario]
   )
 
   const persistPhases = useCallback(async (changed: ChunkPhase[]) => {
@@ -819,166 +819,84 @@ export default function TimelineTab({ project, permissions, onOpenMasterView }: 
     }
   }, [])
 
-  /* ------------------------------------------------------------- sandbox -- */
+  /* ------------------------------------------------------------ versions -- */
 
-  function overlayFromScenario(scenario: Scenario) {
-    return new Map(scenario.payload.phases.map((phase) => [phase.id, phase]))
-  }
-
-  /** Swaps the overlay in state AND in its ref, so a drop that lands before
-   *  the next render already builds on the right overlay. */
-  function replaceOverlay(next: Map<string, ScenarioPhase> | null) {
-    overlayRef.current = next
-    setOverlay(next)
-  }
-
-  async function handleBranch(name: string) {
-    // Consultants may branch -- modelling an idea privately is the point of
-    // having them on the project. Viewers may not: migration 0011 refuses it,
-    // and their sandbox is the ephemeral one above.
-    if (!permissions.canContribute) return
-    setSandboxBusy(true)
-    setConflict(null)
-    setRebaseNotice(null)
-    try {
-      const scenario = await createScenario(project.id, name)
-      setScenarios((prev) => [scenario, ...prev])
-      setActiveScenarioId(scenario.id)
-      replaceOverlay(overlayFromScenario(scenario))
-      setSaveError(null)
-    } catch (err) {
-      setSaveError(err instanceof Error ? err.message : 'Could not start the what-if.')
-    } finally {
-      setSandboxBusy(false)
-    }
-  }
-
-  function handleEnterScenario(scenarioId: string) {
-    // Reads the list that `persistOverlay` keeps current (M-30), so resuming
-    // shows the latest saved moves rather than the page-load copy.
-    const scenario = scenarios.find((s) => s.id === scenarioId)
-    if (!scenario) return
-    setConflict(null)
-    setRebaseNotice(null)
-    setActiveScenarioId(scenario.id)
-    replaceOverlay(overlayFromScenario(scenario))
-  }
-
-  /** Leaves the branch without touching it. The baseline was never modified,
-   *  so this is purely dropping the overlay. */
-  function handleExitScenario() {
-    setActiveScenarioId(null)
-    replaceOverlay(null)
-    setConflict(null)
-    setRebaseNotice(null)
+  function handleSelectVersion(key: string) {
+    setSelectedKey(key)
     setDragPreview(null)
-    setPhases(baselinePhasesRef.current)
+    writeStoredVersion(storageKey, key)
   }
 
-  /** A viewer's "Reset". Nothing was persisted, so restoring the baseline
-   *  rows is the entire operation -- there is no server state to undo. */
-  function handleResetEphemeral() {
-    setPhases(baselinePhasesRef.current)
-  }
-
-  async function handlePublish() {
-    if (!activeScenarioId) return
-    // Publishing writes the shared baseline. This is the UI half of the fix
-    // in migration 0011, where publish_scenario() was checking read access
-    // while its own comment claimed it checked edit access.
+  /** Runs a version-list change with the busy flag up and the last drop's
+   *  save landed first (a copy must include it; a delete must not race it). */
+  async function runVersionAction(action: () => Promise<void>, fallback: string) {
     if (!canEditBaseline) return
-    setSandboxBusy(true)
-    setConflict(null)
-    setRebaseNotice(null)
+    setVersionBusy(true)
     try {
-      // The last drop's save may still be in flight; publishing before it
-      // lands would publish the what-if one move behind what is on screen.
       await saveChainRef.current
-      const result = await publishScenario(activeScenarioId)
-      if (!result.ok) {
-        if (result.reason === 'conflict') {
-          setConflict(
-            'Pull in the latest plan (your moves are kept), then publish again.'
-          )
-        } else {
-          setSaveError(result.message)
-        }
-        return
-      }
-      // The branch is now the baseline. Drop the overlay and re-read, rather
-      // than assuming what landed — publish_scenario() reports how many rows
-      // it touched precisely because that can differ from what was sent.
-      setActiveScenarioId(null)
-      replaceOverlay(null)
-      await reloadScenarios()
-      setPhases(await getChunkPhasesForProject(project.id))
+      await action()
+      if (isMountedRef.current) setSaveError(null)
     } catch (err) {
-      setSaveError(err instanceof Error ? err.message : 'Could not publish.')
+      if (isMountedRef.current) setSaveError(err instanceof Error ? err.message : fallback)
     } finally {
-      setSandboxBusy(false)
+      if (isMountedRef.current) setVersionBusy(false)
     }
   }
 
-  async function handleDiscard() {
-    if (!activeScenarioId) return
-    if (!permissions.canContribute) return
-    // SandboxBar only calls this from its inline "Yes, delete this what-if"
-    // confirm (M-23); there is no one-click path here any more.
-    setSandboxBusy(true)
-    try {
-      await saveChainRef.current
-      await deleteScenario(activeScenarioId)
-      setScenarios((prev) => prev.filter((s) => s.id !== activeScenarioId))
-      handleExitScenario()
-    } catch (err) {
-      setSaveError(err instanceof Error ? err.message : 'Could not discard the what-if.')
-    } finally {
-      setSandboxBusy(false)
-    }
+  /** "New version" and "Duplicate": a copy of the version on screen. */
+  function handleCreateVersion(name: string) {
+    void runVersionAction(async () => {
+      const created = await createVersion(project.id, name, activeScenarioId)
+      if (!isMountedRef.current) return
+      setScenarios((prev) => [...prev, created])
+      handleSelectVersion(created.id)
+    }, 'Could not create the version.')
+  }
+
+  function handleRenameVersion(name: string) {
+    void runVersionAction(async () => {
+      await renameVersion(project.id, activeScenarioId, name)
+      if (!isMountedRef.current) return
+      if (activeScenarioId) {
+        setScenarios((prev) => prev.map((s) => (s.id === activeScenarioId ? { ...s, name } : s)))
+      } else {
+        setVersionData((prev) => ({ ...prev, liveName: name }))
+      }
+    }, 'Could not rename the version.')
   }
 
   /**
-   * "Pull in the latest plan and keep my moves" (M-07).
-   *
-   * The server does a real 3-way merge now (migration 0015): a phase keeps the
-   * what-if's value only where the user changed it since branching, and takes
-   * the live plan's value everywhere else -- dependencies included. The old
-   * rebase kept the what-if's copy of EVERY phase, so publishing afterwards
-   * silently reverted colleagues' edits.
-   *
-   * Afterwards we say what happened, by comparing the what-if before and after
-   * against the freshly loaded live plan. A rebase whose outcome you have to
-   * guess at is one people stop trusting.
+   * Deleting the version on screen. Any other version: its row goes. The
+   * one held in the tables: the server moves another version into the
+   * tables and removes that version's snapshot (ship.delete_version, one
+   * transaction), so every row this screen loaded is re-read. Either way the
+   * screen then shows the version in the tables.
    */
-  async function handleRebase() {
-    if (!activeScenarioId) return
-    if (!permissions.canContribute) return
-    setSandboxBusy(true)
-    setRebaseNotice(null)
-    try {
-      await saveChainRef.current
-      const before = [...(overlayRef.current?.values() ?? [])]
-      const rebased = await rebaseScenario(activeScenarioId)
-      const live = await getChunkPhasesForProject(project.id)
-      setScenarios((prev) => prev.map((s) => (s.id === rebased.id ? rebased : s)))
-      replaceOverlay(overlayFromScenario(rebased))
-      setPhases(live)
-      setConflict(null)
-
-      const chunkNames = new Map(chunkProjects.map((c) => [c.id, c.name]))
-      const phaseChunk = new Map(live.map((p) => [p.id, p.chunkProjectId]))
-      const summary = summariseRebase(before, rebased.payload.phases, live, (phase) => {
-        const chunkName = chunkNames.get(phaseChunk.get(phase.id) ?? '')
-        return chunkName ? `${chunkName} – ${phase.name}` : phase.name
-      })
-      setRebaseNotice(describeRebase(summary.pulledIn, summary.kept))
-    } catch (err) {
-      setSaveError(err instanceof Error ? err.message : 'Could not pull in the latest plan.')
-    } finally {
-      setSandboxBusy(false)
-    }
+  function handleDeleteVersion() {
+    void runVersionAction(async () => {
+      if (activeScenarioId) {
+        await deleteVersion(project.id, activeScenarioId)
+        if (!isMountedRef.current) return
+        setScenarios((prev) => prev.filter((s) => s.id !== activeScenarioId))
+        handleSelectVersion(LIVE_VERSION_KEY)
+        return
+      }
+      await deleteVersion(project.id, null)
+      if (!isMountedRef.current) return
+      handleSelectVersion(LIVE_VERSION_KEY)
+      reloadVersions()
+      reloadPhases()
+      reloadDependencies()
+      reloadCostSettings()
+    }, 'Could not delete the version.')
   }
 
+  /** ExportBar's PDF of a version other than the open one: open it, wait
+   *  for it to be on screen, then the bar prints the page. */
+  async function handlePrintVersion(key: string) {
+    handleSelectVersion(key)
+    await afterNextPaint()
+  }
   const handleToggleExpand = useCallback((chunkProjectId: string) => {
     setExpanded((prev) => {
       const next = new Set(prev)
@@ -999,15 +917,15 @@ export default function TimelineTab({ project, permissions, onOpenMasterView }: 
    * Drag / resize a phase bar.
    *
    * During the drag only `dragPreview` changes, and it is applied on top of
-   * the overlay, so the bar tracks the cursor whether you are on the live plan
-   * or inside a what-if. The network write happens exactly once, on pointerup
-   * -- a write per pointer event would put hundreds of round trips behind a
-   * single drag -- and not at all when the bar ends where it started.
+   * the open version, so the bar tracks the cursor in every version. The
+   * network write happens exactly once, on pointerup -- a write per pointer
+   * event would put hundreds of round trips behind a single drag -- and not
+   * at all when the bar ends where it started.
    *
    * Everything is measured against the schedule the user is LOOKING AT
-   * (`effectivePhases`), never the baseline rows. Inside a what-if that is the
-   * difference between "move this bar" and "move this bar and quietly put
-   * every other bar back where the live plan has it" (M-05).
+   * (`effectivePhases`), never the rows in the tables. Inside another version
+   * that is the difference between "move this bar" and "move this bar and
+   * quietly put every other bar back where the tables have it" (M-05).
    *
    * Dependency propagation runs once, on drop, and only while dependency links
    * are switched on (D-14, `DEPENDENCY_LINKS_ENABLED`).
@@ -1072,7 +990,7 @@ export default function TimelineTab({ project, permissions, onOpenMasterView }: 
       setDragPreview(null)
 
       // A click, or a drag that came back to where it began. Nothing to save
-      // -- in a what-if, a plain click used to re-save the whole overlay.
+      // -- in a what-if, a plain click used to re-save the whole payload.
       if (isNoOpDrop(origin, latest)) return
 
       // The schedule on screen just before this drag: the effective phases
@@ -1090,7 +1008,7 @@ export default function TimelineTab({ project, permissions, onOpenMasterView }: 
         ? (rows: ChunkPhase[]) =>
             propagateDependencies(
               rows.map(toEnginePhase),
-              dependencies.map(toEngineDependency)
+              versionView.dependencies.map(toEngineDependency)
             )
         : undefined
 
@@ -1099,20 +1017,13 @@ export default function TimelineTab({ project, permissions, onOpenMasterView }: 
 
       const scenarioId = activeScenarioIdRef.current
       if (scenarioId) {
-        // Inside a scenario the drag must NOT reach chunk_phases. Only the rows
-        // this drop changed are written, into a COPY of the existing overlay,
-        // so every earlier move in the what-if survives. Saved to the scenario
-        // row, never the live plan -- that separation is the whole feature.
-        const nextOverlay = mergeDropIntoOverlay(
-          overlayRef.current ?? new Map(),
-          changed,
-          (id) => {
-            const row = phasesRef.current.find((p) => p.id === id)
-            return row ? toScenarioPhase(row) : undefined
-          }
-        )
-        replaceOverlay(nextOverlay)
-        void persistOverlay(scenarioId, nextOverlay)
+        // Inside a version other than the one in the tables the drag must NOT
+        // reach chunk_phases: it is saved to that version's payload. Whole
+        // packages are written (lib/versions.ts packagePhasesForSave) from
+        // the schedule on screen, so every earlier move survives and a
+        // package that was showing its live phases becomes part of this
+        // version from now on.
+        void persistVersionPhases(scenarioId, packagePhasesForSave(before, changed))
         return
       }
 
@@ -1125,12 +1036,6 @@ export default function TimelineTab({ project, permissions, onOpenMasterView }: 
             : row
         })
       )
-
-      // A viewer's sandbox is local and stays local. Returning before the
-      // persist is what makes "nothing is saved" true rather than aspirational
-      // -- migration 0011 refuses the writes as well, but the UI should never
-      // be the thing that gets refused.
-      if (isEphemeral) return
 
       void persistPhases(changed)
     }
@@ -1226,11 +1131,11 @@ export default function TimelineTab({ project, permissions, onOpenMasterView }: 
             {permissions.isViewer ? null : (
               <ExportBar
                 project={project}
-                // M-24: while a what-if is open, Excel exports THAT schedule,
-                // matching the screen and the PDF.
-                scenario={
-                  activeScenario ? { id: activeScenario.id, name: activeScenario.name } : null
-                }
+                // "All equal, pick on export": the bar asks which version,
+                // defaulting to the open one (M-24, 0031).
+                versions={versions}
+                activeVersionKey={activeKey}
+                onPrintVersion={handlePrintVersion}
                 className="no-print"
               />
             )}
@@ -1249,24 +1154,26 @@ export default function TimelineTab({ project, permissions, onOpenMasterView }: 
           </div>
         </div>
 
-        {/* Megan: "how do you know that you're looking at the official published
-            one versus your own? [...] if it's active, that means that you're
-            looking at a local copy." The active state is a full-width amber
-            bar for exactly that reason. */}
-        <SandboxBar
-          ephemeral={isEphemeral}
-          scenarios={scenarios}
-          activeScenario={activeScenario}
-          busy={sandboxBusy}
-          conflict={conflict}
-          rebaseNotice={rebaseNotice}
-          onBranch={(name) => void handleBranch(name)}
-          onEnter={handleEnterScenario}
-          onExit={isEphemeral ? handleResetEphemeral : handleExitScenario}
-          onPublish={() => void handlePublish()}
-          onDiscard={() => void handleDiscard()}
-          onRebase={() => void handleRebase()}
-        />
+        {/* Versions replaced the what-if (migration 0031): every version is a
+            peer, so this is a picker, not a "you are in a local copy" bar. */}
+        <div className="no-print">
+          <VersionBar
+            versions={versions}
+            activeKey={activeKey}
+            canEdit={canEditBaseline}
+            busy={versionBusy}
+            onSelect={handleSelectVersion}
+            onCreate={handleCreateVersion}
+            onRename={handleRenameVersion}
+            onDelete={handleDeleteVersion}
+          />
+        </div>
+        {/* On paper the version has to be named: a printed plan travels. */}
+        {versions.length > 1 ? (
+          <div className="hidden text-sm font-semibold text-slate-900 print:block">
+            Version: {activeVersionName}
+          </div>
+        ) : null}
 
         {unreadableCostCount > 0 ? (
           <div
@@ -1281,7 +1188,7 @@ export default function TimelineTab({ project, permissions, onOpenMasterView }: 
         {/* M-25: a missing year is shown, never silently replaced. */}
         {!timelineSettingsLoading &&
         !costSettingsLoading &&
-        (timelineSettings.startCalendarYear === null || costSettingsRow?.baseYear === null) ? (
+        (timelineSettings.startCalendarYear === null || versionCostRow?.baseYear === null) ? (
           <div
             role="alert"
             className="rounded-[1.25rem] border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900"
@@ -1289,7 +1196,7 @@ export default function TimelineTab({ project, permissions, onOpenMasterView }: 
             {timelineSettings.startCalendarYear === null
               ? 'Timeline start year not set. '
               : ''}
-            {costSettingsRow?.baseYear === null ? 'Cost base year not set. ' : ''}
+            {versionCostRow?.baseYear === null ? 'Cost base year not set. ' : ''}
             Totals are provisional (using {standInYear}).
           </div>
         ) : null}
@@ -1357,10 +1264,18 @@ export default function TimelineTab({ project, permissions, onOpenMasterView }: 
           <CostModelBox
             projectId={project.id}
             canEdit={canEditBaseline}
-            costRow={costSettingsRow}
+            costRow={versionCostRow}
             energyRow={energySettingsRow}
             onChanged={handleCostModelChanged}
             openRequest={costModelOpenRequest}
+            // The popup edits the OPEN version's cost model (0031): the
+            // tables for the version held there, the payload for any other.
+            version={{
+              name: activeVersionName,
+              scenarioId: activeScenarioId,
+              phases: versionView.phases,
+              onSaved: adoptScenario,
+            }}
           />
         </div>
       </div>
@@ -1419,11 +1334,9 @@ export default function TimelineTab({ project, permissions, onOpenMasterView }: 
               monthsPerSlot={monthsPerSlot}
               describeSpan={describePhaseSpan}
               hoveredSlot={hoveredSlot}
-              // Was hardcoded false. `canDrag`, not `canEdit`: a viewer may
-              // drag inside their ephemeral sandbox and a consultant may drag
-              // inside their own what-if, neither of which touches the
-              // baseline. What none of them get is a grab cursor followed by a
-              // silent RLS rejection on pointer-up.
+              // Admins and editors edit every version; consultants and viewers
+              // switch between versions read-only (0031) -- never a grab
+              // cursor followed by a refusal on pointer-up.
               readOnly={!canDrag}
               // The grid needs to tell "not allowed" apart from "not known
               // yet" -- both collapse to the same `readOnly` value while the

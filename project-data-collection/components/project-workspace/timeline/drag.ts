@@ -1,20 +1,20 @@
 /**
- * The pure arithmetic behind dragging a phase bar, and behind folding a drop
- * into a what-if's overlay.
+ * The pure arithmetic behind dragging a phase bar.
  *
  * It lives outside TimelineTab for one reason: the what-if drag bug (M-05) was
  * a data bug, not a rendering one -- every drop rebuilt the overlay from the
  * BASELINE rows, so each move silently erased the one before it. A bug of that
  * shape is only caught by feeding two drops through the real code in a row and
  * looking at the result, and that is far cheaper to do against plain functions
- * than against a component. `tests/unit/ws4-whatif.test.ts` does exactly that.
+ * than against a component. `tests/unit/ws4-versions.test.ts` does exactly
+ * that, through lib/versions.ts, which folds a drop into a version (0031).
  *
  * Nothing here imports at runtime (only types, which are erased), so Node's
  * test runner can load it directly. Dependency propagation is passed IN as a
  * callback rather than imported, for the same reason.
  */
 
-import type { ChunkPhase, ScenarioPhase } from '@/lib/types'
+import type { ChunkPhase } from '@/lib/types'
 
 export type DragMode = 'move' | 'resize-start' | 'resize-end'
 
@@ -127,83 +127,4 @@ export function changedPhasesForDrop<P extends PhaseLike>(
       phase.startMonth !== before.startMonth || phase.durationMonths !== before.durationMonths
     )
   })
-}
-
-/**
- * Folds the changed rows of one drop into a COPY of the existing overlay.
- *
- * This is the M-05 fix in one function. The previous version wrote an entry
- * for every phase on screen, taken from the baseline rows, which overwrote each
- * earlier move in the what-if with its live-plan position. Here only the ids
- * the drop actually changed are touched; every other entry -- including every
- * earlier move -- is carried over untouched.
- *
- * `fallback` supplies the full row for a phase the overlay has no entry for
- * yet (a phase created on the live plan after the branch).
- */
-export function mergeDropIntoOverlay(
-  overlay: ReadonlyMap<string, ScenarioPhase>,
-  changed: Array<Pick<ChunkPhase, 'id' | 'startMonth' | 'durationMonths'>>,
-  fallback: (id: string) => ScenarioPhase | undefined
-): Map<string, ScenarioPhase> {
-  const next = new Map(overlay)
-  for (const row of changed) {
-    const existing = next.get(row.id) ?? fallback(row.id)
-    if (!existing) continue
-    next.set(row.id, {
-      ...existing,
-      startMonth: Math.max(0, Math.round(row.startMonth)),
-      durationMonths: Math.max(1, Math.round(row.durationMonths)),
-    })
-  }
-  return next
-}
-
-/**
- * What a rebase ("Pull in the latest plan and keep my moves") actually did,
- * in words the banner can show.
- *
- * - `kept`: phases where the rebased what-if still differs from the live plan
- *   -- the user's moves that survived.
- * - `pulledIn`: phases whose what-if value changed because the rebase brought
- *   in the live plan's newer value.
- */
-export type RebaseSummary = {
-  kept: string[]
-  pulledIn: string[]
-}
-
-type Comparable = Pick<
-  ScenarioPhase,
-  'id' | 'name' | 'startMonth' | 'durationMonths' | 'pctOfTpc' | 'durationLocked'
->
-
-function samePlacement(a: Comparable, b: Comparable): boolean {
-  return (
-    a.startMonth === b.startMonth &&
-    a.durationMonths === b.durationMonths &&
-    a.pctOfTpc === b.pctOfTpc &&
-    a.durationLocked === b.durationLocked
-  )
-}
-
-export function summariseRebase(
-  before: Comparable[],
-  after: Comparable[],
-  live: Comparable[],
-  labelFor: (phase: Comparable) => string = (phase) => phase.name
-): RebaseSummary {
-  const beforeById = new Map(before.map((p) => [p.id, p]))
-  const liveById = new Map(live.map((p) => [p.id, p]))
-  const kept: string[] = []
-  const pulledIn: string[] = []
-
-  for (const phase of after) {
-    const livePhase = liveById.get(phase.id)
-    const previous = beforeById.get(phase.id)
-    if (livePhase && !samePlacement(phase, livePhase)) kept.push(labelFor(phase))
-    if (!previous || !samePlacement(phase, previous)) pulledIn.push(labelFor(phase))
-  }
-
-  return { kept, pulledIn }
 }

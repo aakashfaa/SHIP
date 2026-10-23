@@ -230,6 +230,7 @@ function stubClient(tables: Tables) {
     const builder: Record<string, unknown> = {
       select: () => builder,
       eq: () => builder,
+      is: () => builder,
       order: () => builder,
       range: () => builder,
       maybeSingle: () =>
@@ -284,7 +285,7 @@ const total = (rows: Array<{ totalCost: number }>) => rows.reduce((s, r) => s + 
 
 /* ---------------------------------------------------------------- tests -- */
 
-describe('M-24: the export prices the active what-if', () => {
+describe('M-24 / 0031: the export prices the chosen version', () => {
   test('scenario overlay moves the money exactly as the engine would', async () => {
     const live = await report.buildProjectReportData(stubClient(baseTables()), PROJECT)
     const tables = { ...baseTables(), scenarios: [scenarioRow(5 * 12)] }
@@ -341,7 +342,7 @@ describe('M-24: the export prices the active what-if', () => {
     const annual = what.annualCostSummary.reduce((s, r) => s + r.escalatedTotal, 0)
     assert.ok(Math.abs(annual - expected) < 1e-6)
 
-    assert.match(what.notices[0], /What-if scenario "Defer construction"/)
+    assert.match(what.notices[0], /Version "Defer construction"/)
   })
 
   test('a scenario the caller cannot read (or that does not exist) is a 404, not the baseline', async () => {
@@ -359,27 +360,38 @@ describe('M-24: the export prices the active what-if', () => {
     )
   })
 
-  test('applyScenarioOverlay leaves phases the scenario does not mention alone', () => {
-    const phases = [
-      { id: 'a', startMonth: 0, durationMonths: 2, pctOfTpc: 0.5, durationLocked: false, name: 'A' },
-      { id: 'b', startMonth: 2, durationMonths: 2, pctOfTpc: 0.5, durationLocked: false, name: 'B' },
-    ]
-    const out = engine.applyScenarioOverlay(phases, [
-      { id: 'b', startMonth: 6, durationMonths: 3, pctOfTpc: 0.4, durationLocked: true },
-      { id: 'gone', startMonth: 1, durationMonths: 1, pctOfTpc: 1, durationLocked: false },
-    ])
-    assert.deepEqual(out[0], phases[0])
-    assert.deepEqual(out[1], {
-      id: 'b',
-      startMonth: 6,
-      durationMonths: 3,
-      pctOfTpc: 0.4,
-      durationLocked: true,
-      name: 'B',
-    })
-    assert.equal(out.length, 2)
-    // The input is not mutated.
-    assert.equal(phases[1].startMonth, 2)
+  test("a version's own cost model prices it (0031)", async () => {
+    const live = await report.buildProjectReportData(stubClient(baseTables()), PROJECT)
+    const row = scenarioRow(0)
+    // Same schedule as live; only the cost model differs.
+    ;(row.payload as Record<string, unknown>).cost_settings = {
+      tpc_factor: 2.66,
+      base_year: 2026,
+      escalation_mode: 'compound_annual',
+      escalation_annual_percent: 4,
+      escalation_step_years: 5,
+      escalation_basis: 'midpoint',
+      escalation_confidence_years: 5,
+      default_phase_template_id: null,
+    }
+    ;(row.payload as Record<string, unknown>).rate_overrides = []
+    const version = await report.buildProjectReportData(
+      stubClient({ ...baseTables(), scenarios: [row] }),
+      PROJECT,
+      { scenarioId: SCENARIO_ID }
+    )
+    // Double the TPC factor, double the money.
+    assert.ok(Math.abs(total(version.packages) - 2 * total(live.packages)) < 1e-6)
+  })
+
+  test('a live export names its version once the project has more than one', async () => {
+    const data = await report.buildProjectReportData(
+      stubClient({ ...baseTables(), scenarios: [scenarioRow(0)] }),
+      PROJECT
+    )
+    assert.equal(data.scenario, null)
+    assert.deepEqual(data.version, { scenarioId: null, name: 'Version 1', isOneOfSeveral: true })
+    assert.match(data.notices[0], /Version "Version 1"/)
   })
 })
 
@@ -472,10 +484,10 @@ describe('M-09 / M-10: unreadable input is flagged, not a silent zero', () => {
       scenarioId: SCENARIO_ID,
     })
     const workbook = excel.buildExcelWorkbook(data)
-    assert.match(workbook.title, /scenario: Defer construction/)
+    assert.match(workbook.title, /version: Defer construction/)
     for (const sheet of workbook.worksheets) {
       const banner = String(sheet.getRow(1).getCell(1).value)
-      assert.match(banner, /What-if scenario "Defer construction"/, sheet.name)
+      assert.match(banner, /Version "Defer construction"/, sheet.name)
       assert.equal(sheet.getRow(2).getCell(1).value !== null, true)
       sheet.eachRow((row) =>
         row.eachCell((cell) => assert.equal(cell.formula, undefined, `${sheet.name} has a formula`))

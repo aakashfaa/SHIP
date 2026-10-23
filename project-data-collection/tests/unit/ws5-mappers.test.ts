@@ -227,6 +227,7 @@ describe('scenario payload RPC arguments', () => {
     assert.deepEqual(phases[0], {
       id: 'ph1',
       chunk_project_id: 'c1',
+      template_step_id: null,
       name: 'Design',
       kind: 'design',
       sort_order: 0,

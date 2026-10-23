@@ -22,14 +22,13 @@ async function openTimeline(page: Page) {
   await page.getByRole('button', { name: 'Timeline', exact: true }).click()
   await settle(page)
 
-  // Assert the precondition rather than assume it. A leftover what-if from
-  // another spec adds a "Resume…" select next to "Try a what-if", and a native
-  // select is a couple of pixels taller than the button beside it — which
-  // shifts the entire grid down and turns every screenshot here into a diff
-  // that looks like a rendering regression. Failing loudly on the cause beats
-  // debugging the symptom.
-  await expect(page.getByRole('button', { name: 'Try a what-if' })).toBeVisible()
-  await expect(page.getByLabel('Resume a saved what-if')).toHaveCount(0)
+  // Assert the precondition rather than assume it. A leftover version from
+  // another spec adds an "Export version" select to the export bar and
+  // changes what the version picker shows -- which shifts the layout and
+  // turns every screenshot here into a diff that looks like a rendering
+  // regression. Failing loudly on the cause beats debugging the symptom.
+  await expect(page.locator('#timeline-version')).toBeVisible()
+  await expect(page.locator('#timeline-version option')).toHaveCount(1)
 }
 
 /**

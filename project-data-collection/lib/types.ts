@@ -488,14 +488,16 @@ export type ProjectEnergySettings = {
 }
 
 /**
- * A branched copy of a project's schedule — the Revit local-copy model the
- * client asked for by name.
- *
- * `payload` is deliberately untyped here. It is built and consumed exclusively
- * by `ship.create_scenario()` / `publish_scenario()` / `rebase_scenario()`; the
- * client overlays it in memory but never authors it, because a client-authored
- * payload would be an arbitrary-write primitive into the baseline. See
- * supabase/migrations/0010_ship_scenarios.sql.
+ * One VERSION of the plan other than the one stored in the ordinary tables
+ * (migration 0031). The names say "scenario" for history -- the feature was
+ * "What if" until the owner asked for peer versions: "Each version can have a
+ * different cost model but they will have the same packages and line items"
+ * -- but a Scenario here IS a version: its own phases, dependencies and cost
+ * model, laid over the shared packages and line items by lib/versions.ts
+ * `applyVersionOverlay`. Written only through the version RPCs (which
+ * validate everything); every project member can read every version.
+ * `ownerEmail` is now just "created by"; `visibility` is always 'project';
+ * `baselineFingerprint` is unused since 0031.
  */
 export type Scenario = {
   id: string
@@ -511,11 +513,14 @@ export type Scenario = {
   publishedAt: string | null
 }
 
-/** The subset of a phase a scenario can move. Structural edits (adding or
- *  deleting phases) are deliberately out of scope — see the migration. */
+/** A phase as a version stores it. Held per package: a version that holds
+ *  any phase of a package holds all of them, and its structure may differ
+ *  from the live one after a phase-template change (migration 0031). */
 export type ScenarioPhase = {
   id: string
   chunkProjectId: string
+  // Provenance, as on ChunkPhase. Optional so older literals still type.
+  templateStepId?: string | null
   name: string
   kind: PhaseKind
   sortOrder: number
@@ -539,4 +544,23 @@ export type ScenarioDependency = {
 export type ScenarioPayload = {
   phases: ScenarioPhase[]
   dependencies: ScenarioDependency[]
+  /** This version's cost model (migration 0031). Null/absent when the
+   *  payload has none (a pre-0031 what-if): it is priced with the live one. */
+  costSettings?: VersionCostSettings | null
+}
+
+/** The part of the cost model a version owns: project_cost_settings minus
+ *  the project id, plus escalation_rate_overrides. */
+export type VersionCostSettings = Omit<ProjectCostSettings, 'projectId'>
+
+/**
+ * A version as the Timeline lists it. `key` is 'live' (LIVE_VERSION_KEY in
+ * lib/versions.ts) for the version held in the ordinary tables -- named by
+ * projects.live_version_name -- and the scenario id for every other one. The
+ * UI treats them all as peers.
+ */
+export type PlanVersion = {
+  key: string
+  scenarioId: string | null
+  name: string
 }

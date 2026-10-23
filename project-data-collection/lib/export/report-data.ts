@@ -42,12 +42,12 @@
  */
 
 import type { ShipSupabaseClient } from '../supabase/client'
+import { applyVersionOverlay } from '../versions'
 import { UNREADABLE_CELL, type ReportCellValue, type ReportColumn } from './line-item-cells'
 import { getMasterViewColumnDefs, masterExportCell, masterExportColumn } from '../view-columns/master'
 import { parseCostAmount, parseCostInput, parseQuantity, parseQuantityInput } from '../costs'
 import {
   DEFAULT_ENERGY_SETTINGS,
-  applyScenarioOverlay,
   computeEnergyByFiscalYear,
   computeFiscalYearTotals,
   fiscalYearForMonth,
@@ -268,11 +268,12 @@ async function fetchFormFields(
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
 /**
- * The what-if to export (M-24), read through RLS like everything else here:
- * a private scenario that belongs to someone else is simply not returned,
- * and comes back as "not found" -- the same as one that never existed.
- * Scoped to the project too, so a scenario id from another project can't be
- * laid over this one's phases.
+ * The version to export (M-24, migration 0031), read through RLS like
+ * everything else here: a version in a project the caller cannot read is
+ * simply not returned, and comes back as "not found" -- the same as one that
+ * never existed. Scoped to the project too, so a version id from another
+ * project can't be laid over this one's phases. A pre-0031 what-if that was
+ * already published is history, not a version, and is not found either.
  */
 async function fetchScenarioForExport(
   supabase: ShipSupabaseClient,
@@ -281,7 +282,7 @@ async function fetchScenarioForExport(
 ): Promise<Scenario> {
   // A malformed id would make Postgres raise 22P02 (a 500); it is a 404.
   if (!UUID_PATTERN.test(scenarioId)) {
-    throw new ExportBlockedError('That what-if scenario was not found.', 404)
+    throw new ExportBlockedError('That version was not found.', 404)
   }
 
   const { data, error } = await supabase
@@ -289,17 +290,41 @@ async function fetchScenarioForExport(
     .select('*')
     .eq('id', scenarioId)
     .eq('project_id', projectId)
+    .is('published_at', null)
     .maybeSingle()
 
-  if (error) fail(`Failed to load scenario "${scenarioId}"`, error)
+  if (error) fail(`Failed to load version "${scenarioId}"`, error)
   if (!data) {
     throw new ExportBlockedError(
-      'That what-if scenario was not found, or you no longer have access to it.',
+      'That version was not found, or you no longer have access to it.',
       404
     )
   }
 
   return rowToScenario(data as unknown as ScenarioRow)
+}
+
+/** The name of the version held in the live tables, and how many versions
+ *  the project has in all -- a workbook only needs to say which version it
+ *  is when there is more than one. */
+async function fetchVersionInfo(
+  supabase: ShipSupabaseClient,
+  projectId: string
+): Promise<{ liveName: string; count: number }> {
+  const [projectResult, scenarioResult] = await Promise.all([
+    supabase.from('projects').select('live_version_name').eq('id', projectId).maybeSingle(),
+    supabase
+      .from('scenarios')
+      .select('id')
+      .eq('project_id', projectId)
+      .is('published_at', null),
+  ])
+  if (projectResult.error) fail(`Failed to load versions for "${projectId}"`, projectResult.error)
+  if (scenarioResult.error) fail(`Failed to load versions for "${projectId}"`, scenarioResult.error)
+  const liveName =
+    (projectResult.data as { live_version_name?: string | null } | null)?.live_version_name ||
+    'Version 1'
+  return { liveName, count: 1 + ((scenarioResult.data as unknown[] | null) ?? []).length }
 }
 
 /* --------------------------------------------------------- engine wiring -- */
@@ -397,8 +422,12 @@ export type ReportEnergyPoint = {
 
 export type ProjectReportData = {
   project: { id: string; name: string }
-  /** The what-if this export priced, or null for the live plan (M-24). */
+  /** The version this export priced when it is not the one in the live
+   *  tables, else null (M-24, migration 0031). */
   scenario: { id: string; name: string } | null
+  /** The version this export priced, always (scenario id null = the one in
+   *  the live tables), and whether the project has more than one. */
+  version: { scenarioId: string | null; name: string; isOneOfSeveral: boolean }
   generatedAt: string
   energyUnitLabel: string
   energyBaselineAnnual: number | null
@@ -419,7 +448,8 @@ export type ProjectReportData = {
 }
 
 export type BuildReportOptions = {
-  /** Price this what-if instead of the live plan (M-24). */
+  /** Price this version (a scenario id) instead of the one in the live
+   *  tables (M-24, migration 0031). */
   scenarioId?: string | null
 }
 
@@ -470,11 +500,12 @@ export async function buildProjectReportData(
     lineItems,
     chunkProjects,
     chunkPhases,
-    costSettingsRow,
+    liveCostSettingsRow,
     energySettingsRow,
     timelineSettings,
     formFields,
     scenario,
+    versionInfo,
   ] = await Promise.all([
     fetchLineItems(supabase, project.id),
     fetchChunkProjects(supabase, project.id),
@@ -484,7 +515,20 @@ export async function buildProjectReportData(
     fetchTimelineSettings(supabase, project.id),
     fetchFormFields(supabase, project.id),
     scenarioId ? fetchScenarioForExport(supabase, project.id, scenarioId) : Promise.resolve(null),
+    fetchVersionInfo(supabase, project.id),
   ])
+
+  // M-24 / 0031: a version is the live rows with its payload laid over them
+  // -- its own phases and cost model -- through the same function the
+  // Timeline uses (lib/versions.ts), so the workbook, the PDF and the screen
+  // show one number. Dependencies do not affect prices, hence [].
+  const versionView = applyVersionOverlay(
+    { phases: chunkPhases, dependencies: [], costSettings: liveCostSettingsRow },
+    scenario ? scenario.payload : null,
+    chunkProjects.map((chunk) => chunk.id)
+  )
+  const costSettingsRow = versionView.costSettings ?? liveCostSettingsRow
+  const versionName = scenario ? scenario.name : versionInfo.liveName
 
   // M-25: a deliverable is never priced from a year nobody set. The screen
   // can show a labelled stand-in while settings load; a workbook handed to a
@@ -521,13 +565,7 @@ export async function buildProjectReportData(
 
   const lineItemMap = new Map(lineItems.map((item) => [item.id, item]))
 
-  // M-24: inside a what-if, the screen prices the live phases with the
-  // scenario's placements laid over them (TimelineTab `effectivePhases`).
-  // The export goes through the same rule, so the workbook, the PDF and
-  // the screen show one number.
-  const effectivePhases = scenario
-    ? applyScenarioOverlay(chunkPhases, scenario.payload.phases)
-    : chunkPhases
+  const effectivePhases = versionView.phases
 
   const phasesByChunk = new Map<string, ChunkPhase[]>()
   for (const phase of effectivePhases) {
@@ -598,9 +636,9 @@ export async function buildProjectReportData(
     .map((item) => item.itemNumber || item.name || item.id)
 
   const notices: string[] = []
-  if (scenario) {
+  if (versionInfo.count > 1 || scenario) {
     notices.push(
-      `What-if scenario "${scenario.name}": these figures are the scenario's schedule, not the live plan.`
+      `Version "${versionName}": these figures are this version's schedule and cost model.`
     )
   }
   if (horizon.extended) {
@@ -671,6 +709,11 @@ export async function buildProjectReportData(
   return {
     project: { id: project.id, name: project.name },
     scenario: scenario ? { id: scenario.id, name: scenario.name } : null,
+    version: {
+      scenarioId: scenario ? scenario.id : null,
+      name: versionName,
+      isOneOfSeveral: versionInfo.count > 1 || scenario !== null,
+    },
     generatedAt: new Date().toISOString(),
     energyUnitLabel: energySettings.unitLabel,
     energyBaselineAnnual: energySettings.baselineAnnual,

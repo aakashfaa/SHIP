@@ -60,6 +60,7 @@ import type {
   ScenarioPayload,
   ScenarioPhase,
   TimelineInterval,
+  VersionCostSettings,
 } from './types'
 
 /* ------------------------------------------------------------------ rows -- */
@@ -888,6 +889,7 @@ function toScenarioPayload(value: unknown): ScenarioPayload {
           {
             id: p.id,
             chunkProjectId: String(p.chunk_project_id ?? ''),
+            templateStepId: typeof p.template_step_id === 'string' ? p.template_step_id : null,
             name: String(p.name ?? ''),
             kind: (p.kind as ScenarioPhase['kind']) ?? 'construction',
             sortOrder: toNumber(p.sort_order) ?? 0,
@@ -916,7 +918,23 @@ function toScenarioPayload(value: unknown): ScenarioPayload {
       })
     : []
 
-  return { phases, dependencies }
+  // A version's cost model (migration 0031). Absent or empty = a pre-0031
+  // what-if, priced with the live cost model (null here).
+  const costRow =
+    raw.cost_settings && typeof raw.cost_settings === 'object' && !Array.isArray(raw.cost_settings)
+      ? (raw.cost_settings as Partial<ProjectCostSettingsRow>)
+      : null
+  let costSettings: VersionCostSettings | null = null
+  if (costRow && Object.keys(costRow).length > 0) {
+    const overrideRows = Array.isArray(raw.rate_overrides)
+      ? (raw.rate_overrides as EscalationRateOverrideRow[])
+      : []
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    const { projectId: _projectId, ...rest } = rowToCostSettings(costRow, overrideRows, '')
+    costSettings = rest
+  }
+
+  return { phases, dependencies, costSettings }
 }
 
 export function rowToScenario(row: ScenarioRow): Scenario {
@@ -945,7 +963,7 @@ export function scenarioPayloadToRow(payload: ScenarioPayload): Record<string, u
   }
 }
 
-/** The `p_phases` argument of `ship.save_scenario_payload` (migration 0015):
+/** The `p_phases` argument of `ship.save_version_phases` (migration 0031):
  *  the same per-phase shape the payload stores. */
 export function scenarioPhasesToRows(
   phases: readonly ScenarioPhase[]
@@ -953,6 +971,7 @@ export function scenarioPhasesToRows(
   return phases.map((p) => ({
     id: p.id,
     chunk_project_id: p.chunkProjectId,
+    template_step_id: p.templateStepId ?? null,
     name: p.name,
     kind: p.kind,
     sort_order: p.sortOrder,
@@ -963,7 +982,36 @@ export function scenarioPhasesToRows(
   }))
 }
 
-/** The `p_dependencies` argument of `ship.save_scenario_payload`. */
+/** The `p_settings` argument of `ship.save_version_cost_settings` (0031):
+ *  only the keys given, in the payload's snake_case. A null base year is
+ *  left out -- never written, same as costSettingsToRow. */
+export function versionCostSettingsToRow(
+  settings: Partial<Omit<VersionCostSettings, 'rateOverrides'>>
+): Record<string, unknown> {
+  const row: Record<string, unknown> = {}
+  if (settings.tpcFactor !== undefined) row.tpc_factor = settings.tpcFactor
+  if (settings.baseYear !== undefined && settings.baseYear !== null) row.base_year = settings.baseYear
+  if (settings.escalationMode !== undefined) row.escalation_mode = settings.escalationMode
+  if (settings.escalationAnnualPercent !== undefined)
+    row.escalation_annual_percent = settings.escalationAnnualPercent
+  if (settings.escalationStepYears !== undefined)
+    row.escalation_step_years = settings.escalationStepYears
+  if (settings.escalationBasis !== undefined) row.escalation_basis = settings.escalationBasis
+  if (settings.escalationConfidenceYears !== undefined)
+    row.escalation_confidence_years = settings.escalationConfidenceYears
+  if (settings.defaultPhaseTemplateId !== undefined)
+    row.default_phase_template_id = settings.defaultPhaseTemplateId
+  return row
+}
+
+/** The `p_rate_overrides` argument of `ship.save_version_cost_settings`. */
+export function versionRateOverridesToRows(
+  overrides: VersionCostSettings['rateOverrides']
+): Array<{ year_offset: number; rate_percent: number }> {
+  return overrides.map((o) => ({ year_offset: o.yearOffset, rate_percent: o.ratePercent }))
+}
+
+/** Dependencies in the payload's stored shape. */
 export function scenarioDependenciesToRows(
   dependencies: readonly ScenarioDependency[]
 ): Array<Record<string, unknown>> {

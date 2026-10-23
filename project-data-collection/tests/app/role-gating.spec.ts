@@ -50,18 +50,21 @@ function roleLine(page: Page) {
 // Every role signs in for itself; the stored admin session would defeat the test.
 test.use({ storageState: { cookies: [], origins: [] } })
 
-test('a viewer gets a read-only plan and an ephemeral sandbox', async ({ page }) => {
+test('a viewer gets a read-only plan and can switch versions', async ({ page }) => {
   await openTimelineAs(page, 'electrical@voltworks.com')
 
   await expect(roleLine(page)).toHaveText('Timeline · Client')
-  await expect(page.getByText(/Exploring — nothing is saved/i)).toBeVisible()
+  // Versions (0031), "Whole team": a viewer sees and switches between every
+  // version, read-only. The old "ephemeral sandbox" went with the what-if.
+  await expect(page.locator('#timeline-version')).toBeVisible()
+  await expect(page.getByRole('button', { name: 'New version' })).toHaveCount(0)
 
   // R8.4: no deliverables for a viewer.
   await expect(page.getByRole('button', { name: /Export Excel/i })).toHaveCount(0)
 
-  // They cannot start a persisted what-if — that is migration 0011's rule,
-  // surfaced here as an absent control rather than a failed one.
-  await expect(page.getByRole('button', { name: /Try a what-if/i })).toHaveCount(0)
+  // They cannot change a version -- migration 0031's rule, surfaced here as
+  // absent controls rather than failed ones.
+  await expect(page.getByRole('button', { name: 'Delete' })).toHaveCount(0)
 
   // The schedule itself is still fully legible. Read-only is not blank.
   await expect(page.getByText(/Infrastructure Stabilization/).first()).toBeVisible()
@@ -74,13 +77,14 @@ test('a viewer cannot reach Add Data at all', async ({ page }) => {
   await expect(page.getByRole('button', { name: 'Add Data', exact: true })).toHaveCount(0)
 })
 
-test('a consultant may branch a what-if but not publish the plan', async ({ page }) => {
+test('a consultant switches versions but cannot change them', async ({ page }) => {
   await openTimelineAs(page, 'consultant1@gmail.com')
 
   await expect(roleLine(page)).toHaveText(/^Timeline · Consultant( · .+)?$/)
-  // Branching is theirs — modelling an idea privately is what they are here for.
-  await expect(page.getByRole('button', { name: /Try a what-if/i })).toBeVisible()
-  // Editing the live schedule is not.
+  // Versions are admin / editor territory (0031); a consultant switches.
+  await expect(page.locator('#timeline-version')).toBeVisible()
+  await expect(page.getByRole('button', { name: 'New version' })).toHaveCount(0)
+  // Editing the schedule is not theirs either.
   await expect(page.getByText('Read-only', { exact: true })).toBeVisible()
 })
 
@@ -89,6 +93,7 @@ test('an editor gets the plan and the deliverables', async ({ page }) => {
 
   await expect(roleLine(page)).toHaveText('Timeline · Editor')
   await expect(page.getByRole('button', { name: /Export Excel/i })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'New version' })).toBeVisible()
   await expect(page.getByText('Read-only', { exact: true })).toHaveCount(0)
 })
 

@@ -5,7 +5,7 @@ import Modal from '@/components/ui/Modal'
 import { getPhaseTemplates } from '@/lib/store'
 import { useAsyncData } from '@/lib/useAsyncData'
 import type { PhaseTemplate, ProjectCostSettings, ProjectEnergySettings } from '@/lib/types'
-import CostModelEditor, { type CostModelSaveStatus } from './CostModelEditor'
+import CostModelEditor, { type CostModelSaveStatus, type CostModelVersion } from './CostModelEditor'
 
 /**
  * The Timeline's "Cost model" box: a terse read-only summary of the
@@ -18,7 +18,9 @@ import CostModelEditor, { type CostModelSaveStatus } from './CostModelEditor'
  * popup read-only.
  *
  * The summary renders the rows the Timeline itself prices from (passed in),
- * so what it says and what the totals use can never disagree.
+ * so what it says and what the totals use can never disagree. Since
+ * migration 0031 that is the OPEN version's cost model -- "Each version can
+ * have a different cost model" -- and the popup edits that version's.
  *
  * Save state is held HERE, not in the editor, because the editor's last
  * write can land (or fail) after the popup has closed. A failure then shows
@@ -36,6 +38,8 @@ type Props = {
   /** Bump to open the popup from outside (e.g. the energy chart's empty
    *  state). The editor then focuses the Annual baseline input. */
   openRequest?: number
+  /** The version on the Timeline, whose cost model this is (0031). */
+  version?: CostModelVersion
 }
 
 function formatCompact(value: number): string {
@@ -88,6 +92,7 @@ export default function CostModelBox({
   energyRow,
   onChanged,
   openRequest = 0,
+  version,
 }: Props) {
   const [open, setOpen] = useState(false)
   const [focusBaseline, setFocusBaseline] = useState(false)
@@ -130,7 +135,14 @@ export default function CostModelBox({
   return (
     <div className="no-print rounded-[1.25rem] border border-slate-200 bg-slate-50/80 p-4">
       <div className="flex items-center justify-between gap-3">
-        <div className="text-sm font-medium text-slate-700">Cost model</div>
+        <div className="min-w-0 text-sm font-medium text-slate-700">
+          Cost model
+          {version ? (
+            <span className="ml-1 truncate text-xs font-normal text-slate-500">
+              · {version.name}
+            </span>
+          ) : null}
+        </div>
         <button
           type="button"
           onClick={openEditor}
@@ -194,7 +206,9 @@ export default function CostModelBox({
         // With a failed save on screen, Escape and the backdrop do nothing:
         // the only way out is the button that says "Close anyway".
         dismissable={status.state !== 'error'}
-        title={canEdit ? 'Cost model' : 'Cost model (read-only)'}
+        title={`${canEdit ? 'Cost model' : 'Cost model (read-only)'}${
+          version ? ` — ${version.name}` : ''
+        }`}
         size="xl"
         footer={
           <>
@@ -232,6 +246,8 @@ export default function CostModelBox({
             onSaved={onChanged}
             onStatus={setStatus}
             focusBaseline={focusBaseline}
+            version={version}
+            versionCostRow={costRow}
           />
         ) : null}
       </Modal>
