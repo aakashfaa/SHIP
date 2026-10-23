@@ -400,6 +400,9 @@ export async function getLineItemsForProject(projectId: string): Promise<LineIte
     .from('line_items')
     .select('*')
     .eq('project_id', projectId)
+    // 0029: the arrangement people set in Add Data. Item numbers follow it
+    // within a discipline, so this is also item-number order per discipline.
+    .order('sort_order', { ascending: true })
     .order('created_at', { ascending: true })
 
   if (error) fail(`Failed to load line items for project "${projectId}"`, error)
@@ -418,6 +421,7 @@ export async function getLineItemsForProjectUser(
     .select('*')
     .eq('project_id', projectId)
     .eq('user_email', userEmail)
+    .order('sort_order', { ascending: true })
     .order('created_at', { ascending: true })
 
   if (error) fail(`Failed to load line items for "${userEmail}"`, error)
@@ -432,7 +436,8 @@ export async function createLineItem(
     // recomputes it from `estimated_first_cost` on every write, so accepting it
     // here would let a caller believe they had set a cost that the database
     // immediately overwrote.
-    'id' | 'createdAt' | 'companyName' | 'discipline' | 'itemNumber' | 'eccAmount'
+    // `sortOrder` (0029) is assigned by trigger too: a new item goes last.
+    'id' | 'createdAt' | 'companyName' | 'discipline' | 'itemNumber' | 'eccAmount' | 'sortOrder'
   >
 ): Promise<LineItem> {
   const supabase = getSupabaseBrowserClient()
@@ -483,6 +488,31 @@ export async function deleteLineItem(lineItemId: string): Promise<void> {
   const { error } = await supabase.from('line_items').delete().eq('id', lineItemId)
 
   if (error) fail(`Failed to delete line item "${lineItemId}"`, error)
+}
+
+/**
+ * Drag-and-drop order for line items (migration 0029,
+ * `ship.reorder_line_items`). Pass the items the caller can see, in the new
+ * order: they take the slots those same items hold now, so other people's
+ * items do not move, and the server then renumbers every discipline gap-free
+ * (A1, A2, ... with no holes). Item numbers therefore change -- reload the
+ * list afterwards. Links (packages, suggestions) are by id and are untouched.
+ *
+ * All or nothing: if any id is not in the project, or the caller may not edit
+ * it (editors: any item; consultants: their own; viewers: none), the call
+ * fails with 42501 and nothing moves.
+ */
+export async function reorderLineItems(projectId: string, orderedIds: string[]): Promise<void> {
+  if (orderedIds.length === 0) return
+
+  const supabase = getSupabaseBrowserClient()
+
+  const { error } = await supabase.rpc('reorder_line_items', {
+    p_project_id: projectId,
+    p_ordered_ids: orderedIds,
+  })
+
+  if (error) fail(`Failed to reorder line items for "${projectId}"`, error)
 }
 
 /* --------------------------------------------------------- chunk projects -- */

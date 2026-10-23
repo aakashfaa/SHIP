@@ -1,7 +1,7 @@
 'use client'
 
-import { AnimatePresence, motion } from 'framer-motion'
-import { useEffect, useId, useMemo, useRef, useState } from 'react'
+import { AnimatePresence, motion, Reorder, useDragControls } from 'framer-motion'
+import { useEffect, useId, useMemo, useRef, useState, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 import {
   createLineItem,
@@ -10,9 +10,12 @@ import {
   getChunkProjectsForProject,
   getFormFieldsForProject,
   getLineItemsForProjectUser,
+  reorderLineItems,
   updateLineItem,
   visibleFormFields,
 } from '@/lib/store'
+import { moveId, previewItemNumbers, sameOrder } from '@/lib/line-item-order'
+import { GripIcon } from './form-builder/shared'
 import { COST_PARSE_MESSAGES, formatCostAmount, parseCostAmount } from '@/lib/costs'
 import { useAsyncData } from '@/lib/useAsyncData'
 import {
@@ -147,6 +150,7 @@ type DraftLineItem = Omit<
   | 'companyName'
   | 'discipline'
   | 'itemNumber'
+  | 'sortOrder'
   | 'eccAmount'
   | 'operationalImpact'
   | 'benefitToUsers'
@@ -183,10 +187,10 @@ type DraftLineItem = Omit<
  *  were; this cast only tells TypeScript what the server already checks. */
 function draftForCreate(
   draft: DraftLineItem
-): Omit<LineItem, 'id' | 'createdAt' | 'companyName' | 'discipline' | 'itemNumber' | 'eccAmount'> {
+): Omit<LineItem, 'id' | 'createdAt' | 'companyName' | 'discipline' | 'itemNumber' | 'eccAmount' | 'sortOrder'> {
   return draft as unknown as Omit<
     LineItem,
-    'id' | 'createdAt' | 'companyName' | 'discipline' | 'itemNumber' | 'eccAmount'
+    'id' | 'createdAt' | 'companyName' | 'discipline' | 'itemNumber' | 'eccAmount' | 'sortOrder'
   >
 }
 
@@ -706,6 +710,83 @@ function LineItemFields({
   )
 }
 
+/**
+ * One line-item card in the reorderable list (migration 0029).
+ *
+ * Owner: "Let people reorder stuff in the Add Data view so they can reorder
+ * their own stuff. The way they do that is by dragging and dropping, looking
+ * on the left side of a line item, and moving up and down."
+ *
+ * So the grip sits in its own column on the LEFT of the card and is the ONLY
+ * place a drag starts (`dragListener={false}` + useDragControls): the card
+ * body stays a normal button/form, and text selection inside an expanded item
+ * still works. The grip is also a focusable button for keyboard users:
+ * ArrowUp / ArrowDown move the item one place. People who may not edit the
+ * item get no grip at all.
+ */
+function ReorderableLineItem({
+  id,
+  label,
+  canDrag,
+  busy,
+  onKeyMove,
+  onDragEnd,
+  children,
+}: {
+  id: string
+  label: string
+  canDrag: boolean
+  /** A reorder is being saved; further moves wait for it. */
+  busy: boolean
+  onKeyMove: (direction: -1 | 1) => void
+  onDragEnd: () => void
+  children: ReactNode
+}) {
+  const controls = useDragControls()
+
+  return (
+    <Reorder.Item
+      value={id}
+      dragListener={false}
+      dragControls={controls}
+      onDragEnd={onDragEnd}
+      whileDrag={{ scale: 1.01, boxShadow: '0 18px 40px -16px rgba(15, 23, 42, 0.35)', zIndex: 10 }}
+      className="relative flex overflow-hidden rounded-[2rem] border border-gray-200 bg-white shadow-sm"
+    >
+      {canDrag ? (
+        <div
+          role="button"
+          tabIndex={0}
+          data-reorder-handle={id}
+          aria-label={`Reorder ${label} (drag, or use the up and down arrow keys)`}
+          aria-disabled={busy}
+          title="Drag to reorder"
+          onPointerDown={(event) => {
+            if (busy) return
+            event.preventDefault()
+            controls.start(event)
+          }}
+          onKeyDown={(event) => {
+            if (event.key !== 'ArrowUp' && event.key !== 'ArrowDown') return
+            event.preventDefault()
+            if (busy) return
+            onKeyMove(event.key === 'ArrowUp' ? -1 : 1)
+          }}
+          // touch-action: none lets a finger drag the grip instead of
+          // scrolling the page.
+          style={{ touchAction: 'none' }}
+          className={`flex w-10 shrink-0 select-none justify-center border-r border-gray-100 pt-6 text-gray-300 outline-none transition hover:bg-gray-50 hover:text-gray-600 focus-visible:bg-gray-50 focus-visible:text-gray-900 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-black ${
+            busy ? 'cursor-wait' : 'cursor-grab active:cursor-grabbing'
+          }`}
+        >
+          <GripIcon />
+        </div>
+      ) : null}
+      <div className="min-w-0 flex-1">{children}</div>
+    </Reorder.Item>
+  )
+}
+
 export default function AddDataTab({ project, user, permissions }: Props) {
   /**
    * The project's own line-item form (migration 0012). Loaded here rather
@@ -771,6 +852,58 @@ export default function AddDataTab({ project, user, permissions }: Props) {
     }
   }, [])
 
+  /*
+   * Drag-to-reorder (migration 0029). Megan: "If I wanted to shift A4 to A7,
+   * is there a way?" -- and numbers renumber gap-free afterwards.
+   *
+   * `optimistic` is the order the person just made, tied to the server list
+   * it was made from (`base`). Once the reload after the RPC lands,
+   * `lineItems` is a new array, `base` no longer matches, and the server's
+   * order and real numbers take over -- no effect needed to clear it. While
+   * it is showing, the numbers are previewed (lib/line-item-order) so A4..A7
+   * visibly follow the rows straight away.
+   */
+  const [optimistic, setOptimistic] = useState<{ base: LineItem[]; ids: string[] } | null>(null)
+  const [reordering, setReordering] = useState(false)
+  const [reorderAnnouncement, setReorderAnnouncement] = useState('')
+  // Mirrors the latest dragged order for onDragEnd, which may fire with a
+  // closure from before the last onReorder render.
+  const draggedOrderRef = useRef<string[] | null>(null)
+  // A keyboard move re-renders the list in a new order; put focus back on
+  // the moved item's grip afterwards (same approach as FormBuilder).
+  const refocusHandleRef = useRef<string | null>(null)
+
+  const activeOrder = optimistic && optimistic.base === lineItems ? optimistic.ids : null
+  const displayedItems = useMemo(() => {
+    if (!activeOrder) return lineItems
+    const byId = new Map(lineItems.map((item) => [item.id, item]))
+    const ordered = activeOrder.flatMap((id) => {
+      const item = byId.get(id)
+      return item ? [item] : []
+    })
+    return ordered.length === lineItems.length ? ordered : lineItems
+  }, [activeOrder, lineItems])
+  const previewNumbers = useMemo(
+    () => (activeOrder ? previewItemNumbers(displayedItems) : null),
+    [activeOrder, displayedItems]
+  )
+
+  useEffect(() => {
+    const id = refocusHandleRef.current
+    if (id === null) return
+    refocusHandleRef.current = null
+    const handle = document.querySelector<HTMLElement>(`[data-reorder-handle="${CSS.escape(id)}"]`)
+    if (handle && document.activeElement !== handle) handle.focus()
+  })
+
+  /** Only people who may edit an item get its grip -- the same rule the
+   *  database applies in ship.reorder_line_items: editors any item,
+   *  contributors their own, viewers none. */
+  function canReorderItem(item: LineItem): boolean {
+    if (!permissions.canContribute) return false
+    return permissions.canEdit || item.userEmail.toLowerCase() === user.email.toLowerCase()
+  }
+
   const consultantType = getUserConsultantType(project, user, permissions)
 
   const synergyOptions = useMemo(() => {
@@ -835,12 +968,63 @@ export default function AddDataTab({ project, user, permissions }: Props) {
     if (step > 0) setStep((prev) => prev - 1)
   }
 
+  /** Save a new order: show it at once, then let the server renumber and
+   *  reload the real numbers. On failure the list snaps back to what the
+   *  database holds and says why. */
+  async function commitOrder(ids: string[]) {
+    if (sameOrder(ids, lineItems.map((item) => item.id))) {
+      setOptimistic(null)
+      return
+    }
+    setOptimistic({ base: lineItems, ids })
+    setReordering(true)
+    setActionError(null)
+    try {
+      await reorderLineItems(project.id, ids)
+      if (!isMountedRef.current) return
+      reloadLineItems()
+    } catch (err) {
+      if (!isMountedRef.current) return
+      setOptimistic(null)
+      reloadLineItems()
+      setActionError(err instanceof Error ? err.message : 'Failed to reorder line items.')
+    } finally {
+      if (isMountedRef.current) setReordering(false)
+    }
+  }
+
+  function handleDragReorder(ids: string[]) {
+    draggedOrderRef.current = ids
+    setOptimistic({ base: lineItems, ids })
+  }
+
+  function handleDragEnd() {
+    const ids = draggedOrderRef.current
+    draggedOrderRef.current = null
+    if (ids) void commitOrder(ids)
+  }
+
+  function handleKeyMove(item: LineItem, direction: -1 | 1) {
+    if (reordering) return
+    const ids = displayedItems.map((entry) => entry.id)
+    const next = moveId(ids, item.id, direction)
+    if (!next) return
+    refocusHandleRef.current = item.id
+    setReorderAnnouncement(
+      `${item.name || item.itemNumber} moved to position ${next.indexOf(item.id) + 1} of ${next.length}.`
+    )
+    void commitOrder(next)
+  }
+
   async function handleDelete(id: string) {
     setActionError(null)
     setPendingDeleteId(id)
     try {
       await deleteLineItem(id)
       if (!isMountedRef.current) return
+      // The delete renumbers the rest of the discipline server-side (0029:
+      // "if something is deleted there should be renumbering for all"), so
+      // the reload is what shows the closed-up numbers.
       reloadLineItems()
       reloadChunks()
       setConfirmDeleteId(null)
@@ -1000,6 +1184,13 @@ export default function AddDataTab({ project, user, permissions }: Props) {
           </div>
         ) : null}
 
+        {lineItems.length > 1 && permissions.canContribute ? (
+          <p className="-mt-2 text-sm text-gray-500">
+            Drag the handle on the left of an item to reorder. Numbers update to match the new
+            order, and close up when an item is deleted.
+          </p>
+        ) : null}
+
         {lineItemsError || actionError ? (
           <div className="rounded-[1.5rem] border border-red-200 bg-red-50 px-5 py-4 text-sm text-red-700">
             {actionError || lineItemsError?.message || 'Something went wrong.'}
@@ -1013,16 +1204,27 @@ export default function AddDataTab({ project, user, permissions }: Props) {
             </h4>
           </div>
         ) : (
-          <div className="space-y-4">
-            {lineItems.map((item) => {
+          <Reorder.Group
+            as="div"
+            axis="y"
+            values={displayedItems.map((item) => item.id)}
+            onReorder={handleDragReorder}
+            className="space-y-4"
+          >
+            {displayedItems.map((item) => {
               const expanded = expandedId === item.id
               const editDraft = editingDrafts[item.id] ?? makeEditableDraft(item)
+              const shownNumber = previewNumbers?.get(item.id) ?? item.itemNumber
 
               return (
-                <motion.div
+                <ReorderableLineItem
                   key={item.id}
-                  layout
-                  className="overflow-hidden rounded-[2rem] border border-gray-200 bg-white shadow-sm"
+                  id={item.id}
+                  label={item.name ? `${shownNumber} ${item.name}` : shownNumber}
+                  canDrag={canReorderItem(item)}
+                  busy={reordering}
+                  onKeyMove={(direction) => handleKeyMove(item, direction)}
+                  onDragEnd={handleDragEnd}
                 >
                   <button
                     type="button"
@@ -1033,7 +1235,7 @@ export default function AddDataTab({ project, user, permissions }: Props) {
                       <div>
                         <div className="flex flex-wrap items-center gap-2">
                           <span className="rounded-full bg-black px-3 py-1 text-xs font-medium text-white">
-                            {item.itemNumber}
+                            {shownNumber}
                           </span>
                           <span className="rounded-full bg-gray-100 px-3 py-1 text-xs text-gray-700">
                             {item.discipline}
@@ -1151,11 +1353,16 @@ export default function AddDataTab({ project, user, permissions }: Props) {
                       </motion.div>
                     ) : null}
                   </AnimatePresence>
-                </motion.div>
+                </ReorderableLineItem>
               )
             })}
-          </div>
+          </Reorder.Group>
         )}
+
+        {/* Keyboard moves are announced; a sighted user sees the row move. */}
+        <p aria-live="polite" className="sr-only">
+          {reorderAnnouncement}
+        </p>
       </div>
 
       {typeof document !== 'undefined'

@@ -137,6 +137,12 @@ export type LineItem = {
   companyName: string
   discipline: ConsultantType | 'Admin'
   itemNumber: string
+  // Migration 0029: the project-wide arrangement people set by dragging in
+  // Add Data. READ ONLY here -- assigned on insert (last) and changed only
+  // through `reorderLineItems` (ship.reorder_line_items). `itemNumber` is
+  // derived from it: within a discipline, lowest sortOrder = <prefix>1, and
+  // numbers renumber gap-free after every reorder or delete.
+  sortOrder: number
   name: string
   shortDescription: string
   /*

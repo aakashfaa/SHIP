@@ -54,6 +54,7 @@ function lineItemRow(overrides: Record<string, unknown> = {}) {
     company_name: 'Acme',
     discipline: 'Mechanical',
     item_number: 'M1',
+    sort_order: 7,
     name: 'Chiller',
     short_description: null,
     category: 'END OF LIFE',
@@ -139,7 +140,8 @@ describe('D-9: line item savings, write direction', () => {
 })
 
 describe('M-11: line item write mapping never sends system columns', () => {
-  const SYSTEM = ['id', 'item_number', 'company_name', 'discipline', 'created_at', 'ecc_amount']
+  // sort_order (0029) is server-owned too: moved only by reorder_line_items.
+  const SYSTEM = ['id', 'item_number', 'sort_order', 'company_name', 'discipline', 'created_at', 'ecc_amount']
   const FILING = ['project_id', 'user_email', 'consultant_type']
 
   test('update of a whole LineItem drops system AND filing columns', () => {
@@ -162,6 +164,12 @@ describe('M-11: line item write mapping never sends system columns', () => {
     assert.equal(row.project_id, 'p1')
     assert.equal(row.user_email, 'a@b.com')
     assert.equal(row.consultant_type, 'Mechanical')
+  })
+
+  test('0029: sort_order is read (as a number) but never written', () => {
+    assert.equal(m.rowToLineItem(lineItemRow({ sort_order: '12' })).sortOrder, 12)
+    assert.equal(m.rowToLineItem(lineItemRow({ sort_order: null })).sortOrder, 0)
+    assert.deepEqual(m.lineItemToUpdateRow({ sortOrder: 3, name: 'n' }), { name: 'n' })
   })
 
   test('deprecated lineItemToRow is the update-safe mapping', () => {

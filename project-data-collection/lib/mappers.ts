@@ -95,6 +95,8 @@ export type LineItemRow = {
   company_name: string | null
   discipline: string
   item_number: string | null
+  // 0029. Server-owned like item_number: never in either write mapping.
+  sort_order: number | string | null
   name: string
   short_description: string | null
   category: string
@@ -265,6 +267,7 @@ export function rowToLineItem(row: LineItemRow): LineItem {
     companyName: row.company_name ?? '',
     discipline: row.discipline as LineItem['discipline'],
     itemNumber: row.item_number ?? '',
+    sortOrder: toNumber(row.sort_order) ?? 0,
     name: row.name,
     shortDescription: row.short_description ?? '',
     category: row.category as LineItem['category'],
@@ -324,6 +327,9 @@ const LINE_ITEM_INSERT_ONLY_COLUMNS: Array<[keyof LineItem, keyof LineItemRow]> 
  *   id, created_at                 database-assigned
  *   item_number                    ship.fill_item_number(); a hand-set number
  *                                  used to brick numbering for a discipline
+ *   sort_order                     0029: set on insert, changed only by
+ *                                  ship.reorder_line_items (store.ts
+ *                                  reorderLineItems)
  *   company_name, discipline       ship.normalize_line_item()
  *   ecc_amount                     ship.sync_line_item_ecc(), derived from
  *                                  estimated_first_cost on every write
