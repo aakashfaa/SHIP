@@ -10,6 +10,7 @@
 
 import { test, describe, before } from 'node:test'
 import assert from 'node:assert/strict'
+import ExcelJS from 'exceljs'
 import * as nodeModule from 'node:module'
 
 import type { ChunkProject, FormField, LineItem } from '../../lib/types.ts'
@@ -357,5 +358,16 @@ describe('Excel export: one fiscal-year sheet per graph', () => {
     assert.equal(long.length, 31)
     assert.equal(excel.graphSheetName('x'.repeat(40), used), `${'x'.repeat(27)} (2)`)
     assert.equal(excel.graphSheetName('   ', used), 'Graph')
+  })
+
+  test('names exceljs would refuse are made safe instead of failing the export', () => {
+    const used = new Set<string>()
+    assert.equal(excel.graphSheetName('History', used), 'History (2)')
+    assert.equal(excel.graphSheetName("'Carbon'", used), 'Carbon')
+    assert.equal(excel.graphSheetName("Owners'", used), 'Owners')
+    assert.equal(excel.graphSheetName("'''", used), 'Graph')
+    // And a real workbook accepts every one of them.
+    const workbook = new ExcelJS.Workbook()
+    for (const name of used) workbook.addWorksheet(name)
   })
 })

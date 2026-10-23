@@ -717,8 +717,10 @@ begin
         using errcode = '22023';
     end if;
 
-    if btrim(coalesce(v_entry ->> 'name', '')) = '' or length(btrim(v_entry ->> 'name')) > 200 then
-      raise exception 'save_version_phases: a phase name must be 1-200 characters' using errcode = '22023';
+    -- Blank is allowed: chunk_phases.name defaults to '' and a version
+    -- copies the live phases as they are.
+    if coalesce(jsonb_typeof(v_entry -> 'name'), '') <> 'string' or length(btrim(v_entry ->> 'name')) > 200 then
+      raise exception 'save_version_phases: a phase name must be text of at most 200 characters' using errcode = '22023';
     end if;
 
     if coalesce(v_entry ->> 'kind', '') not in ('study', 'design', 'construction', 'closeout') then

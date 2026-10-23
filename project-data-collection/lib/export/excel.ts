@@ -105,16 +105,21 @@ function addSheet<T>(
 }
 
 /**
- * A graph's sheet name: its label, made legal for Excel (no []:*?/\, at
- * most 31 characters, unique case-insensitively within the workbook) --
- * "Energy reduction", "Carbon reduction". Records the name in `used`.
+ * A graph's sheet name: its label, made legal for Excel (no []:*?/\, no
+ * apostrophe at either end, at most 31 characters, not the reserved
+ * "History", unique case-insensitively within the workbook) -- "Energy
+ * reduction", "Carbon reduction". Records the name in `used`. exceljs
+ * throws on an illegal name, which would fail the whole export.
  */
 export function graphSheetName(label: string, used: Set<string>): string {
-  const base = label.replace(/[[\]:*?/\\]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 31) || 'Graph'
+  const tidy = (text: string) => text.replace(/^[\s']+|[\s']+$/g, '')
+  const base = tidy(label.replace(/[[\]:*?/\\]/g, ' ').replace(/\s+/g, ' ').slice(0, 31)) || 'Graph'
+  const taken = (candidate: string) =>
+    used.has(candidate.toLowerCase()) || candidate.toLowerCase() === 'history'
   let name = base
-  for (let n = 2; used.has(name.toLowerCase()); n += 1) {
+  for (let n = 2; taken(name); n += 1) {
     const suffix = ` (${n})`
-    name = `${base.slice(0, 31 - suffix.length)}${suffix}`
+    name = `${tidy(base.slice(0, 31 - suffix.length))}${suffix}`
   }
   used.add(name.toLowerCase())
   return name

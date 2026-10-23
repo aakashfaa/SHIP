@@ -57,25 +57,28 @@ select (select p.id from ship.chunk_phases p
        null::uuid as scenario_id;
 grant select, update on t20 to authenticated;
 
+-- Versions (0031) replaced create_scenario / save_scenario_payload /
+-- publish_scenario; a version's phases are saved in months as given.
 select pg_temp.login('admin@gmail.com');
 set local role authenticated;
-update t20 set scenario_id = (ship.create_scenario('federal-campus-master-plan', 'months test')).id;
-select ship.save_scenario_payload(
+update t20 set scenario_id = (ship.create_version('federal-campus-master-plan', 'months test')).id;
+select ship.save_version_phases(
   (select scenario_id from t20),
-  jsonb_build_array(jsonb_build_object('id', (select phase_id from t20)::text,
-                                       'start_slot', 37, 'duration_slots', 13)),
-  '[]'::jsonb);
+  (select jsonb_agg(case when (e ->> 'id')::uuid = (select phase_id from t20)
+                         then e || '{"start_slot": 37, "duration_slots": 13}'::jsonb
+                         else e end)
+     from ship.scenarios s, jsonb_array_elements(s.payload -> 'phases') e
+    where s.id = (select scenario_id from t20)));
 select pg_temp.ok(
   (select (e ->> 'start_slot')::numeric = 37 and (e ->> 'duration_slots')::numeric = 13
      from ship.scenarios s, jsonb_array_elements(s.payload -> 'phases') e
     where s.id = (select scenario_id from t20) and (e ->> 'id')::uuid = (select phase_id from t20)),
-  'D-1 save_scenario_payload stores a 13-month duration as-is');
-select ship.publish_scenario((select scenario_id from t20));
+  'D-1 save_version_phases stores a 13-month duration as-is');
 reset role;
 
 select pg_temp.ok(
-  (select start_slot = 37 and duration_slots = 13 from ship.chunk_phases where id = (select phase_id from t20)),
-  'D-1 publish writes the month values to the live plan');
+  (select not (start_slot = 37 and duration_slots = 13) from ship.chunk_phases where id = (select phase_id from t20)),
+  'D-1 editing another version leaves the live plan alone');
 
 -- ---------------------------------------------------------------- part 2
 

@@ -151,6 +151,8 @@ async function fetchLineItems(
     .from('line_items')
     .select('*')
     .eq('project_id', projectId)
+    // The drag order (0029), which item numbers follow; as lib/store.ts.
+    .order('sort_order', { ascending: true })
     .order('created_at', { ascending: true })
 
   if (error) fail(`Failed to load line items for "${projectId}"`, error)

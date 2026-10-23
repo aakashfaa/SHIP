@@ -484,10 +484,29 @@ export async function updateLineItem(
   return rowToLineItem(data as unknown as LineItemRow)
 }
 
+/**
+ * A delete and a reorder in the same project can deadlock (0029: a DELETE
+ * locks its row before its renumber trigger takes the project lock; a
+ * reorder takes them the other way round). Postgres aborts one with 40P01
+ * and writes nothing, so that one just tries again.
+ */
+async function retryOnDeadlock<T extends { error: { code?: string } | null }>(
+  run: () => PromiseLike<T>
+): Promise<T> {
+  let result = await run()
+  for (let attempt = 1; attempt < 3 && result.error?.code === '40P01'; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 100 * attempt + Math.random() * 100))
+    result = await run()
+  }
+  return result
+}
+
 export async function deleteLineItem(lineItemId: string): Promise<void> {
   const supabase = getSupabaseBrowserClient()
 
-  const { error } = await supabase.from('line_items').delete().eq('id', lineItemId)
+  const { error } = await retryOnDeadlock(() =>
+    supabase.from('line_items').delete().eq('id', lineItemId)
+  )
 
   if (error) fail(`Failed to delete line item "${lineItemId}"`, error)
 }
@@ -509,10 +528,12 @@ export async function reorderLineItems(projectId: string, orderedIds: string[]):
 
   const supabase = getSupabaseBrowserClient()
 
-  const { error } = await supabase.rpc('reorder_line_items', {
-    p_project_id: projectId,
-    p_ordered_ids: orderedIds,
-  })
+  const { error } = await retryOnDeadlock(() =>
+    supabase.rpc('reorder_line_items', {
+      p_project_id: projectId,
+      p_ordered_ids: orderedIds,
+    })
+  )
 
   if (error) fail(`Failed to reorder line items for "${projectId}"`, error)
 }
