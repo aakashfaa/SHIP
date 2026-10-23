@@ -15,6 +15,7 @@ import {
   visibleFormFields,
 } from '@/lib/store'
 import { moveId, previewItemNumbers, sameOrder } from '@/lib/line-item-order'
+import { canPickDiscipline, disciplineChoices } from '@/lib/line-item-discipline'
 import { GripIcon } from './form-builder/shared'
 import { COST_PARSE_MESSAGES, formatCostAmount, parseCostAmount } from '@/lib/costs'
 import { useAsyncData } from '@/lib/useAsyncData'
@@ -912,6 +913,31 @@ export default function AddDataTab({ project, user, permissions }: Props) {
       .filter((type) => type !== consultantType)
   }, [consultantType, project.consultants])
 
+  // Admins and @faainc.com users choose the discipline a new item is filed
+  // under; everyone else files under their own, as before.
+  const pickDiscipline = canPickDiscipline(user, permissions)
+  const disciplineOptions = useMemo(
+    () => disciplineChoices(project, consultantType),
+    [project, consultantType]
+  )
+  // Synergies are "other disciplines", so in the new-item form they are
+  // measured against the discipline picked there.
+  const draftSynergyOptions = useMemo(() => {
+    return project.consultants
+      .map((consultant) => consultant.type)
+      .filter((type) => type.toLowerCase() !== draft.consultantType.toLowerCase())
+  }, [draft.consultantType, project.consultants])
+
+  function pickDraftDiscipline(type: ConsultantType) {
+    setDraft((prev) => ({
+      ...prev,
+      consultantType: type,
+      potentialSynergies: prev.potentialSynergies.filter(
+        (other) => other.toLowerCase() !== type.toLowerCase()
+      ),
+    }))
+  }
+
   const totalSteps = Math.max(steps.length, 1)
   const progress = ((step + 1) / totalSteps) * 100
 
@@ -1424,6 +1450,31 @@ export default function AddDataTab({ project, user, permissions }: Props) {
                               </h4>
 
                               <div className="mt-8 space-y-8">
+                                {pickDiscipline && step === 0 ? (
+                                  <div>
+                                    <label
+                                      htmlFor="new-item-discipline"
+                                      className="block text-sm font-medium text-gray-700"
+                                    >
+                                      Discipline
+                                    </label>
+                                    <select
+                                      id="new-item-discipline"
+                                      value={draft.consultantType}
+                                      onChange={(event) => pickDraftDiscipline(event.target.value)}
+                                      className="mt-2 w-full rounded-2xl border border-gray-300 bg-white px-4 py-3 text-base text-gray-900 outline-none transition focus:border-black"
+                                    >
+                                      {disciplineOptions.map((type) => (
+                                        <option key={type} value={type}>
+                                          {type}
+                                        </option>
+                                      ))}
+                                    </select>
+                                    <p className="mt-1 px-1 text-xs text-gray-500">
+                                      The item is numbered and listed under this discipline.
+                                    </p>
+                                  </div>
+                                ) : null}
                                 <LineItemFields
                                   fields={currentStep.fields}
                                   getValue={(field) => getFieldValue(draft, field)}
@@ -1432,7 +1483,7 @@ export default function AddDataTab({ project, user, permissions }: Props) {
                                     setDraft((prev) => setFieldValue(prev, field, value))
                                   }}
                                   variant="wizard"
-                                  synergyOptions={synergyOptions}
+                                  synergyOptions={draftSynergyOptions}
                                   errorFor={(field) => fieldErrors[`new|${field.id}`]}
                                 />
                               </div>
