@@ -25,13 +25,19 @@ export function canPickDiscipline(user: SafeUser, permissions: ProjectPermission
 
 /**
  * The disciplines offered in the picker: the one the form would have used
- * anyway first, then every discipline on the project's roster, each once
- * (case-insensitively, keeping the roster's spelling).
+ * anyway first, then the project's roster, then every built-in discipline
+ * -- "they should get all options even if people aren't added in there
+ * from that discipline" (owner) -- each once (case-insensitively, keeping
+ * the first spelling seen). The form adds an "Other…" box after these.
  */
-export function disciplineChoices(project: Project, fallback: ConsultantType): ConsultantType[] {
+export function disciplineChoices(
+  project: Project,
+  fallback: ConsultantType,
+  builtins: readonly string[]
+): ConsultantType[] {
   const seen = new Set<string>()
   const out: ConsultantType[] = []
-  for (const type of [fallback, ...project.consultants.map((c) => c.type)]) {
+  for (const type of [fallback, ...project.consultants.map((c) => c.type), ...builtins]) {
     const key = type.trim().toLowerCase()
     if (!key || key === 'admin' || seen.has(key)) continue
     seen.add(key)

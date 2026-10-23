@@ -25,7 +25,7 @@ test('isFaaEmail matches the domain only', () => {
   assert.equal(isFaaEmail('x@faainc.com.evil.io'), false)
 })
 
-test('choices: the default first, then the roster, each once', () => {
+test('choices: the default first, then the roster, then every built-in, each once', () => {
   const project = {
     consultants: [
       { type: 'Mechanical', orgName: '', emails: [] },
@@ -33,5 +33,10 @@ test('choices: the default first, then the roster, each once', () => {
       { type: 'Civil', orgName: '', emails: [] },
     ],
   } as unknown as Project
-  assert.deepEqual(disciplineChoices(project, 'Architecture'), ['Architecture', 'Mechanical', 'Civil'])
+  assert.deepEqual(disciplineChoices(project, 'Architecture', ['Architecture', 'Civil', 'Plumbing']), [
+    'Architecture',
+    'Mechanical',
+    'Civil',
+    'Plumbing',
+  ])
 })

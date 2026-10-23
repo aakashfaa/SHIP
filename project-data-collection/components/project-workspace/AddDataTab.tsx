@@ -18,6 +18,7 @@ import { moveId, previewItemNumbers, sameOrder } from '@/lib/line-item-order'
 import { canPickDiscipline, disciplineChoices } from '@/lib/line-item-discipline'
 import { GripIcon } from './form-builder/shared'
 import { COST_PARSE_MESSAGES, formatCostAmount, parseCostAmount } from '@/lib/costs'
+import { CONSULTANT_TYPES, customDisciplineError, normalizeDisciplineName } from '@/lib/constants'
 import { useAsyncData } from '@/lib/useAsyncData'
 import {
   blankValueForField,
@@ -244,6 +245,12 @@ const BASE_FIELD_DEFAULTS: Omit<DraftLineItem, 'projectId' | 'userEmail' | 'cons
  * person in charge here", which is the question a default on THIS project's
  * form should be asking.
  */
+/** The discipline picker's "Other…" entry. No discipline can carry this
+ *  value: customDisciplineError() refuses control characters. */
+const OTHER_DISCIPLINE = '\u0000other'
+/** Room to type past the 60-character limit so the error can say so. */
+const MAX_OTHER_DISCIPLINE_INPUT = 80
+
 function getUserConsultantType(
   project: Project,
   user: SafeUser,
@@ -917,9 +924,11 @@ export default function AddDataTab({ project, user, permissions }: Props) {
   // under; everyone else files under their own, as before.
   const pickDiscipline = canPickDiscipline(user, permissions)
   const disciplineOptions = useMemo(
-    () => disciplineChoices(project, consultantType),
+    () => disciplineChoices(project, consultantType, CONSULTANT_TYPES),
     [project, consultantType]
   )
+  // Non-null while "Other…" is chosen: what is typed in its box.
+  const [otherDiscipline, setOtherDiscipline] = useState<string | null>(null)
   // Synergies are "other disciplines", so in the new-item form they are
   // measured against the discipline picked there.
   const draftSynergyOptions = useMemo(() => {
@@ -927,6 +936,12 @@ export default function AddDataTab({ project, user, permissions }: Props) {
       .map((consultant) => consultant.type)
       .filter((type) => type.toLowerCase() !== draft.consultantType.toLowerCase())
   }, [draft.consultantType, project.consultants])
+
+  /** The typed discipline's problem, if "Other…" is chosen; else null. */
+  function otherDisciplineError(): string | null {
+    if (otherDiscipline === null) return null
+    return customDisciplineError(normalizeDisciplineName(otherDiscipline), [])
+  }
 
   function pickDraftDiscipline(type: ConsultantType) {
     setDraft((prev) => ({
@@ -943,6 +958,7 @@ export default function AddDataTab({ project, user, permissions }: Props) {
 
   function openCreateFlow() {
     setDraft(makeInitialDraft(project, user, permissions, fields))
+    setOtherDiscipline(null)
     setStep(0)
     setActionError(null)
     setIsCreating(true)
@@ -973,6 +989,11 @@ export default function AddDataTab({ project, user, permissions }: Props) {
   }
 
   function goNext() {
+    const disciplineError = step === 0 ? otherDisciplineError() : null
+    if (disciplineError) {
+      setActionError(disciplineError)
+      return
+    }
     const stepFields = steps[step]?.fields ?? []
     const getValue = (field: FormField) => getFieldValue(draft, field)
     const formatErrors = findFormatErrors(stepFields, getValue)
@@ -1069,6 +1090,12 @@ export default function AddDataTab({ project, user, permissions }: Props) {
   }
 
   async function saveLineItem() {
+    const disciplineError = otherDisciplineError()
+    if (disciplineError) {
+      setStep(0)
+      setActionError(disciplineError)
+      return
+    }
     const getValue = (field: FormField) => getFieldValue(draft, field)
     const formatErrors = findFormatErrors(visibleFields, getValue)
     setScopeErrors('new', formatErrors)
@@ -1460,8 +1487,17 @@ export default function AddDataTab({ project, user, permissions }: Props) {
                                     </label>
                                     <select
                                       id="new-item-discipline"
-                                      value={draft.consultantType}
-                                      onChange={(event) => pickDraftDiscipline(event.target.value)}
+                                      value={otherDiscipline !== null ? OTHER_DISCIPLINE : draft.consultantType}
+                                      onChange={(event) => {
+                                        const value = event.target.value
+                                        if (value === OTHER_DISCIPLINE) {
+                                          setOtherDiscipline('')
+                                          pickDraftDiscipline('')
+                                        } else {
+                                          setOtherDiscipline(null)
+                                          pickDraftDiscipline(value)
+                                        }
+                                      }}
                                       className="mt-2 w-full rounded-2xl border border-gray-300 bg-white px-4 py-3 text-base text-gray-900 outline-none transition focus:border-black"
                                     >
                                       {disciplineOptions.map((type) => (
@@ -1469,7 +1505,23 @@ export default function AddDataTab({ project, user, permissions }: Props) {
                                           {type}
                                         </option>
                                       ))}
+                                      <option value={OTHER_DISCIPLINE}>Other…</option>
                                     </select>
+                                    {otherDiscipline !== null ? (
+                                      <input
+                                        aria-label="Other discipline"
+                                        autoFocus
+                                        maxLength={MAX_OTHER_DISCIPLINE_INPUT}
+                                        placeholder="Type the discipline, e.g. Acoustics"
+                                        value={otherDiscipline}
+                                        onChange={(event) => {
+                                          setOtherDiscipline(event.target.value)
+                                          setActionError(null)
+                                          pickDraftDiscipline(normalizeDisciplineName(event.target.value))
+                                        }}
+                                        className="mt-2 w-full rounded-2xl border border-gray-300 bg-white px-4 py-3 text-base text-gray-900 outline-none transition focus:border-black"
+                                      />
+                                    ) : null}
                                     <p className="mt-1 px-1 text-xs text-gray-500">
                                       The item is numbered and listed under this discipline.
                                     </p>
