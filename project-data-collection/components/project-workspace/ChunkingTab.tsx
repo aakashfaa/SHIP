@@ -1,6 +1,7 @@
 'use client'
 
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { Reorder, useDragControls } from 'framer-motion'
 import {
   addLineItemToChunkProject,
   addLineItemsToChunkProject,
@@ -14,6 +15,7 @@ import {
   getPhaseDependenciesForProject,
   getPhaseTemplates,
   removeLineItemFromChunkProject,
+  reorderPackages,
   replaceChunkPhases,
   updateChunkProject,
   updateChunkProjectItemQuantity,
@@ -59,6 +61,12 @@ import {
   resolveProjectTemplate,
 } from '@/components/project-workspace/cost-model/phase-layout'
 import type { ProjectPermissions } from '@/lib/project-role'
+import {
+  PACKAGE_NUMBER_MAX_LENGTH,
+  moveItem,
+  sameOrder,
+  validatePackageNumber,
+} from '@/lib/package-order'
 
 type Props = {
   project: Project
@@ -179,6 +187,7 @@ export default function ChunkingTab({ project, permissions }: Props) {
 
   const {
     data: chunkProjects,
+    setData: setChunkProjects,
     loading: chunkProjectsLoading,
     error: chunkProjectsError,
     reload: reloadChunks,
@@ -250,6 +259,15 @@ export default function ChunkingTab({ project, permissions }: Props) {
   const [expandedChunkId, setExpandedChunkId] = useState<string | null>(null)
   const [editingChunkId, setEditingChunkId] = useState<string | null>(null)
   const [editingName, setEditingName] = useState('')
+  // Rename edits the number too (0030). The inline error covers both a
+  // client-side check (blank / duplicate) and the server's answer.
+  const [editingNumber, setEditingNumber] = useState('')
+  const [editError, setEditError] = useState<string | null>(null)
+  // Package order (drag handle / arrow keys). Saves run one after another
+  // so a quick run of key presses lands in the order it was pressed.
+  const orderSaveChain = useRef<Promise<void>>(Promise.resolve())
+  const dragStartOrder = useRef<string[] | null>(null)
+  const [orderAnnouncement, setOrderAnnouncement] = useState('')
   const [isCreatingChunk, setIsCreatingChunk] = useState(false)
   const [deletingChunkId, setDeletingChunkId] = useState<string | null>(null)
   // Two-step inline confirm (no window.confirm): first click arms, second deletes.
@@ -284,6 +302,13 @@ export default function ChunkingTab({ project, permissions }: Props) {
   useEffect(() => {
     lineItemsRef.current = allLineItems
   }, [allLineItems])
+
+  // The order as last rendered, so a drag-end handler created mid-drag
+  // reads the order the drag finished on.
+  const chunkProjectsRef = useRef(chunkProjects)
+  useEffect(() => {
+    chunkProjectsRef.current = chunkProjects
+  }, [chunkProjects])
 
   const isMountedRef = useRef(true)
   const quantityTimers = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map())
@@ -440,6 +465,8 @@ export default function ChunkingTab({ project, permissions }: Props) {
       if (editingChunkId === chunkId) {
         setEditingChunkId(null)
         setEditingName('')
+        setEditingNumber('')
+        setEditError(null)
       }
     } catch (err) {
       if (!isMountedRef.current) return
@@ -452,26 +479,99 @@ export default function ChunkingTab({ project, permissions }: Props) {
   function handleStartEdit(chunk: ChunkProject) {
     setEditingChunkId(chunk.id)
     setEditingName(chunk.name)
+    setEditingNumber(chunk.chunkNumber)
+    setEditError(null)
   }
 
-  async function handleSaveEdit(chunkId: string) {
-    if (!editingName.trim()) return
+  function handleCancelEdit() {
+    setEditingChunkId(null)
+    setEditingName('')
+    setEditingNumber('')
+    setEditError(null)
+  }
+
+  /**
+   * Saves the package's number and name. The number is free text, unique
+   * within the project; changing it renumbers nothing else, and nothing is
+   * linked by it (items, phases and dependencies use the package id).
+   */
+  async function handleSaveEdit(chunk: ChunkProject) {
+    const name = editingName.trim()
+    if (!name) {
+      setEditError('Enter a package name.')
+      return
+    }
+    const numberError = validatePackageNumber(editingNumber, chunkProjects, chunk.id)
+    if (numberError) {
+      setEditError(numberError)
+      return
+    }
+    const number = editingNumber.trim()
+
+    const updates: Partial<ChunkProject> = {}
+    if (name !== chunk.name) updates.name = name
+    if (number !== chunk.chunkNumber) updates.chunkNumber = number
 
     setActionError(null)
-    setSavingEditChunkId(chunkId)
+    setEditError(null)
+    setSavingEditChunkId(chunk.id)
     try {
-      await updateChunkProject(chunkId, { name: editingName.trim() })
+      if (Object.keys(updates).length > 0) await updateChunkProject(chunk.id, updates)
       if (!isMountedRef.current) return
 
       reloadChunks()
-      setEditingChunkId(null)
-      setEditingName('')
+      handleCancelEdit()
     } catch (err) {
       if (!isMountedRef.current) return
-      setActionError(err instanceof Error ? err.message : 'Failed to rename package.')
+      setEditError(err instanceof Error ? err.message : 'Failed to rename package.')
     } finally {
       if (isMountedRef.current) setSavingEditChunkId(null)
     }
+  }
+
+  /* ------------------------------------------------------ package order -- */
+
+  /** Shows `next` at once and saves it in the background. A failed save
+   *  reloads the real order and says why. */
+  function commitOrder(next: readonly ChunkProject[]) {
+    const ordered = next.map((chunk, index) =>
+      chunk.sortOrder === index ? chunk : { ...chunk, sortOrder: index }
+    )
+    setChunkProjects(ordered)
+    const ids = ordered.map((chunk) => chunk.id)
+    orderSaveChain.current = orderSaveChain.current.then(async () => {
+      try {
+        await reorderPackages(project.id, ids)
+      } catch (err) {
+        if (!isMountedRef.current) return
+        setActionError(err instanceof Error ? err.message : 'Failed to reorder packages.')
+        reloadChunks()
+      }
+    })
+  }
+
+  function handleMovePackage(chunkId: string, delta: -1 | 1) {
+    const from = chunkProjects.findIndex((chunk) => chunk.id === chunkId)
+    if (from < 0) return
+    const next = moveItem(chunkProjects, from, from + delta)
+    if (next === chunkProjects) return
+    setOrderAnnouncement(
+      `${chunkProjects[from].chunkNumber} moved to position ${from + delta + 1} of ${chunkProjects.length}.`
+    )
+    commitOrder(next)
+  }
+
+  function handleDragStart() {
+    dragStartOrder.current = chunkProjects.map((chunk) => chunk.id)
+  }
+
+  function handleDragEnd() {
+    const before = dragStartOrder.current
+    dragStartOrder.current = null
+    if (!before) return
+    const current = chunkProjectsRef.current
+    if (sameOrder(before, current.map((chunk) => chunk.id))) return
+    commitOrder(current)
   }
 
   async function handleAddLineItem(chunkId: string, lineItemId: string) {
@@ -785,8 +885,14 @@ export default function ChunkingTab({ project, permissions }: Props) {
           {chunkProjectsLoading ? 'Loading packages…' : 'No packages'}
         </div>
       ) : (
-        <div className="space-y-5">
-          {chunkProjects.map((chunk) => {
+        <Reorder.Group
+          as="div"
+          axis="y"
+          values={chunkProjects}
+          onReorder={setChunkProjects}
+          className="space-y-5"
+        >
+          {chunkProjects.map((chunk, chunkIndex) => {
             const expanded = expandedChunkId === chunk.id
             const linkedItems = chunk.itemLinks
               .map((link) => ({
@@ -845,9 +951,19 @@ export default function ChunkingTab({ project, permissions }: Props) {
             )
 
             return (
-              <div
+              <ReorderablePackage
                 key={chunk.id}
-                className="overflow-hidden rounded-[2rem] border border-white/80 bg-white/82 shadow-[0_24px_80px_rgba(15,23,42,0.10)] backdrop-blur-xl"
+                chunk={chunk}
+                index={chunkIndex}
+                count={chunkProjects.length}
+                show={canEdit || permissionsLoading}
+                enabled={canEdit && editingChunkId === null}
+                onDragStart={handleDragStart}
+                onDragEnd={handleDragEnd}
+                onMove={(delta) => handleMovePackage(chunk.id, delta)}
+              >
+              <div
+                className="min-w-0 flex-1 overflow-hidden rounded-[2rem] border border-white/80 bg-white/82 shadow-[0_24px_80px_rgba(15,23,42,0.10)] backdrop-blur-xl"
               >
                 <div className="border-b border-slate-100 bg-[linear-gradient(135deg,rgba(255,255,255,0.92)_0%,rgba(248,250,252,0.92)_45%,rgba(224,242,254,0.86)_100%)] px-6 py-5">
                   <div className="flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between">
@@ -865,32 +981,73 @@ export default function ChunkingTab({ project, permissions }: Props) {
                       </div>
 
                       {editingChunkId === chunk.id ? (
-                        <div className="flex flex-wrap items-center gap-2">
-                          <input
-                            value={editingName}
-                            onChange={(e) => setEditingName(e.target.value)}
-                            className="min-w-[280px] rounded-[1rem] border border-slate-200 bg-white px-4 py-2.5 text-sm outline-none focus:border-teal-500"
-                          />
-                          <button
-                            type="button"
-                            onClick={() => handleSaveEdit(chunk.id)}
-                            disabled={savingEditChunkId === chunk.id}
-                            className="rounded-[1rem] bg-slate-950 px-4 py-2.5 text-sm font-medium text-white disabled:cursor-not-allowed disabled:opacity-50"
-                          >
-                            {savingEditChunkId === chunk.id ? 'Saving…' : 'Save'}
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setEditingChunkId(null)
-                              setEditingName('')
-                            }}
-                            disabled={savingEditChunkId === chunk.id}
-                            className="rounded-[1rem] border border-slate-200 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 disabled:cursor-not-allowed disabled:opacity-50"
-                          >
-                            Cancel
-                          </button>
-                        </div>
+                        <form
+                          aria-label={`Rename package ${chunk.chunkNumber}`}
+                          className="space-y-2"
+                          onSubmit={(e) => {
+                            e.preventDefault()
+                            void handleSaveEdit(chunk)
+                          }}
+                        >
+                          <div className="flex flex-wrap items-end gap-2">
+                            <label className="flex flex-col gap-1 text-xs font-medium text-slate-600">
+                              Number
+                              <input
+                                value={editingNumber}
+                                onChange={(e) => {
+                                  setEditingNumber(e.target.value)
+                                  setEditError(null)
+                                }}
+                                maxLength={PACKAGE_NUMBER_MAX_LENGTH}
+                                aria-invalid={editError !== null}
+                                aria-describedby={
+                                  editError ? `package-edit-error-${chunk.id}` : undefined
+                                }
+                                autoFocus
+                                className="w-32 rounded-[1rem] border border-slate-200 bg-white px-4 py-2.5 text-sm text-slate-950 outline-none focus:border-teal-500"
+                              />
+                            </label>
+                            <label className="flex flex-col gap-1 text-xs font-medium text-slate-600">
+                              Name
+                              <input
+                                value={editingName}
+                                onChange={(e) => {
+                                  setEditingName(e.target.value)
+                                  setEditError(null)
+                                }}
+                                aria-invalid={editError !== null}
+                                aria-describedby={
+                                  editError ? `package-edit-error-${chunk.id}` : undefined
+                                }
+                                className="min-w-[280px] rounded-[1rem] border border-slate-200 bg-white px-4 py-2.5 text-sm text-slate-950 outline-none focus:border-teal-500"
+                              />
+                            </label>
+                            <button
+                              type="submit"
+                              disabled={savingEditChunkId === chunk.id}
+                              className="rounded-[1rem] bg-slate-950 px-4 py-2.5 text-sm font-medium text-white disabled:cursor-not-allowed disabled:opacity-50"
+                            >
+                              {savingEditChunkId === chunk.id ? 'Saving…' : 'Save'}
+                            </button>
+                            <button
+                              type="button"
+                              onClick={handleCancelEdit}
+                              disabled={savingEditChunkId === chunk.id}
+                              className="rounded-[1rem] border border-slate-200 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 disabled:cursor-not-allowed disabled:opacity-50"
+                            >
+                              Cancel
+                            </button>
+                          </div>
+                          {editError ? (
+                            <p
+                              id={`package-edit-error-${chunk.id}`}
+                              role="alert"
+                              className="text-sm font-medium text-rose-700"
+                            >
+                              {editError}
+                            </p>
+                          ) : null}
+                        </form>
                       ) : (
                         <div className="text-2xl font-semibold tracking-tight text-slate-950">
                           {chunk.name}
@@ -1334,10 +1491,14 @@ export default function ChunkingTab({ project, permissions }: Props) {
                   </div>
                 ) : null}
               </div>
+              </ReorderablePackage>
             )
           })}
-        </div>
+        </Reorder.Group>
       )}
+      <div role="status" aria-live="polite" className="sr-only">
+        {orderAnnouncement}
+      </div>
 
       <Modal
         open={isCreateDialogOpen}
@@ -1495,5 +1656,88 @@ export default function ChunkingTab({ project, permissions }: Props) {
         </div>
       </Modal>
     </div>
+  )
+}
+
+/**
+ * One package in the Packaging list, draggable by its handle only (the card
+ * itself is full of inputs and buttons, so a whole-card drag would fight
+ * them). The handle sits on the left of the card; with keyboard focus,
+ * Arrow Up / Arrow Down move the package one place. The order is
+ * `chunk_projects.sort_order` (0030) and is independent of the package
+ * number.
+ *
+ * `show` keeps the handle's slot while permissions load (disabled), so an
+ * editor sees it enable rather than pop in; viewers and consultants get no
+ * handle at all.
+ */
+function ReorderablePackage({
+  chunk,
+  index,
+  count,
+  show,
+  enabled,
+  onDragStart,
+  onDragEnd,
+  onMove,
+  children,
+}: {
+  chunk: ChunkProject
+  index: number
+  count: number
+  show: boolean
+  enabled: boolean
+  onDragStart: () => void
+  onDragEnd: () => void
+  onMove: (delta: -1 | 1) => void
+  children: ReactNode
+}) {
+  const controls = useDragControls()
+
+  return (
+    <Reorder.Item
+      as="div"
+      value={chunk}
+      dragListener={false}
+      dragControls={controls}
+      onDragEnd={onDragEnd}
+      className="relative flex items-start gap-2"
+    >
+      {show ? (
+        <button
+          type="button"
+          disabled={!enabled}
+          aria-label={`Reorder package ${chunk.chunkNumber}, position ${index + 1} of ${count}. Use the arrow keys to move it.`}
+          title="Drag to reorder (or focus and use the arrow keys)"
+          onPointerDown={(event) => {
+            if (!enabled) return
+            event.preventDefault()
+            onDragStart()
+            controls.start(event)
+          }}
+          onKeyDown={(event) => {
+            if (!enabled) return
+            if (event.key === 'ArrowUp' && index > 0) {
+              event.preventDefault()
+              onMove(-1)
+            } else if (event.key === 'ArrowDown' && index < count - 1) {
+              event.preventDefault()
+              onMove(1)
+            }
+          }}
+          className="mt-6 flex h-10 w-7 shrink-0 cursor-grab touch-none items-center justify-center rounded-lg border border-slate-200 bg-white/80 text-slate-400 transition hover:border-slate-300 hover:text-slate-700 focus-visible:outline-2 focus-visible:outline-teal-500 active:cursor-grabbing disabled:cursor-not-allowed disabled:opacity-40"
+        >
+          <svg aria-hidden="true" width="10" height="16" viewBox="0 0 10 16" fill="currentColor">
+            <circle cx="2" cy="2" r="1.5" />
+            <circle cx="8" cy="2" r="1.5" />
+            <circle cx="2" cy="8" r="1.5" />
+            <circle cx="8" cy="8" r="1.5" />
+            <circle cx="2" cy="14" r="1.5" />
+            <circle cx="8" cy="14" r="1.5" />
+          </svg>
+        </button>
+      ) : null}
+      {children}
+    </Reorder.Item>
   )
 }

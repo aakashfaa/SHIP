@@ -539,7 +539,10 @@ export async function getChunkProjectsForProject(projectId: string): Promise<Chu
     .from('chunk_projects')
     .select(CHUNK_SELECT)
     .eq('project_id', projectId)
+    // User-owned order (0030); same ORDER BY as lib/package-order.ts.
+    .order('sort_order', { ascending: true })
     .order('created_at', { ascending: true })
+    .order('id', { ascending: true })
 
   if (error) fail(`Failed to load chunk projects for "${projectId}"`, error)
 
@@ -552,7 +555,8 @@ export async function createChunkProject(input: {
 }): Promise<ChunkProject> {
   const supabase = getSupabaseBrowserClient()
 
-  // `chunk_number` is assigned by a trigger.
+  // `chunk_number` (next free PP number) and `sort_order` (last) are
+  // assigned by a trigger (0030).
   const { data, error } = await supabase
     .from('chunk_projects')
     .insert({ project_id: input.projectId, name: input.name.trim() })
@@ -572,6 +576,8 @@ export async function updateChunkProject(
 
   const row: Record<string, unknown> = {}
   if (updates.name !== undefined) row.name = updates.name
+  // Free text since 0030; the trigger trims it and refuses a blank one.
+  if (updates.chunkNumber !== undefined) row.chunk_number = updates.chunkNumber.trim()
 
   if (updates.timelineSegments !== undefined) {
     const segments = normalizeTimelineSegments(
@@ -598,10 +604,33 @@ export async function updateChunkProject(
     .select(CHUNK_SELECT)
     .maybeSingle()
 
-  if (error) fail(`Failed to update chunk project "${chunkId}"`, error)
+  if (error) {
+    // The unique (project_id, chunk_number) constraint: say it in words.
+    if (error.code === '23505' && row.chunk_number !== undefined) {
+      throw new Error(`${String(row.chunk_number)} is already used by another package in this project.`)
+    }
+    fail(`Failed to update chunk project "${chunkId}"`, error)
+  }
   if (!data) return null
 
   return rowToChunkProject(data as unknown as ChunkProjectRow)
+}
+
+/**
+ * Saves the display order of a project's packages (0030
+ * ship.reorder_chunk_projects): `orderedIds` take positions 0..n-1. Admins
+ * and editors only; the RPC refuses anyone else with 42501. Numbers are
+ * not touched.
+ */
+export async function reorderPackages(projectId: string, orderedIds: string[]): Promise<void> {
+  const supabase = getSupabaseBrowserClient()
+
+  const { error } = await supabase.rpc('reorder_chunk_projects', {
+    p_project_id: projectId,
+    p_ordered_ids: orderedIds,
+  })
+
+  if (error) fail('Failed to reorder packages', error)
 }
 
 export async function deleteChunkProject(chunkId: string): Promise<void> {
