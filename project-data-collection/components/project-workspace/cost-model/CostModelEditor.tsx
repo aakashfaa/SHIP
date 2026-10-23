@@ -11,19 +11,42 @@ import {
   getPhaseTemplates,
   getProjectGraphs,
   replaceChunkPhases,
+  saveVersionCostSettings,
+  saveVersionPhases,
   setEscalationRateOverride,
   updateCostSettingsForProject,
   updateProjectGraph,
 } from '@/lib/store'
 import { useAsyncData } from '@/lib/useAsyncData'
 import type {
+  ChunkPhase,
   ChunkProject,
   PhaseTemplate,
   ProjectCostSettings,
   ProjectGraph,
+  Scenario,
+  ScenarioPhase,
 } from '@/lib/types'
 import { layoutTemplatePhases, packageStartMonth } from './phase-layout'
 import { GraphColorPicker } from '../timeline/GraphSetup'
+
+/**
+ * The version whose cost model this popup edits (migration 0031: "Each
+ * version can have a different cost model"). `scenarioId` null = the
+ * version held in the ordinary tables, edited exactly as before; any other
+ * id = that version's payload, through ship.save_version_cost_settings /
+ * save_version_phases. Energy settings are project-wide and always go to
+ * the tables.
+ */
+export type CostModelVersion = {
+  name: string
+  scenarioId: string | null
+  /** The version's phases as the Timeline shows them (for a template
+   *  re-apply: each package keeps its place in THIS version). */
+  phases: ChunkPhase[]
+  /** The server's copy of the version after each write. */
+  onSaved: (scenario: Scenario) => void
+}
 
 /**
  * Where the numbers behind the numbers live.
@@ -66,6 +89,11 @@ type Props = {
   /** Opens the Timeline's graph setup (where energy's unit, baseline and
    *  interaction factor now live, migration 0032). Omit for read-only. */
   onOpenGraphSetup?: () => void
+  /** Which version's cost model to edit; absent = the one in the tables. */
+  version?: CostModelVersion
+  /** That version's cost model as the Timeline prices it (its starting
+   *  point here when it is not the one in the tables). */
+  versionCostRow?: ProjectCostSettings | null
 }
 
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
@@ -88,14 +116,20 @@ export default function CostModelEditor({
   onSaved,
   onStatus,
   onOpenGraphSetup,
+  version,
+  versionCostRow = null,
 }: Props) {
+  const versionScenarioId = version?.scenarioId ?? null
   const {
     data: costRow,
     setData: setCostRow,
     error: costError,
   } = useAsyncData<ProjectCostSettings | null>(
-    () => getCostSettingsForProject(projectId),
-    [projectId],
+    // Another version's cost model lives in its payload, which the Timeline
+    // has already loaded and overlaid; start from that.
+    () =>
+      versionScenarioId ? Promise.resolve(versionCostRow) : getCostSettingsForProject(projectId),
+    [projectId, versionScenarioId],
     null
   )
 
@@ -128,6 +162,7 @@ export default function CostModelEditor({
   const [templateBusy, setTemplateBusy] = useState<string | null>(null)
 
   const isMountedRef = useRef(true)
+  const versionRef = useRef(version)
   const onSavedRef = useRef(onSaved)
   const onStatusRef = useRef(onStatus)
   const costTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -143,6 +178,34 @@ export default function CostModelEditor({
   useEffect(() => {
     onSavedRef.current = onSaved
   }, [onSaved])
+  useEffect(() => {
+    versionRef.current = version
+  }, [version])
+
+  /** A cost-settings write to whichever version is open (0031). */
+  function writeCost(payload: Partial<ProjectCostSettings>): Promise<unknown> {
+    const target = versionRef.current
+    if (target?.scenarioId) {
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      const { projectId: _ignored, rateOverrides: _overrides, ...settings } = payload
+      return saveVersionCostSettings(target.scenarioId, settings, null).then((saved) =>
+        target.onSaved(saved)
+      )
+    }
+    return updateCostSettingsForProject(projectId, payload)
+  }
+
+  /** The complete override list, written to the open version. */
+  function writeOverrides(
+    next: ProjectCostSettings['rateOverrides']
+  ): Promise<ProjectCostSettings['rateOverrides']> {
+    const target = versionRef.current
+    if (!target?.scenarioId) throw new Error('Not a version')
+    return saveVersionCostSettings(target.scenarioId, null, next).then((saved) => {
+      target.onSaved(saved)
+      return next
+    })
+  }
   useEffect(() => {
     onStatusRef.current = onStatus
   }, [onStatus])
@@ -197,11 +260,7 @@ export default function CostModelEditor({
         const payload = pendingCostRef.current
         pendingCostRef.current = {}
         if (Object.keys(payload).length > 0) {
-          void trackWrite(
-            'cost',
-            updateCostSettingsForProject(projectId, payload),
-            'Failed to save cost settings.'
-          )
+          void trackWrite('cost', writeCost(payload), 'Failed to save cost settings.')
         }
       }
       reportStatus()
@@ -223,11 +282,7 @@ export default function CostModelEditor({
       costTimerRef.current = null
       const payload = pendingCostRef.current
       pendingCostRef.current = {}
-      void trackWrite(
-        'cost',
-        updateCostSettingsForProject(projectId, payload),
-        'Failed to save cost settings.'
-      )
+      void trackWrite('cost', writeCost(payload), 'Failed to save cost settings.')
     }, PERSIST_DEBOUNCE_MS)
     reportStatus()
   }
@@ -272,6 +327,24 @@ export default function CostModelEditor({
     const rate = Number.parseFloat(overrideRate)
     if (!Number.isFinite(year) || year < 0 || !Number.isFinite(rate) || rate < 0) return
 
+    if (versionScenarioId && costRow) {
+      const next = [
+        ...costRow.rateOverrides.filter((o) => o.yearOffset !== year),
+        { yearOffset: year, ratePercent: rate },
+      ].sort((a, b) => a.yearOffset - b.yearOffset)
+      void trackWrite(
+        'override',
+        writeOverrides(next).then((saved) => {
+          if (!isMountedRef.current) return
+          setCostRow((prev) => (prev ? { ...prev, rateOverrides: saved } : prev))
+          setOverrideYear('')
+          setOverrideRate('')
+        }),
+        'Failed to save the override.'
+      )
+      return
+    }
+
     void trackWrite(
       'override',
       setEscalationRateOverride(projectId, year, rate)
@@ -288,6 +361,19 @@ export default function CostModelEditor({
 
   function handleRemoveOverride(yearOffset: number) {
     if (readOnly) return
+    if (versionScenarioId && costRow) {
+      const next = costRow.rateOverrides.filter((o) => o.yearOffset !== yearOffset)
+      void trackWrite(
+        'override',
+        writeOverrides(next).then((saved) => {
+          if (isMountedRef.current) {
+            setCostRow((prev) => (prev ? { ...prev, rateOverrides: saved } : prev))
+          }
+        }),
+        'Failed to remove the override.'
+      )
+      return
+    }
     void trackWrite(
       'override',
       clearEscalationRateOverride(projectId, yearOffset)
@@ -330,7 +416,7 @@ export default function CostModelEditor({
     setCostRow((prev) => (prev ? { ...prev, defaultPhaseTemplateId: templateId } : prev))
     return trackWrite(
       'cost',
-      updateCostSettingsForProject(projectId, { defaultPhaseTemplateId: templateId }),
+      writeCost({ defaultPhaseTemplateId: templateId }),
       'Failed to save the phase template.'
     )
   }
@@ -342,6 +428,32 @@ export default function CostModelEditor({
     // No point re-phasing every package to a template the project did not
     // keep; the status line already shows why.
     if (!(await saveTemplateChoice(templateId))) return
+
+    // Another version (0031): every package is re-phased inside that version
+    // in ONE save -- all or nothing -- each keeping its place in it. The
+    // phases are new, so they get new ids; the live rows are untouched.
+    const target = versionRef.current
+    if (target?.scenarioId) {
+      const scenarioId = target.scenarioId
+      const next: ScenarioPhase[] = packages.flatMap((pkg) => {
+        const start = packageStartMonth(target.phases.filter((p) => p.chunkProjectId === pkg.id))
+        return layoutTemplatePhases(template, start).map((seed) => ({
+          ...seed,
+          id: crypto.randomUUID(),
+          chunkProjectId: pkg.id,
+        }))
+      })
+      if (isMountedRef.current) setTemplateBusy(`${packages.length}/${packages.length}`)
+      const ok = await trackWrite(
+        'template',
+        saveVersionPhases(scenarioId, next).then((saved) => target.onSaved(saved)),
+        'Failed to apply the phase template.'
+      )
+      if (!isMountedRef.current) return
+      setTemplateBusy(null)
+      if (!ok) setTemplateFailed({ templateId, packages })
+      return
+    }
 
     const failed: ChunkProject[] = []
     let firstError = ''
@@ -473,7 +585,9 @@ export default function CostModelEditor({
                 {templates.find((t) => t.id === templateConfirm.templateId)?.name ?? 'this template'}
               </span>{' '}
               to all {templateConfirm.packages.length} package
-              {templateConfirm.packages.length === 1 ? '' : 's'}? Their phases are replaced; what-if moves on them are discarded.
+              {templateConfirm.packages.length === 1 ? '' : 's'}
+              {versionScenarioId ? ` in ${version?.name ?? 'this version'}` : ''}? Their phases
+              in this version are replaced; other versions are not touched.
             </span>
             <span className="flex gap-2">
               <button

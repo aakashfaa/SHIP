@@ -48,11 +48,11 @@ type ColumnSpec<T> = {
 
 /**
  * One line above the header on every sheet when the workbook needs to say
- * something the numbers can't: which what-if it prices (M-24 -- a scenario
- * workbook must never pass for the live plan once it is detached from the
- * app), and any unreadable costs/quantities counted as zero (M-09/M-10).
+ * something the numbers can't: which version it prices (M-24, migration 0031
+ * -- a workbook of one of several versions must never pass for another once
+ * it is detached from the app), and any unreadable costs/quantities counted as zero (M-09/M-10).
  * Sheet NAMES stay fixed ("Packages", ...) -- Excel forbids ':' in them and
- * caps them at 31 characters, so "Scenario: X" can't go there; it goes in
+ * caps them at 31 characters, so "Version: X" can't go there; it goes in
  * this banner, the workbook title and the file name instead.
  */
 function bannerText(data: ProjectReportData): string | null {
@@ -124,8 +124,8 @@ export function buildExcelWorkbook(data: ProjectReportData): ExcelJS.Workbook {
   const workbook = new ExcelJS.Workbook()
   workbook.creator = 'SHIP'
   workbook.created = new Date(data.generatedAt)
-  workbook.title = data.scenario
-    ? `${data.project.name} — scenario: ${data.scenario.name} — export`
+  workbook.title = data.version.isOneOfSeveral
+    ? `${data.project.name} — version: ${data.version.name} — export`
     : `${data.project.name} — export`
 
   const banner = bannerText(data)

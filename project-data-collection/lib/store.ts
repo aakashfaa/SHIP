@@ -50,9 +50,10 @@ import {
   rowToProject,
   rowToScenario,
   rowToTimelineSettings,
-  scenarioDependenciesToRows,
   scenarioPhasesToRows,
   timelineSettingsToRow,
+  versionCostSettingsToRow,
+  versionRateOverridesToRows,
 } from './mappers'
 import {
   AccessNotice,
@@ -73,10 +74,9 @@ import {
   ProjectTaxonomyValue,
   ProjectTimelineSettings,
   Scenario,
-  ScenarioDependency,
-  ScenarioPayload,
   ScenarioPhase,
   TaxonomyKind,
+  VersionCostSettings,
 } from './types'
 import { projectGraphToRow, rowToProjectGraph, type ProjectGraphRow } from './mappers'
 import type { ProjectGraph } from './types'
@@ -1195,214 +1195,168 @@ export async function reorderProjectGraphs(
   await Promise.all(moved.map(({ graph, index }) => updateProjectGraph(graph.id, { sortOrder: index })))
 }
 
-/* --------------------------------------------------------------- scenarios -- */
+/* ---------------------------------------------------------------- versions -- */
+// supabase/migrations/0031_versions.sql. Table and RPC names say "scenario"
+// for history; every scenario row is a VERSION of the plan.
 
 /**
- * Scenarios are created, published and rebased exclusively through RPCs.
+ * Every version of a project: the name of the one held in the ordinary
+ * tables (`projects.live_version_name`) and every other one as a scenario
+ * row. Pre-0031 what-ifs that were already PUBLISHED are history, not
+ * versions, and are left out. Whole team: RLS lets any member read them.
  *
- * There is no `createScenario` that INSERTs: the table grants no INSERT to
- * `authenticated` at all. The payload names real row ids that
- * `publish_scenario()` later writes back, so a client able to author one would
- * hold an arbitrary-write primitive into the baseline. Building it server-side
- * means a payload can only ever describe rows that already exist in a project
- * the caller belongs to. See supabase/migrations/0010_ship_scenarios.sql.
+ * Versions are written exclusively through RPCs -- the table grants
+ * authenticated SELECT only -- which check edit access (admin / editor) and
+ * validate every phase and setting before a byte of payload is stored.
  */
-
-export async function getScenariosForProject(projectId: string): Promise<Scenario[]> {
+export async function getVersionsForProject(
+  projectId: string
+): Promise<{ liveName: string; scenarios: Scenario[] }> {
   const supabase = getSupabaseBrowserClient()
 
-  const { data, error } = await supabase
-    .from('scenarios')
-    .select('*')
-    .eq('project_id', projectId)
-    .order('created_at', { ascending: false })
+  const [projectResult, scenarioResult] = await Promise.all([
+    supabase.from('projects').select('live_version_name').eq('id', projectId).maybeSingle(),
+    supabase
+      .from('scenarios')
+      .select('*')
+      .eq('project_id', projectId)
+      .is('published_at', null)
+      .order('created_at', { ascending: true }),
+  ])
 
-  if (error) fail(`Failed to load scenarios for "${projectId}"`, error)
+  if (projectResult.error) fail(`Failed to load versions for "${projectId}"`, projectResult.error)
+  if (scenarioResult.error) fail(`Failed to load versions for "${projectId}"`, scenarioResult.error)
 
-  return ((data ?? []) as unknown as ScenarioRow[]).map(rowToScenario)
-}
+  const liveName =
+    (projectResult.data as { live_version_name?: string | null } | null)?.live_version_name ||
+    'Version 1'
 
-export async function createScenario(
-  projectId: string,
-  name: string,
-  description = ''
-): Promise<Scenario> {
-  const supabase = getSupabaseBrowserClient()
-
-  const { data, error } = await supabase.rpc('create_scenario', {
-    p_project_id: projectId,
-    p_name: name.trim(),
-    p_description: description,
-  })
-
-  if (error) fail('Failed to create the scenario', error)
-
-  return rowToScenario(data as unknown as ScenarioRow)
-}
-
-/**
- * Persists the in-memory overlay back onto the scenario row — NOT onto the
- * baseline. This is the "save my sandbox" write; `publishScenario` is the
- * separate, deliberate act of pushing it to the shared plan.
- *
- * Goes through `ship.save_scenario_payload` (migration 0015, M-13) rather
- * than a table UPDATE: the owner can no longer write `payload` directly. The
- * RPC is owner-only, merges the phases/dependencies into the stored payload
- * (so keys this client never sees -- `cost_settings` -- survive the save),
- * and rejects ids from another project and out-of-range slots.
- *
- * Accepts either `(id, payload)` -- the original signature -- or
- * `(id, phases, dependencies)`, the Phase 2 contract shape.
- */
-export async function saveScenarioPayload(
-  scenarioId: string,
-  payload: ScenarioPayload
-): Promise<Scenario | null>
-export async function saveScenarioPayload(
-  scenarioId: string,
-  phases: readonly ScenarioPhase[],
-  dependencies: readonly ScenarioDependency[]
-): Promise<Scenario | null>
-export async function saveScenarioPayload(
-  scenarioId: string,
-  payloadOrPhases: ScenarioPayload | readonly ScenarioPhase[],
-  maybeDependencies?: readonly ScenarioDependency[]
-): Promise<Scenario | null> {
-  const supabase = getSupabaseBrowserClient()
-
-  let phases: readonly ScenarioPhase[]
-  let dependencies: readonly ScenarioDependency[]
-  if (isScenarioPhaseList(payloadOrPhases)) {
-    phases = payloadOrPhases
-    dependencies = maybeDependencies ?? []
-  } else {
-    phases = payloadOrPhases.phases
-    dependencies = payloadOrPhases.dependencies
+  return {
+    liveName,
+    scenarios: ((scenarioResult.data ?? []) as unknown as ScenarioRow[]).map(rowToScenario),
   }
+}
 
-  const { data, error } = await supabase.rpc('save_scenario_payload', {
-    p_scenario_id: scenarioId,
-    p_phases: scenarioPhasesToRows(phases),
-    p_dependencies: scenarioDependenciesToRows(dependencies),
-  })
+/** Kept for callers that only need the list. */
+export async function getScenariosForProject(projectId: string): Promise<Scenario[]> {
+  return (await getVersionsForProject(projectId)).scenarios
+}
 
-  if (error) fail('Failed to save the scenario', error)
-
+function readScenarioRpc(context: string, data: unknown): Scenario {
   // `returns ship.scenarios` comes back as one object; tolerate a one-row
   // array as well rather than depend on PostgREST's composite-return shape.
   const row = (Array.isArray(data) ? data[0] : data) as ScenarioRow | null | undefined
-  if (!row || typeof row !== 'object' || !row.id) return null
-
+  if (!row || typeof row !== 'object' || !row.id) {
+    throw new Error(`${context}: the server returned no version`)
+  }
   return rowToScenario(row)
 }
 
-function isScenarioPhaseList(
-  value: ScenarioPayload | readonly ScenarioPhase[]
-): value is readonly ScenarioPhase[] {
-  return Array.isArray(value)
+/** A new version copying `sourceScenarioId`, or the live version if null. */
+export async function createVersion(
+  projectId: string,
+  name: string,
+  sourceScenarioId: string | null
+): Promise<Scenario> {
+  const supabase = getSupabaseBrowserClient()
+
+  const { data, error } = await supabase.rpc('create_version', {
+    p_project_id: projectId,
+    p_name: name.trim(),
+    p_source_scenario_id: sourceScenarioId,
+  })
+
+  if (error) fail('Failed to create the version', error)
+  return readScenarioRpc('Failed to create the version', data)
+}
+
+/** `scenarioId` null renames the version held in the live tables. */
+export async function renameVersion(
+  projectId: string,
+  scenarioId: string | null,
+  name: string
+): Promise<void> {
+  const supabase = getSupabaseBrowserClient()
+
+  const { error } = await supabase.rpc('rename_version', {
+    p_project_id: projectId,
+    p_scenario_id: scenarioId,
+    p_name: name.trim(),
+  })
+
+  if (error) fail('Failed to rename the version', error)
 }
 
 /**
- * Renames / re-describes / shares a scenario. Since migration 0015 these
- * three columns are ALL an owner may UPDATE directly (the payload goes
- * through `saveScenarioPayload`), so this sends nothing else -- not even
- * `updated_at`, which the column grant would refuse. Returns null when the
- * update matched no row (not the owner, or the scenario is gone).
+ * Deletes a version. `scenarioId` null deletes the version held in the live
+ * tables: the server moves another version in (the most recently edited
+ * one unless `promoteScenarioId` names one) and removes that version's
+ * snapshot, in one transaction. The last version cannot be deleted.
  */
-export async function updateScenarioMeta(
-  scenarioId: string,
-  updates: { name?: string; description?: string; visibility?: Scenario['visibility'] }
-): Promise<Scenario | null> {
+export async function deleteVersion(
+  projectId: string,
+  scenarioId: string | null,
+  promoteScenarioId: string | null = null
+): Promise<{ promotedScenarioId: string | null; liveVersionName: string }> {
   const supabase = getSupabaseBrowserClient()
 
-  const row: Record<string, unknown> = {}
-  if (updates.name !== undefined) {
-    const name = updates.name.trim()
-    if (name === '') throw new Error('A what-if needs a name.')
-    row.name = name
-  }
-  if (updates.description !== undefined) row.description = updates.description
-  if (updates.visibility !== undefined) row.visibility = updates.visibility
-
-  if (Object.keys(row).length === 0) {
-    const { data, error } = await supabase
-      .from('scenarios')
-      .select('*')
-      .eq('id', scenarioId)
-      .maybeSingle()
-    if (error) fail('Failed to load the scenario', error)
-    return data ? rowToScenario(data as unknown as ScenarioRow) : null
-  }
-
-  const { data, error } = await supabase
-    .from('scenarios')
-    .update(row)
-    .eq('id', scenarioId)
-    .select('*')
-    .maybeSingle()
-
-  if (error) fail('Failed to update the scenario', error)
-  if (!data) return null
-
-  return rowToScenario(data as unknown as ScenarioRow)
-}
-
-export type PublishScenarioResult =
-  | { ok: true; phasesUpdated: number; dependenciesUpdated: number }
-  /** The baseline moved under the scenario. This is the Revit
-   *  sync-with-central conflict, and it is surfaced rather than resolved: the
-   *  alternative is one user silently reverting another's work. */
-  | { ok: false; reason: 'conflict' | 'already-published' | 'denied'; message: string }
-
-export async function publishScenario(scenarioId: string): Promise<PublishScenarioResult> {
-  const supabase = getSupabaseBrowserClient()
-
-  const { data, error } = await supabase.rpc('publish_scenario', {
+  const { data, error } = await supabase.rpc('delete_version', {
+    p_project_id: projectId,
     p_scenario_id: scenarioId,
+    p_promote_scenario_id: promoteScenarioId,
   })
 
-  if (error) {
-    // The RPC raises with meaningful SQLSTATEs so the UI can offer the right
-    // next action — rebase on a conflict, nothing on an already-published
-    // scenario — rather than showing one generic failure for all three.
-    const reason =
-      error.code === '40001'
-        ? 'conflict'
-        : error.code === '22023'
-          ? 'already-published'
-          : 'denied'
-    return { ok: false, reason, message: error.message }
-  }
+  if (error) fail('Failed to delete the version', error)
 
-  const payload = (data ?? {}) as Record<string, unknown>
+  const result = (data ?? {}) as Record<string, unknown>
   return {
-    ok: true,
-    phasesUpdated: Number(payload.phases_updated ?? 0),
-    dependenciesUpdated: Number(payload.dependencies_updated ?? 0),
+    promotedScenarioId:
+      typeof result.promoted_scenario_id === 'string' ? result.promoted_scenario_id : null,
+    liveVersionName: typeof result.live_version_name === 'string' ? result.live_version_name : '',
   }
 }
 
-/** Re-reads the current baseline into the scenario, keeping its own placements
- *  where the underlying row still exists. The way out of a publish conflict
- *  that is not "lose your work". */
-export async function rebaseScenario(scenarioId: string): Promise<Scenario> {
+/**
+ * Saves complete phase lists for one or more packages into a version
+ * (ship.save_version_phases): each listed package's phases are replaced by
+ * the ones given; every other package is untouched. Build the list with
+ * lib/versions.ts `packagePhasesForSave`.
+ */
+export async function saveVersionPhases(
+  scenarioId: string,
+  phases: readonly ScenarioPhase[]
+): Promise<Scenario> {
   const supabase = getSupabaseBrowserClient()
 
-  const { data, error } = await supabase.rpc('rebase_scenario', {
+  const { data, error } = await supabase.rpc('save_version_phases', {
     p_scenario_id: scenarioId,
+    p_phases: scenarioPhasesToRows(phases),
   })
 
-  if (error) fail('Failed to rebase the scenario', error)
-
-  return rowToScenario(data as unknown as ScenarioRow)
+  if (error) fail('Failed to save the version', error)
+  return readScenarioRpc('Failed to save the version', data)
 }
 
-export async function deleteScenario(scenarioId: string): Promise<void> {
+/**
+ * A version's cost model (ship.save_version_cost_settings): `settings` is
+ * merged in key by key; `rateOverrides` is the complete new list, or null
+ * to leave the overrides alone.
+ */
+export async function saveVersionCostSettings(
+  scenarioId: string,
+  settings: Partial<Omit<VersionCostSettings, 'rateOverrides'>> | null,
+  rateOverrides: VersionCostSettings['rateOverrides'] | null = null
+): Promise<Scenario> {
   const supabase = getSupabaseBrowserClient()
 
-  const { error } = await supabase.from('scenarios').delete().eq('id', scenarioId)
+  const { data, error } = await supabase.rpc('save_version_cost_settings', {
+    p_scenario_id: scenarioId,
+    p_settings: settings ? versionCostSettingsToRow(settings) : null,
+    p_rate_overrides: rateOverrides ? versionRateOverridesToRows(rateOverrides) : null,
+  })
 
-  if (error) fail('Failed to discard the scenario', error)
+  if (error) fail('Failed to save the version cost model', error)
+  return readScenarioRpc('Failed to save the version cost model', data)
 }
 
 /* ------------------------------------------------------------ taxonomies -- */

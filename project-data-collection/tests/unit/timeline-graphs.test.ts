@@ -283,6 +283,7 @@ function stubClient(t: Record<string, unknown>) {
     const builder: Record<string, unknown> = {
       select: () => builder,
       eq: () => builder,
+      is: () => builder,
       order: () => builder,
       range: () => builder,
       maybeSingle: () =>

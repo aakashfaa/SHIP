@@ -3,7 +3,7 @@
 import { useState } from 'react'
 import type { PlainTable } from '@/lib/export/excel'
 import { printTable } from '@/lib/export/print-table'
-import type { Project } from '@/lib/types'
+import type { PlanVersion, Project } from '@/lib/types'
 
 /**
  * Excel + PDF export controls (spec R8). Deliberately NOT wired into any
@@ -33,12 +33,17 @@ import type { Project } from '@/lib/types'
 type Props = {
   project: Project
   /**
-   * The what-if currently on screen, if any (M-24). Excel then exports THAT
-   * schedule (`?scenario=<id>`, priced server-side through the same overlay as
-   * the Timeline), so the workbook matches the screen and the printed PDF.
-   * Omit / null for the live plan.
+   * VERSIONS (migration 0031, Timeline only). Owner: "All equal, pick on
+   * export" -- so with more than one version the bar asks which one to
+   * export, defaulting to the one open on screen (`activeVersionKey`).
+   * Excel sends `?version=<id>` (priced server-side through the same overlay
+   * as the Timeline, lib/versions.ts); PDF prints the page, so for a version
+   * other than the open one `onPrintVersion` switches the Timeline to it and
+   * resolves once it is on screen.
    */
-  scenario?: { id: string; name: string } | null
+  versions?: PlanVersion[]
+  activeVersionKey?: string
+  onPrintVersion?: (versionKey: string) => Promise<void>
   className?: string
   /** Table mode: called at click time for what is on screen right now. */
   table?: () => PlainTable & { subtitle?: string }
@@ -59,9 +64,26 @@ function downloadBlob(blob: Blob, fileName: string) {
   URL.revokeObjectURL(url)
 }
 
-export default function ExportBar({ project, scenario = null, className = '', table }: Props) {
+export default function ExportBar({
+  project,
+  versions = [],
+  activeVersionKey,
+  onPrintVersion,
+  className = '',
+  table,
+}: Props) {
   const [isExporting, setIsExporting] = useState(false)
   const [exportError, setExportError] = useState<string | null>(null)
+  // The version to export: the open one until the user picks another. Held
+  // as "picked, or follow the screen" so switching versions on the Timeline
+  // moves the default with it.
+  const [pickedVersionKey, setPickedVersionKey] = useState<string | null>(null)
+  const chosenKey =
+    pickedVersionKey !== null && versions.some((v) => v.key === pickedVersionKey)
+      ? pickedVersionKey
+      : (activeVersionKey ?? versions[0]?.key ?? null)
+  const chosen = versions.find((v) => v.key === chosenKey) ?? null
+  const showVersionChoice = !table && versions.length > 1
 
   async function handleExportExcel() {
     setExportError(null)
@@ -79,7 +101,7 @@ export default function ExportBar({ project, scenario = null, className = '', ta
         return
       }
 
-      const query = scenario ? `?scenario=${encodeURIComponent(scenario.id)}` : ''
+      const query = chosen?.scenarioId ? `?version=${encodeURIComponent(chosen.scenarioId)}` : ''
       const response = await fetch(`/api/projects/${encodeURIComponent(project.id)}/export/xlsx${query}`)
 
       if (!response.ok) {
@@ -93,9 +115,10 @@ export default function ExportBar({ project, scenario = null, className = '', ta
         throw new Error(message)
       }
 
-      const slug = scenario
-        ? `${slugify(project.name)}-scenario-${slugify(scenario.name)}`
-        : slugify(project.name)
+      const slug =
+        chosen && versions.length > 1
+          ? `${slugify(project.name)}-${slugify(chosen.name)}`
+          : slugify(project.name)
       downloadBlob(await response.blob(), `${slug}-export.xlsx`)
     } catch (error) {
       setExportError(error instanceof Error ? error.message : 'Export failed.')
@@ -104,9 +127,19 @@ export default function ExportBar({ project, scenario = null, className = '', ta
     }
   }
 
-  function handleExportPdf() {
+  async function handleExportPdf() {
     setExportError(null)
     if (!table) {
+      // The PDF is the page itself, so the chosen version has to be the one
+      // on screen when the print dialog opens.
+      if (chosen && chosen.key !== activeVersionKey && onPrintVersion) {
+        try {
+          await onPrintVersion(chosen.key)
+        } catch (error) {
+          setExportError(error instanceof Error ? error.message : 'Could not open that version.')
+          return
+        }
+      }
       window.print()
       return
     }
@@ -120,18 +153,36 @@ export default function ExportBar({ project, scenario = null, className = '', ta
     // them into their own PDF output would be nonsensical. See the
     // `@media print` block in app/globals.css.
     <div className={`no-print flex flex-wrap items-center gap-2 ${className}`}>
+      {showVersionChoice ? (
+        <label className="flex items-center gap-2 text-[11px] font-medium text-slate-600">
+          Export version
+          <select
+            value={chosenKey ?? ''}
+            onChange={(e) => setPickedVersionKey(e.target.value)}
+            aria-label="Version to export"
+            className="rounded-[0.8rem] border border-slate-200 bg-white px-2 py-1.5 text-[11px] text-slate-800"
+          >
+            {versions.map((version) => (
+              <option key={version.key} value={version.key}>
+                {version.name}
+                {version.key === activeVersionKey ? ' (open)' : ''}
+              </option>
+            ))}
+          </select>
+        </label>
+      ) : null}
       <button
         type="button"
         onClick={handleExportExcel}
         disabled={isExporting}
         className="rounded-[1rem] bg-[linear-gradient(135deg,#0f172a_0%,#1e293b_48%,#0f766e_100%)] px-5 py-3 text-[11px] font-medium text-white shadow-lg transition hover:-translate-y-[1px] disabled:cursor-not-allowed disabled:opacity-60"
       >
-        {isExporting ? 'Exporting…' : scenario ? 'Export Excel (this what-if)' : 'Export Excel'}
+        {isExporting ? 'Exporting…' : 'Export Excel'}
       </button>
 
       <button
         type="button"
-        onClick={handleExportPdf}
+        onClick={() => void handleExportPdf()}
         className="rounded-[1rem] border border-slate-200 bg-white px-5 py-3 text-[11px] font-medium text-slate-700 transition hover:-translate-y-[1px] hover:border-slate-300"
       >
         Export PDF

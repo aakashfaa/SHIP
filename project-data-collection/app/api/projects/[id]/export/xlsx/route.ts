@@ -40,11 +40,17 @@ type RouteParams = { params: Promise<{ id: string }> }
 export async function GET(request: NextRequest, { params }: RouteParams) {
   const { id: projectId } = await params
 
-  // M-24: `?scenario=<id>` exports the what-if the user is looking at, priced
-  // through the same overlay as the screen. Absent = the live plan. The id is
-  // only a lookup key: the scenario row is read through RLS below, so a
-  // private what-if belonging to someone else is "not found", not exported.
-  const scenarioId = request.nextUrl.searchParams.get('scenario')?.trim() || null
+  // M-24 / migration 0031: `?version=<id>` exports that version of the plan,
+  // priced through the same overlay as the Timeline (lib/versions.ts).
+  // Absent or `live` = the version held in the live tables. `?scenario=` is
+  // the pre-0031 name of the same parameter, still accepted. The id is only
+  // a lookup key: the version row is read through RLS below, so one in a
+  // project the caller cannot read is "not found", not exported.
+  const versionParam =
+    request.nextUrl.searchParams.get('version')?.trim() ||
+    request.nextUrl.searchParams.get('scenario')?.trim() ||
+    null
+  const scenarioId = versionParam && versionParam !== 'live' ? versionParam : null
 
   const supabase = await createSupabaseServerClient()
 
@@ -93,13 +99,13 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
   }
 
   let buffer: Buffer
-  let scenarioName: string | null = null
+  let versionName: string | null = null
   try {
     const reportData = await buildProjectReportData(supabase, project, { scenarioId })
     buffer = await buildExcelBuffer(reportData)
-    scenarioName = reportData.scenario?.name ?? null
+    versionName = reportData.version.isOneOfSeveral ? reportData.version.name : null
   } catch (error) {
-    // Missing base/start year (M-25) or a scenario that isn't there (M-24):
+    // Missing base/start year (M-25) or a version that isn't there (M-24):
     // a specific, fixable reason -- say it, with its own status, not a 500.
     if (error instanceof ExportBlockedError) {
       return NextResponse.json({ error: error.message }, { status: error.status })
@@ -108,8 +114,8 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
     return NextResponse.json({ error: message }, { status: 500 })
   }
 
-  const filename = scenarioName
-    ? `${slugifyFilename(project.name)}-scenario-${slugifyFilename(scenarioName)}-export.xlsx`
+  const filename = versionName
+    ? `${slugifyFilename(project.name)}-${slugifyFilename(versionName)}-export.xlsx`
     : `${slugifyFilename(project.name)}-export.xlsx`
 
   return new NextResponse(new Uint8Array(buffer), {
