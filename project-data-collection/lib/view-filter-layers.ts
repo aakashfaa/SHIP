@@ -24,6 +24,10 @@ export type TimelineLayer = {
   costBreakdown?: TimelineCostBreakdown
   showEnergy?: boolean
   showPackages?: boolean
+  /** Graphs this person hid on top of the default (0032). */
+  hideGraphs?: string[]
+  /** Admins only: graphs the default hides that this admin shows. */
+  showGraphs?: string[]
 }
 
 type Columns = { hiddenColumns: string[] }
@@ -46,7 +50,19 @@ export function parseTimelineLayer(raw: unknown): TimelineLayer {
   }
   if (typeof r.showEnergy === 'boolean') layer.showEnergy = r.showEnergy
   if (typeof r.showPackages === 'boolean') layer.showPackages = r.showPackages
+  const hideGraphs = strings(r.hideGraphs)
+  const showGraphs = strings(r.showGraphs)
+  if (hideGraphs.length > 0) layer.hideGraphs = hideGraphs
+  if (showGraphs.length > 0) layer.showGraphs = showGraphs
   return layer
+}
+
+/** Graph ids hidden after the layer: like columns, a non-admin can only add
+ *  to what the default hides; an admin can also un-hide. */
+function applyGraphsLayer(baseHidden: readonly string[], layer: TimelineLayer, isAdmin: boolean): string[] {
+  const hidden = new Set([...baseHidden, ...(layer.hideGraphs ?? [])])
+  if (isAdmin) for (const id of layer.showGraphs ?? []) hidden.delete(id)
+  return [...hidden]
 }
 
 export function applyColumnsLayer(base: Columns, layer: ColumnsLayer, isAdmin: boolean): Columns {
@@ -61,12 +77,14 @@ export function applyTimelineLayer(base: Timeline, layer: TimelineLayer, isAdmin
       costBreakdown: layer.costBreakdown ?? base.costBreakdown,
       showEnergy: layer.showEnergy ?? base.showEnergy,
       showPackages: layer.showPackages ?? base.showPackages,
+      hiddenGraphs: applyGraphsLayer(base.hiddenGraphs, layer, true),
     }
   }
   return {
     costBreakdown: base.costBreakdown === 'none' ? 'none' : layer.costBreakdown ?? base.costBreakdown,
     showEnergy: base.showEnergy && layer.showEnergy !== false,
     showPackages: base.showPackages && layer.showPackages !== false,
+    hiddenGraphs: applyGraphsLayer(base.hiddenGraphs, layer, false),
   }
 }
 
@@ -92,6 +110,12 @@ export function timelineLayerFor(base: Timeline, desired: Timeline, isAdmin: boo
   if (desired.showPackages !== base.showPackages && (isAdmin || !desired.showPackages)) {
     layer.showPackages = desired.showPackages
   }
+  const baseHidden = new Set(base.hiddenGraphs)
+  const desiredHidden = new Set(desired.hiddenGraphs)
+  const hideGraphs = [...desiredHidden].filter((id) => !baseHidden.has(id))
+  const showGraphs = isAdmin ? [...baseHidden].filter((id) => !desiredHidden.has(id)) : []
+  if (hideGraphs.length > 0) layer.hideGraphs = hideGraphs
+  if (showGraphs.length > 0) layer.showGraphs = showGraphs
   return layer
 }
 

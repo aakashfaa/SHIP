@@ -1,7 +1,8 @@
 'use client'
 
 import { useMemo } from 'react'
-import type { EnergySeries } from '@/lib/cost-model'
+import type { MetricSeries } from '@/lib/cost-model'
+import { colorWithAlpha } from '@/lib/graphs'
 import {
   CELL_WIDTH,
   ENERGY_CHART_HEIGHT,
@@ -10,17 +11,28 @@ import {
   LABEL_COLUMN_WIDTH,
   xForSlot,
 } from './layout'
-import { energyEmptyHints } from './energy-empty-state'
+import { graphEmptyHints } from './graph-empty-state'
 
 /**
- * The energy reduction chart that sits under the timeline.
+ * One graph under the timeline. There is one of these per row of
+ * ship.project_graphs, stacked in sort_order (migration 0032).
  *
- * Requested by Megan after the DCAMM demo:
+ * It started as the energy reduction chart, requested by Megan after the
+ * DCAMM demo:
  *
  *   "quantify and graph the energy reductions of the proposed building
  *    upgrades on the timeline [...] we add a graph below the timeline that live
  *    updates with the savings similar to how the overall cost gets updated
  *    above."
+ *
+ * and was generalised when she asked for carbon too:
+ *
+ *   "would it be possible to add a parameter for carbon reduction that can be
+ *    tracked on a separate graph right below energy? It could be a different
+ *    color (blue maybe?)."
+ *
+ * So the label, unit, column and colour all come from the graph's row; the
+ * drawing is the same for every graph.
  *
  * Hand-rolled SVG rather than a charting library, and that is the entire
  * design. The requirement is not "draw a nice step chart", it is "draw a step
@@ -29,7 +41,7 @@ import { energyEmptyHints } from './energy-empty-state'
  * owns its own scale and margins, which would put a second slot→pixel
  * translation in the codebase that has to be kept in sync with `xForSlot` by
  * hand. Importing the same function the grid uses makes drift impossible
- * rather than merely unlikely.
+ * rather than merely unlikely -- for every graph in the stack.
  *
  * The shape is a descending staircase: flat between package completions,
  * dropping vertically at each one. That is both Megan's sketch and the
@@ -37,15 +49,25 @@ import { energyEmptyHints } from './energy-empty-state'
  */
 
 type Props = {
-  series: EnergySeries
+  /** Shown as the chart's heading. */
+  label: string
+  /** '#rrggbb' -- the line, the step dots, the fill (at 10%) and the legend. */
+  color: string
+  series: MetricSeries
+  /** The line-item column the graph sums, for the empty state's wording. */
+  sourceLabel: string
+  /** The column no longer exists (custom field deleted or retyped). */
+  sourceMissing?: boolean
   slotCount: number
   /** Highlighted when the user hovers a column in the grid above. */
   hoveredSlot?: number | null
-  /** Opens the Cost model popup at the energy baseline. Omit when the user
-   *  cannot edit; the empty state then explains without linking. */
-  onOpenCostModel?: () => void
+  /** Opens graph setup at this graph. Omit when the user cannot edit; the
+   *  empty state then explains without linking. */
+  onOpenSetup?: () => void
   /** Switches to the Master View tab. Omit when the user cannot edit line items. */
   onOpenMasterView?: () => void
+  /** For tests and the PDF: identifies the graph. */
+  graphId?: string
 }
 
 function formatCompact(value: number): string {
@@ -58,16 +80,22 @@ function formatCompact(value: number): string {
 const LINK_CLASS =
   'rounded-sm font-medium text-teal-700 underline underline-offset-2 transition hover:text-teal-900 focus:outline-none focus-visible:ring-2 focus-visible:ring-teal-500'
 
-export default function EnergyChart({
+export default function GraphChart({
+  label,
+  color,
   series,
+  sourceLabel,
+  sourceMissing = false,
   slotCount,
   hoveredSlot,
-  onOpenCostModel,
+  onOpenSetup,
   onOpenMasterView,
+  graphId,
 }: Props) {
   const plotHeight =
     ENERGY_CHART_HEIGHT - ENERGY_CHART_PADDING_TOP - ENERGY_CHART_PADDING_BOTTOM
   const width = Math.max(slotCount * CELL_WIDTH, CELL_WIDTH)
+  const unit = series.unitLabel.trim()
 
   const { path, baselineY, yFor, top, hasData } = useMemo(() => {
     // Two modes, because a baseline is genuinely optional — the engineers had
@@ -75,9 +103,10 @@ export default function EnergyChart({
     // the units yet"), and a feature that only works after that delivery will
     // not be adopted before it.
     //
-    //   baseline set  -> plot remaining consumption falling away from it
-    //   no baseline   -> plot cumulative savings climbing from zero, inverted
-    //                    so the line still descends and the shape is familiar
+    //   baseline set  -> plot what remains, falling away from it
+    //   no baseline   -> plot the cumulative reduction climbing from zero,
+    //                    inverted so the line still descends and the shape
+    //                    is familiar
     const usesBaseline = series.baseline !== null && series.baseline > 0
     const topValue = usesBaseline ? (series.baseline as number) : series.finalSavings
 
@@ -133,15 +162,23 @@ export default function EnergyChart({
     <div
       className="grid border-t border-slate-200 bg-white"
       style={{ gridTemplateColumns: `${LABEL_COLUMN_WIDTH}px ${width}px` }}
+      data-testid="timeline-graph"
+      data-graph-id={graphId}
     >
       <div className="border-r border-slate-200 px-5 py-4">
-        <div className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">
-          Energy
+        <div className="flex items-center gap-2">
+          <span aria-hidden className="inline-block h-2 w-2 shrink-0 rounded-full" style={{ backgroundColor: color }} />
+          <div
+            className="truncate text-xs font-semibold uppercase tracking-[0.18em] text-slate-500"
+            title={label}
+          >
+            {label}
+          </div>
         </div>
         <div className="mt-1 text-sm font-semibold text-slate-950">
           {series.baseline !== null ? 'Remaining consumption' : 'Cumulative savings'}
         </div>
-        <div className="mt-1 text-xs text-slate-500">{series.unitLabel}</div>
+        {unit ? <div className="mt-1 text-xs text-slate-500">{unit}</div> : null}
 
         {hasData ? (
           <div className="mt-3 space-y-1">
@@ -149,8 +186,8 @@ export default function EnergyChart({
               <span className="inline-block h-0 w-4 border-t border-dashed border-slate-400" />
               Baseline {formatCompact(top)}
             </div>
-            <div className="flex items-center gap-2 text-[11px] text-emerald-700">
-              <span className="inline-block h-0 w-4 border-t-2 border-emerald-600" />
+            <div className="flex items-center gap-2 text-[11px]" style={{ color }}>
+              <span className="inline-block h-0 w-4 border-t-2" style={{ borderColor: color }} />
               Saved {formatCompact(finalSavings)}
               {reductionPct !== null ? ` (${reductionPct.toFixed(0)}%)` : ''}
             </div>
@@ -165,9 +202,9 @@ export default function EnergyChart({
             height={ENERGY_CHART_HEIGHT}
             className="block"
             role="img"
-            aria-label={`Energy reduction over the plan. ${formatCompact(
-              finalSavings
-            )} ${series.unitLabel} saved once every package is in service.`}
+            aria-label={`${label} over the plan. ${formatCompact(finalSavings)}${
+              unit ? ` ${unit}` : ''
+            } saved once every package is in service.`}
           >
             {/* Column rules, drawn here rather than inherited, so the chart
                 lines up with the grid above even though it is a separate
@@ -238,13 +275,13 @@ export default function EnergyChart({
             </text>
 
             {/* Fill under the curve, closed back along the baseline. It reads
-                as "consumption that is still happening", which is the quantity
-                the client is trying to shrink. */}
+                as "what is still happening", which is the quantity the client
+                is trying to shrink. */}
             <path
               d={`${path} V ${ENERGY_CHART_PADDING_TOP + plotHeight} H 0 Z`}
-              fill="rgba(16,185,129,0.10)"
+              fill={colorWithAlpha(color, 0.1)}
             />
-            <path d={path} fill="none" stroke="#059669" strokeWidth={2} />
+            <path d={path} fill="none" stroke={color} strokeWidth={2} />
 
             {/* A tick at each step, so the drop is attributable to a specific
                 column rather than being a bend in a line. */}
@@ -263,20 +300,17 @@ export default function EnergyChart({
                   cx={xForSlot(point.slotIndex)}
                   cy={yFor(value)}
                   r={3}
-                  fill="#059669"
+                  fill={color}
                 />
               )
             })}
           </svg>
         ) : (
           <div className="flex h-full flex-col items-center justify-center gap-1 text-xs text-slate-400">
-            <span>No energy savings</span>
-            {energyEmptyHints(series).map((hint) => {
-              const onClick = hint.kind === 'baseline' ? onOpenCostModel : onOpenMasterView
-              const testId =
-                hint.kind === 'baseline'
-                  ? 'energy-empty-baseline-link'
-                  : 'energy-empty-savings-link'
+            <span>No {label.toLowerCase()} yet</span>
+            {graphEmptyHints(series, { label: sourceLabel, missing: sourceMissing }).map((hint) => {
+              const onClick = hint.kind === 'values' ? onOpenMasterView : onOpenSetup
+              const testId = `graph-empty-${hint.kind}-link`
               return onClick ? (
                 <button
                   key={hint.kind}

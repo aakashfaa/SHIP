@@ -47,17 +47,15 @@ import { getMasterViewColumnDefs, masterExportCell, masterExportColumn } from '.
 import { parseCostAmount, parseCostInput, parseQuantity, parseQuantityInput } from '../costs'
 import { sortPackages } from '../package-order'
 import {
-  DEFAULT_ENERGY_SETTINGS,
   applyScenarioOverlay,
-  computeEnergyByFiscalYear,
   computeFiscalYearTotals,
+  computeMetricByFiscalYear,
   fiscalYearForMonth,
   formatFiscalYear,
   monthLabel,
   resolveHorizon,
   summarisePackage,
   type CostSettings,
-  type EnergySettings,
   type PackageInput,
   type PackageSummary,
   type Phase,
@@ -67,10 +65,10 @@ import {
   rowToChunkPhase,
   rowToChunkProject,
   rowToCostSettings,
-  rowToEnergySettings,
   rowToFormField,
   rowToLineItem,
   rowToProject,
+  rowToProjectGraph,
   rowToScenario,
   rowToTimelineSettings,
   type ChunkPhaseRow,
@@ -79,7 +77,7 @@ import {
   type FormFieldRow,
   type LineItemRow,
   type ProjectCostSettingsRow,
-  type ProjectEnergySettingsRow,
+  type ProjectGraphRow,
   type ProjectRow,
   type ScenarioRow,
   type TimelineSettingsRow,
@@ -91,10 +89,11 @@ import type {
   LineItem,
   Project,
   ProjectCostSettings,
-  ProjectEnergySettings,
+  ProjectGraph,
   ProjectTimelineSettings,
   Scenario,
 } from '../types'
+import { graphMetricSettings, graphSourceOptions, packageGraphValues } from '../graphs'
 
 /**
  * The export cannot be produced as asked, for a reason the caller can fix
@@ -224,19 +223,23 @@ async function fetchCostSettings(
   )
 }
 
-async function fetchEnergySettings(
+/** The Timeline's graphs (migration 0032), in drawing order -- same select
+ *  as lib/store.ts#getProjectGraphs. Replaces the energy-settings read: the
+ *  export no longer reads project_energy_settings. */
+async function fetchGraphs(
   supabase: ShipSupabaseClient,
   projectId: string
-): Promise<ProjectEnergySettings> {
+): Promise<ProjectGraph[]> {
   const { data, error } = await supabase
-    .from('project_energy_settings')
+    .from('project_graphs')
     .select('*')
     .eq('project_id', projectId)
-    .maybeSingle()
+    .order('sort_order', { ascending: true })
+    .order('created_at', { ascending: true })
 
-  if (error) fail(`Failed to load energy settings for "${projectId}"`, error)
+  if (error) fail(`Failed to load graphs for "${projectId}"`, error)
 
-  return rowToEnergySettings(data as unknown as ProjectEnergySettingsRow | null, projectId)
+  return ((data ?? []) as unknown as ProjectGraphRow[]).map(rowToProjectGraph)
 }
 
 async function fetchTimelineSettings(
@@ -339,15 +342,6 @@ function toCostSettings(row: ProjectCostSettings, baseYear: number): CostSetting
   }
 }
 
-function toEnergySettings(row: ProjectEnergySettings | null): EnergySettings {
-  if (!row) return DEFAULT_ENERGY_SETTINGS
-  return {
-    unitLabel: row.unitLabel,
-    baselineAnnual: row.baselineAnnual,
-    interactionFactor: row.interactionFactor,
-  }
-}
-
 /* ------------------------------------------------------------- shaping -- */
 
 // Cell/column shapes live with the per-cell helpers in line-item-cells.ts
@@ -401,13 +395,26 @@ export type ReportEnergyPoint = {
   remainingConsumption: number | null
 }
 
+/**
+ * One Timeline graph's fiscal-year table (migration 0032) -- what the single
+ * "Energy Summary" became: one per graph, in the Timeline's order. Carries
+ * the label, unit and whether a baseline exists (it is the client's own
+ * data), never the interaction factor (see the file header) or the colour.
+ */
+export type ReportGraph = {
+  label: string
+  unitLabel: string
+  /** The line-item column it sums, as the form labels it. */
+  sourceLabel: string
+  hasBaseline: boolean
+  rows: ReportEnergyPoint[]
+}
+
 export type ProjectReportData = {
   project: { id: string; name: string }
   /** The what-if this export priced, or null for the live plan (M-24). */
   scenario: { id: string; name: string } | null
   generatedAt: string
-  energyUnitLabel: string
-  energyBaselineAnnual: number | null
   /**
    * Plain-sentence warnings the workbook must carry, e.g. "3 line items have
    * an unreadable cost (A4, M2, E7); they count as $0." Empty when clean.
@@ -421,7 +428,8 @@ export type ProjectReportData = {
   packages: ReportPackage[]
   phases: ReportPhase[]
   annualCostSummary: ReportAnnualTotal[]
-  energySummary: ReportEnergyPoint[]
+  /** One per Timeline graph, in drawing order (was `energySummary`). */
+  graphSummaries: ReportGraph[]
 }
 
 export type BuildReportOptions = {
@@ -477,7 +485,7 @@ export async function buildProjectReportData(
     chunkProjects,
     chunkPhases,
     costSettingsRow,
-    energySettingsRow,
+    graphs,
     timelineSettings,
     formFields,
     scenario,
@@ -486,7 +494,7 @@ export async function buildProjectReportData(
     fetchChunkProjects(supabase, project.id),
     fetchChunkPhases(supabase, project.id),
     fetchCostSettings(supabase, project.id),
-    fetchEnergySettings(supabase, project.id),
+    fetchGraphs(supabase, project.id),
     fetchTimelineSettings(supabase, project.id),
     fetchFormFields(supabase, project.id),
     scenarioId ? fetchScenarioForExport(supabase, project.id, scenarioId) : Promise.resolve(null),
@@ -511,7 +519,6 @@ export async function buildProjectReportData(
   }
 
   const costSettings = toCostSettings(costSettingsRow, baseYear)
-  const energySettings = toEnergySettings(energySettingsRow)
 
   // No zoom here any more (M-01, D-1): schedules are in months and nothing
   // the workbook contains depends on how many months a screen column shows,
@@ -597,7 +604,32 @@ export async function buildProjectReportData(
   // Monthly resolution, fiscal quarters (M-26, D-11): the same function the
   // Timeline's "By fiscal year" strip calls.
   const fiscalTotals = computeFiscalYearTotals(summaries, geometry)
-  const energyByYear = computeEnergyByFiscalYear(summaries, energySettings, geometry)
+
+  // One fiscal-year table per Timeline graph (0032), summed by the same
+  // helper the Timeline uses (lib/graphs.ts packageGraphValues), so the
+  // workbook and the screen cannot disagree.
+  const sourceLabels = new Map(graphSourceOptions(formFields).map((s) => [s.key, s.label]))
+  const graphSummaries: ReportGraph[] = graphs.map((graph) => {
+    const byYear = computeMetricByFiscalYear(
+      summaries,
+      packageGraphValues(chunkProjects, lineItemMap, graph.sourceKey),
+      graphMetricSettings(graph),
+      geometry
+    )
+    return {
+      label: graph.label,
+      unitLabel: graph.unitLabel,
+      sourceLabel: sourceLabels.get(graph.sourceKey) ?? graph.sourceKey,
+      hasBaseline: graph.baselineAnnual !== null,
+      // One row per fiscal year, read at the year's end -- not one row per
+      // screen column, which made this sheet's length depend on the zoom.
+      rows: byYear.map((point) => ({
+        fiscalYear: formatFiscalYear(point.fiscalYear),
+        cumulativeSavings: point.cumulativeSavings,
+        remainingConsumption: point.remainingConsumption,
+      })),
+    }
+  })
 
   const unreadableCostItems = lineItems
     .filter((item) => !parseCostAmount(item.estimatedFirstCost).ok)
@@ -666,20 +698,10 @@ export async function buildProjectReportData(
     ],
   }))
 
-  // One row per fiscal year, read at the year's end -- not one row per
-  // screen column, which made this sheet's length depend on the zoom.
-  const energySummary: ReportEnergyPoint[] = energyByYear.map((point) => ({
-    fiscalYear: formatFiscalYear(point.fiscalYear),
-    cumulativeSavings: point.cumulativeSavings,
-    remainingConsumption: point.remainingConsumption,
-  }))
-
   return {
     project: { id: project.id, name: project.name },
     scenario: scenario ? { id: scenario.id, name: scenario.name } : null,
     generatedAt: new Date().toISOString(),
-    energyUnitLabel: energySettings.unitLabel,
-    energyBaselineAnnual: energySettings.baselineAnnual,
     notices,
     unreadableCostItems,
     unreadableQuantityLinks,
@@ -687,6 +709,6 @@ export async function buildProjectReportData(
     packages: reportPackages,
     phases: reportPhases,
     annualCostSummary,
-    energySummary,
+    graphSummaries,
   }
 }

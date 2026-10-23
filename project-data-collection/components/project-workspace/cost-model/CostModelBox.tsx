@@ -4,7 +4,7 @@ import { useState } from 'react'
 import Modal from '@/components/ui/Modal'
 import { getPhaseTemplates } from '@/lib/store'
 import { useAsyncData } from '@/lib/useAsyncData'
-import type { PhaseTemplate, ProjectCostSettings, ProjectEnergySettings } from '@/lib/types'
+import type { PhaseTemplate, ProjectCostSettings, ProjectGraph } from '@/lib/types'
 import CostModelEditor, { type CostModelSaveStatus } from './CostModelEditor'
 
 /**
@@ -30,19 +30,16 @@ type Props = {
   projectId: string
   canEdit: boolean
   costRow: ProjectCostSettings | null
-  energyRow: ProjectEnergySettings | null
-  /** A cost or energy setting was written; re-read and re-price. */
+  /** The Timeline's graphs (migration 0032), as the Timeline draws them. */
+  graphs: readonly ProjectGraph[]
+  /** A cost setting or a graph colour was written; re-read and re-price. */
   onChanged: () => void
-  /** Bump to open the popup from outside (e.g. the energy chart's empty
-   *  state). The editor then focuses the Annual baseline input. */
+  /** Bump to open the popup from outside. */
   openRequest?: number
+  /** Opens the Timeline's graph setup. Omit when the user cannot edit. */
+  onOpenGraphSetup?: () => void
 }
 
-function formatCompact(value: number): string {
-  return new Intl.NumberFormat('en-US', { notation: 'compact', maximumFractionDigits: 1 }).format(
-    value
-  )
-}
 
 function describeEscalation(row: ProjectCostSettings): string {
   const rate = `${row.escalationAnnualPercent}%/yr`
@@ -85,12 +82,12 @@ export default function CostModelBox({
   projectId,
   canEdit,
   costRow,
-  energyRow,
+  graphs,
   onChanged,
   openRequest = 0,
+  onOpenGraphSetup,
 }: Props) {
   const [open, setOpen] = useState(false)
-  const [focusBaseline, setFocusBaseline] = useState(false)
   const [handledRequest, setHandledRequest] = useState(openRequest)
   const [status, setStatus] = useState<CostModelSaveStatus>({ state: 'idle' })
 
@@ -108,12 +105,10 @@ export default function CostModelBox({
   if (openRequest !== handledRequest) {
     setHandledRequest(openRequest)
     setStatus({ state: 'idle' })
-    setFocusBaseline(true)
     setOpen(true)
   }
 
   function openEditor() {
-    setFocusBaseline(false)
     // A fresh editor starts with a clean slate; the old failure is shown
     // again only if a write in this session fails too.
     setStatus({ state: 'idle' })
@@ -151,13 +146,10 @@ export default function CostModelBox({
             value={costRow.baseYear !== null ? String(costRow.baseYear) : 'Not set'}
             warn={costRow.baseYear === null}
           />
+          {/* Was "Energy baseline"; energy is one of the graphs now (0032). */}
           <SummaryItem
-            label="Energy baseline"
-            value={
-              energyRow?.baselineAnnual != null
-                ? `${formatCompact(energyRow.baselineAnnual)} ${energyRow.unitLabel}`.trim()
-                : 'Not set'
-            }
+            label="Graphs"
+            value={graphs.length > 0 ? graphs.map((g) => g.label).join(', ') : 'None'}
           />
           <div className="col-span-2">
             <SummaryItem label="Escalation" value={describeEscalation(costRow)} />
@@ -231,7 +223,15 @@ export default function CostModelBox({
             readOnly={!canEdit}
             onSaved={onChanged}
             onStatus={setStatus}
-            focusBaseline={focusBaseline}
+            onOpenGraphSetup={
+              onOpenGraphSetup
+                ? () => {
+                    // One popup at a time: close this one, open graph setup.
+                    close()
+                    onOpenGraphSetup()
+                  }
+                : undefined
+            }
           />
         ) : null}
       </Modal>

@@ -8,21 +8,22 @@ import {
   getChunkPhasesForProject,
   getChunkProjectsForProject,
   getCostSettingsForProject,
-  getEnergySettingsForProject,
   getPhaseTemplates,
+  getProjectGraphs,
   replaceChunkPhases,
   setEscalationRateOverride,
   updateCostSettingsForProject,
-  updateEnergySettingsForProject,
+  updateProjectGraph,
 } from '@/lib/store'
 import { useAsyncData } from '@/lib/useAsyncData'
 import type {
   ChunkProject,
   PhaseTemplate,
   ProjectCostSettings,
-  ProjectEnergySettings,
+  ProjectGraph,
 } from '@/lib/types'
 import { layoutTemplatePhases, packageStartMonth } from './phase-layout'
+import { GraphColorPicker } from '../timeline/GraphSetup'
 
 /**
  * Where the numbers behind the numbers live.
@@ -52,7 +53,7 @@ export type CostModelSaveStatus =
   | { state: 'idle' | 'saving' | 'saved' }
   | { state: 'error'; message: string }
 
-type WriteChannel = 'cost' | 'energy' | 'override' | 'template'
+type WriteChannel = 'cost' | 'graph' | 'override' | 'template'
 
 type Props = {
   projectId: string
@@ -62,8 +63,9 @@ type Props = {
   onSaved?: () => void
   /** Every change in save state, including ones after unmount. */
   onStatus?: (status: CostModelSaveStatus) => void
-  /** Focus the Annual baseline input once the editor has loaded. */
-  focusBaseline?: boolean
+  /** Opens the Timeline's graph setup (where energy's unit, baseline and
+   *  interaction factor now live, migration 0032). Omit for read-only. */
+  onOpenGraphSetup?: () => void
 }
 
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
@@ -85,7 +87,7 @@ export default function CostModelEditor({
   readOnly,
   onSaved,
   onStatus,
-  focusBaseline = false,
+  onOpenGraphSetup,
 }: Props) {
   const {
     data: costRow,
@@ -97,15 +99,13 @@ export default function CostModelEditor({
     null
   )
 
+  // The Timeline's graphs (0032), for the colour swatches below. Energy's
+  // settings used to be edited here; they are a graph's settings now.
   const {
-    data: energyRow,
-    setData: setEnergyRow,
-    error: energyError,
-  } = useAsyncData<ProjectEnergySettings | null>(
-    () => getEnergySettingsForProject(projectId),
-    [projectId],
-    null
-  )
+    data: graphs,
+    setData: setGraphs,
+    error: graphsError,
+  } = useAsyncData<ProjectGraph[] | null>(() => getProjectGraphs(projectId), [projectId], null)
 
   const { data: templates } = useAsyncData<PhaseTemplate[]>(
     () => getPhaseTemplates(projectId),
@@ -131,14 +131,12 @@ export default function CostModelEditor({
   const onSavedRef = useRef(onSaved)
   const onStatusRef = useRef(onStatus)
   const costTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const energyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const pendingCostRef = useRef<Partial<ProjectCostSettings>>({})
-  const pendingEnergyRef = useRef<Partial<ProjectEnergySettings>>({})
   // Save bookkeeping lives in refs, not state: it has to keep working after
   // unmount, while the flush's request is still out.
   const inFlightRef = useRef(0)
   const savedOnceRef = useRef(false)
-  // Per channel, so a cost write that failed is not "cleared" by an energy
+  // Per channel, so a cost write that failed is not "cleared" by a graph
   // write that succeeded afterwards.
   const errorsRef = useRef(new Map<WriteChannel, string>())
 
@@ -151,8 +149,7 @@ export default function CostModelEditor({
 
   function reportStatus() {
     const error = [...errorsRef.current.values()].at(-1)
-    const pending =
-      costTimerRef.current !== null || energyTimerRef.current !== null || inFlightRef.current > 0
+    const pending = costTimerRef.current !== null || inFlightRef.current > 0
     onStatusRef.current?.(
       error !== undefined
         ? { state: 'error', message: error }
@@ -207,19 +204,6 @@ export default function CostModelEditor({
           )
         }
       }
-      if (energyTimerRef.current) {
-        clearTimeout(energyTimerRef.current)
-        energyTimerRef.current = null
-        const payload = pendingEnergyRef.current
-        pendingEnergyRef.current = {}
-        if (Object.keys(payload).length > 0) {
-          void trackWrite(
-            'energy',
-            updateEnergySettingsForProject(projectId, payload),
-            'Failed to save energy settings.'
-          )
-        }
-      }
       reportStatus()
     }
     // trackWrite/reportStatus only touch refs, so the first render's copies
@@ -248,22 +232,12 @@ export default function CostModelEditor({
     reportStatus()
   }
 
-  function patchEnergy(updates: Partial<ProjectEnergySettings>) {
+  /** A swatch click is one discrete choice, so it is written at once (no
+   *  debounce); the Timeline re-reads the graphs through onSaved. */
+  function setGraphColor(graphId: string, color: string) {
     if (readOnly) return
-    setEnergyRow((prev) => (prev ? { ...prev, ...updates } : prev))
-    pendingEnergyRef.current = { ...pendingEnergyRef.current, ...updates }
-    if (energyTimerRef.current) clearTimeout(energyTimerRef.current)
-    energyTimerRef.current = setTimeout(() => {
-      energyTimerRef.current = null
-      const payload = pendingEnergyRef.current
-      pendingEnergyRef.current = {}
-      void trackWrite(
-        'energy',
-        updateEnergySettingsForProject(projectId, payload),
-        'Failed to save energy settings.'
-      )
-    }, PERSIST_DEBOUNCE_MS)
-    reportStatus()
+    setGraphs((prev) => (prev ? prev.map((g) => (g.id === graphId ? { ...g, color } : g)) : prev))
+    void trackWrite('graph', updateProjectGraph(graphId, { color }), 'Failed to save the graph colour.')
   }
 
   /**
@@ -396,10 +370,10 @@ export default function CostModelEditor({
     if (!ok) setTemplateFailed({ templateId, packages: failed.length > 0 ? failed : packages })
   }
 
-  if (!costRow || !energyRow) {
+  if (!costRow || !graphs) {
     return (
       <div className="px-6 py-12 text-center text-sm font-medium text-slate-400">
-        {costError || energyError ? 'Could not load the cost model.' : 'Loading…'}
+        {costError || graphsError ? 'Could not load the cost model.' : 'Loading…'}
       </div>
     )
   }
@@ -765,55 +739,52 @@ export default function CostModelEditor({
         </div>
       </section>
 
-      {/* ----------------------------------------------------------- energy -- */}
-      <section className={SECTION_CLASS}>
-        <h3 className="text-sm font-semibold text-slate-950">Energy</h3>
-
-        <div className="mt-3 grid gap-4 md:grid-cols-3">
-          <Field label="Unit">
-            <input
-              type="text"
-              value={energyRow.unitLabel}
-              onChange={(e) => patchEnergy({ unitLabel: e.target.value })}
-              className={INPUT_CLASS}
-            />
-          </Field>
-
-          <Field label="Annual baseline">
-            <input
-              type="number"
-              min={0}
-              step={1000}
-              value={energyRow.baselineAnnual ?? ''}
-              onChange={(e) =>
-                patchEnergy({
-                  baselineAnnual: e.target.value === '' ? null : Number(e.target.value),
-                })
-              }
-              placeholder="Not set"
-              // Mounts only once the rows have loaded, so autoFocus lands
-              // after the popup is up.
-              autoFocus={focusBaseline && !readOnly}
-              className={INPUT_CLASS}
-            />
-          </Field>
-
-          <Field label="Interaction factor">
-            <input
-              type="number"
-              min={0.1}
-              max={2}
-              step={0.01}
-              value={energyRow.interactionFactor}
-              onChange={(e) =>
-                patchEnergy({
-                  interactionFactor: Math.min(2, Math.max(0.1, Number(e.target.value) || 1)),
-                })
-              }
-              className={INPUT_CLASS}
-            />
-          </Field>
+      {/* ----------------------------------------------------------- graphs -- */}
+      {/* Was the Energy section (unit, baseline, interaction factor). Since
+          0032 energy is one of the Timeline's graphs, and every graph is set
+          up in ONE place -- the Timeline's Graphs popup, because the owner
+          wanted it "in the timeline setting". What stays here is what he
+          floated for the cost model: "control over the colors". A summary
+          of each graph plus its colour swatches, and a link to the rest. */}
+      <section className={SECTION_CLASS} aria-label="Graphs">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <h3 className="text-sm font-semibold text-slate-950">Graphs</h3>
+          {onOpenGraphSetup ? (
+            <button
+              type="button"
+              onClick={onOpenGraphSetup}
+              className="rounded-full border border-slate-300 bg-white px-3 py-1 text-xs font-semibold text-slate-700 transition hover:border-slate-500"
+            >
+              Set up graphs
+            </button>
+          ) : null}
         </div>
+        {graphs.length === 0 ? (
+          <p className="mt-2 text-sm text-slate-500">No graphs under the timeline.</p>
+        ) : (
+          <ul className="mt-3 space-y-3">
+            {graphs.map((graph) => (
+              <li key={graph.id} className="flex flex-wrap items-center justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="text-sm font-medium text-slate-900">{graph.label}</div>
+                  <div className="text-xs text-slate-500">
+                    Baseline{' '}
+                    {graph.baselineAnnual !== null
+                      ? `${graph.baselineAnnual.toLocaleString('en-US')} ${graph.unitLabel}`.trim()
+                      : 'not set'}
+                    {' · '}interaction ×{graph.interactionFactor}
+                  </div>
+                </div>
+                <GraphColorPicker
+                  value={graph.color}
+                  onChange={(color) => setGraphColor(graph.id, color)}
+                  allowCustom={false}
+                  disabled={readOnly}
+                />
+              </li>
+            ))}
+          </ul>
+        )}
       </section>
     </fieldset>
   )

@@ -17,8 +17,6 @@ import {
 import {
   DEFAULT_COST_SETTINGS,
   applyScenarioOverlay,
-  DEFAULT_ENERGY_SETTINGS,
-  computeEnergySeries,
   computeFiscalYearTotals,
   computeSlotCosts,
   findDependencyViolations,
@@ -32,7 +30,6 @@ import {
   slotFiscalLabel,
   summarisePackage,
   type CostSettings,
-  type EnergySettings,
   type PackageInput,
   type Phase,
   type PhaseDependency as EnginePhaseDependency,
@@ -44,7 +41,6 @@ import {
   getChunkPhasesForProject,
   getChunkProjectsForProject,
   getCostSettingsForProject,
-  getEnergySettingsForProject,
   getLineItemsForProject,
   getPhaseDependenciesForProject,
   getScenariosForProject,
@@ -65,7 +61,6 @@ import type {
   PhaseDependency,
   Project,
   ProjectCostSettings,
-  ProjectEnergySettings,
   ProjectTimelineSettings,
   Scenario,
   ScenarioPayload,
@@ -77,7 +72,8 @@ import TimelineGrid, {
   type DragMode,
   type RowLayout,
 } from './timeline/TimelineGrid'
-import EnergyChart from './timeline/EnergyChart'
+import TimelineGraphs, { useTimelineGraphs } from './timeline/TimelineGraphs'
+import GraphSetupButton from './timeline/GraphSetup'
 import type { ArrowLink } from './timeline/DependencyArrows'
 import ExportBar from './ExportBar'
 import TimelineFilter from './view-filter/TimelineFilter'
@@ -179,15 +175,6 @@ function toCostSettings(
   }
 }
 
-function toEnergySettings(row: ProjectEnergySettings | null): EnergySettings {
-  if (!row) return DEFAULT_ENERGY_SETTINGS
-  return {
-    unitLabel: row.unitLabel,
-    baselineAnnual: row.baselineAnnual,
-    interactionFactor: row.interactionFactor,
-  }
-}
-
 /** Up to four names, then "and N more" -- a rebase can touch dozens of phases
  *  and the banner must stay a sentence, not a report. */
 function listNames(names: string[]): string {
@@ -215,6 +202,10 @@ type Props = {
   permissions: ProjectPermissions
   /** Switches the workspace to the Master View tab. Supplied by the shell. */
   onOpenMasterView?: () => void
+  /** Switches to Settings, where the line-item form is built. Supplied by
+   *  the shell for project admins only; graph setup links there when the
+   *  form has no number field to graph. */
+  onOpenFormBuilder?: () => void
 }
 
 /** The bar being dragged right now and where it currently sits. Applied on
@@ -263,9 +254,30 @@ const DEFAULT_TIMELINE_SETTINGS: Omit<ProjectTimelineSettings, 'projectId'> = {
   fiscalYearLabelsBy: 'end_year',
 }
 
-export default function TimelineTab({ project, permissions, onOpenMasterView }: Props) {
-  // Bumped by the energy chart's empty state to open the Cost model popup.
-  const [costModelOpenRequest, setCostModelOpenRequest] = useState(0)
+export default function TimelineTab({
+  project,
+  permissions,
+  onOpenMasterView,
+  onOpenFormBuilder,
+}: Props) {
+  // The graphs under the timeline (migration 0032) and the request that
+  // opens their setup popup at one graph (a chart's empty state, the Cost
+  // model's graph list).
+  const {
+    graphs,
+    setGraphs,
+    reloadGraphs,
+    formFields,
+    error: graphsError,
+  } = useTimelineGraphs(project.id)
+  const [graphSetupRequest, setGraphSetupRequest] = useState<{ n: number; graphId: string | null }>({
+    n: 0,
+    graphId: null,
+  })
+  const openGraphSetup = useCallback(
+    (graphId: string | null) => setGraphSetupRequest((r) => ({ n: r.n + 1, graphId })),
+    []
+  )
   const { data: chunkProjects, loading: chunksLoading, error: chunksError } = useAsyncData<
     ChunkProject[]
   >(() => getChunkProjectsForProject(project.id), [project.id], [])
@@ -318,30 +330,22 @@ export default function TimelineTab({ project, permissions, onOpenMasterView }: 
     null
   )
 
-  const {
-    data: energySettingsRow,
-    error: energySettingsError,
-    reload: reloadEnergySettings,
-  } = useAsyncData<ProjectEnergySettings | null>(
-    () => getEnergySettingsForProject(project.id),
-    [project.id],
-    null
-  )
-
   // Phases and links too: changing the project's phase template re-applies
-  // it to every package (cost-model/CostModelEditor).
+  // it to every package (cost-model/CostModelEditor). Graphs: the popup's
+  // graph list can recolour them (0032; energy settings are no longer read).
   const handleCostModelChanged = useCallback(() => {
     reloadCostSettings()
-    reloadEnergySettings()
+    reloadGraphs()
     reloadPhases()
     reloadDependencies()
-  }, [reloadCostSettings, reloadEnergySettings, reloadPhases, reloadDependencies])
+  }, [reloadCostSettings, reloadGraphs, reloadPhases, reloadDependencies])
 
   // Display choices: the project default, or this person's own from the
   // Filter button (lib/use-effective-view-settings). Display only: nothing
-  // here changes what is priced, just what is drawn.
+  // here changes what is priced, just what is drawn. `showEnergy` is the
+  // switch for every graph now; `hiddenGraphs` hides them one by one.
   const timelineView = useEffectiveViewSettings(project.id, 'timeline', permissions.isAdmin)
-  const { costBreakdown, showEnergy, showPackages } = timelineView.effective
+  const { costBreakdown, showEnergy, showPackages, hiddenGraphs } = timelineView.effective
 
   const [expanded, setExpanded] = useState<Set<string>>(new Set())
   const [hoveredSlot, setHoveredSlot] = useState<number | null>(null)
@@ -428,7 +432,6 @@ export default function TimelineTab({ project, permissions, onOpenMasterView }: 
     () => toCostSettings(costSettingsRow, standInYear),
     [costSettingsRow, standInYear]
   )
-  const energySettings = useMemo(() => toEnergySettings(energySettingsRow), [energySettingsRow])
 
   // The CONFIGURED geometry, at the viewer's zoom. Everything that draws or
   // totals uses `geometry` below, which is this stretched by the one horizon
@@ -578,11 +581,6 @@ export default function TimelineTab({ project, permissions, onOpenMasterView }: 
   )
 
   const slotCosts = useMemo(() => computeSlotCosts(summaries, geometry), [summaries, geometry])
-
-  const energySeries = useMemo(
-    () => computeEnergySeries(summaries, energySettings, geometry),
-    [summaries, energySettings, geometry]
-  )
 
   // Monthly resolution, fiscal quarters (M-26, D-11) -- the same function the
   // export's Annual Cost Summary uses.
@@ -1208,7 +1206,7 @@ export default function TimelineTab({ project, permissions, onOpenMasterView }: 
     dependenciesError ??
     timelineSettingsError ??
     costSettingsError ??
-    energySettingsError
+    graphsError
 
   const grandTotal = summaries.reduce((sum, s) => sum + s.totalEscalatedCost, 0)
   const grandBase = summaries.reduce((sum, s) => sum + s.totalBaseCost, 0)
@@ -1220,7 +1218,21 @@ export default function TimelineTab({ project, permissions, onOpenMasterView }: 
           <h2 className="text-xl font-semibold tracking-tight text-slate-950">Timeline</h2>
 
           <div className="flex flex-wrap items-center gap-2">
-            <TimelineFilter view={timelineView} />
+            <TimelineFilter view={timelineView} graphs={graphs} />
+            {/* "they set it up in the timeline setting": graph setup lives
+                here, beside the view filter (timeline/GraphSetup). Editors
+                only; everyone else can still show/hide graphs in Filter. */}
+            {canEditBaseline ? (
+              <GraphSetupButton
+                projectId={project.id}
+                graphs={graphs}
+                setGraphs={setGraphs}
+                formFields={formFields}
+                canEdit={canEditBaseline}
+                onOpenFormBuilder={onOpenFormBuilder}
+                openRequest={graphSetupRequest}
+              />
+            ) : null}
             {/* The two deliverables the client actually asked for: "we can make
                 that an Excel spreadsheet pretty easily that we could give to the
                 client. And then we would want a PDF view of the whole phasing
@@ -1362,9 +1374,9 @@ export default function TimelineTab({ project, permissions, onOpenMasterView }: 
             projectId={project.id}
             canEdit={canEditBaseline}
             costRow={costSettingsRow}
-            energyRow={energySettingsRow}
+            graphs={graphs}
             onChanged={handleCostModelChanged}
-            openRequest={costModelOpenRequest}
+            onOpenGraphSetup={canEditBaseline ? () => openGraphSetup(null) : undefined}
           />
         </div>
       </div>
@@ -1441,14 +1453,20 @@ export default function TimelineTab({ project, permissions, onOpenMasterView }: 
               onPhasePointerDown={handlePhasePointerDown}
               onSelectLink={() => undefined}
             />
+            {/* One chart per graph (0032), stacked in sort_order, each on
+                the grid's own x-scale. */}
             {showEnergy ? (
-              <EnergyChart
-                series={energySeries}
+              <TimelineGraphs
+                graphs={graphs}
+                formFields={formFields}
+                hiddenGraphs={hiddenGraphs}
+                summaries={summaries}
+                chunkProjects={chunkProjects}
+                lineItemsById={lineItemMap}
+                geometry={geometry}
                 slotCount={slotCount}
                 hoveredSlot={hoveredSlot}
-                onOpenCostModel={
-                  canEditBaseline ? () => setCostModelOpenRequest((n) => n + 1) : undefined
-                }
+                onOpenSetup={canEditBaseline ? openGraphSetup : undefined}
                 onOpenMasterView={permissions.canContribute ? onOpenMasterView : undefined}
               />
             ) : null}

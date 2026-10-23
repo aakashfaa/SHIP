@@ -19,8 +19,14 @@ export type ProjectViewSettings = {
   timeline: {
     /** The cost row(s) under the timeline grid: by fiscal year, by quarter, or hidden. */
     costBreakdown: TimelineCostBreakdown
+    /** Every graph under the timeline (migration 0032). The key predates
+     *  graphs other than energy; it is the master "Graphs" switch now. */
     showEnergy: boolean
     showPackages: boolean
+    /** Graphs (ship.project_graphs ids) hidden individually. A HIDDEN list,
+     *  like the column settings, so a graph an editor adds later shows by
+     *  default instead of silently missing. */
+    hiddenGraphs: string[]
   }
 }
 
@@ -35,7 +41,7 @@ export type ViewColumn = {
 export const DEFAULT_VIEW_SETTINGS: ProjectViewSettings = {
   masterView: { hiddenColumns: [] },
   chunking: { hiddenColumns: [] },
-  timeline: { costBreakdown: 'fiscal-year', showEnergy: true, showPackages: true },
+  timeline: { costBreakdown: 'fiscal-year', showEnergy: true, showPackages: true, hiddenGraphs: [] },
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -60,6 +66,7 @@ export function normalizeViewSettings(raw: unknown): ProjectViewSettings {
           : DEFAULT_VIEW_SETTINGS.timeline.costBreakdown,
       showEnergy: typeof t.showEnergy === 'boolean' ? t.showEnergy : true,
       showPackages: typeof t.showPackages === 'boolean' ? t.showPackages : true,
+      hiddenGraphs: stringList(t.hiddenGraphs),
     },
   }
 }

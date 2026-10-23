@@ -19,6 +19,9 @@ import {
   DependencyCycleError,
   computeEnergySeries,
   computeFiscalYearTotals,
+  computeMetricByFiscalYear,
+  computeMetricSeries,
+  energyValues,
   computePhaseCost,
   computeSlotCosts,
   constraintStart,
@@ -483,6 +486,41 @@ describe('energy series', () => {
 
     assert.equal(series.points[9].remainingConsumption, null)
     assert.equal(series.points[9].cumulativeSavings, 100_000)
+  })
+
+  test('any graph (0032): the same staircase from any per-package value', () => {
+    // A carbon graph: values come from the caller's map, not energySavingsAnnual.
+    const summaries = [pkg('A', 100_000, 0, 2), pkg('B', 0, 4, 2)]
+    const carbon = computeMetricSeries(
+      summaries,
+      new Map([['A', 40], ['B', 60]]),
+      { unitLabel: 'MTCO2e', baselineAnnual: 200, interactionFactor: 0.5 },
+      GEOMETRY
+    )
+    assert.equal(carbon.points[1].cumulativeSavings, 20)
+    assert.equal(carbon.points[6].cumulativeSavings, 50)
+    assert.equal(carbon.points[6].remainingConsumption, 150)
+    assert.equal(carbon.finalSavings, 50)
+    assert.equal(carbon.unitLabel, 'MTCO2e')
+
+    // Energy is exactly the generic series over energySavingsAnnual.
+    assert.deepEqual(
+      computeEnergySeries(summaries, energy, GEOMETRY),
+      computeMetricSeries(summaries, energyValues(summaries), energy, GEOMETRY)
+    )
+
+    // A package missing from the map, or with a non-positive value, adds nothing.
+    const sparse = computeMetricSeries(summaries, new Map([['B', -5]]), energy, GEOMETRY)
+    assert.equal(sparse.finalSavings, 0)
+  })
+
+  test('fiscal-year rows end where the column series ends', () => {
+    const summaries = [pkg('A', 100_000, 0, 2), pkg('B', 250_000, 4, 2)]
+    const values = new Map([['A', 7], ['B', 3]])
+    const byYear = computeMetricByFiscalYear(summaries, values, energy, GEOMETRY)
+    const series = computeMetricSeries(summaries, values, energy, GEOMETRY)
+    assert.equal(byYear.at(-1)?.cumulativeSavings, series.finalSavings)
+    assert.equal(byYear.at(-1)?.remainingConsumption, 1_000_000 - 10)
   })
 
   test('remaining consumption never goes negative', () => {

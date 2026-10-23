@@ -497,6 +497,30 @@ export type ProjectEnergySettings = {
 }
 
 /**
+ * One graph under the Timeline (migration 0032, ship.project_graphs). The
+ * energy chart generalised: Megan wanted carbon "on a separate graph right
+ * below energy [...] a different color (blue maybe?)", and the owner wanted
+ * "graphs from any column they want". Energy is the first of these rows,
+ * seeded from ProjectEnergySettings, which the app no longer reads.
+ */
+export type ProjectGraph = {
+  id: string
+  projectId: string
+  label: string
+  /** The line-item value the graph sums per package: a built-in numeric
+   *  column key (annual_energy_savings, annual_cost_savings,
+   *  estimated_first_cost) or a custom number/currency FormField.key. See
+   *  lib/graphs.ts. */
+  sourceKey: string
+  unitLabel: string
+  baselineAnnual: number | null
+  interactionFactor: number
+  /** '#rrggbb', lower-case. */
+  color: string
+  sortOrder: number
+}
+
+/**
  * A branched copy of a project's schedule — the Revit local-copy model the
  * client asked for by name.
  *

@@ -4,12 +4,15 @@ import type { EffectiveViewSettings } from '@/lib/use-effective-view-settings'
 import type { TimelineCostBreakdown } from '@/lib/view-settings'
 import ViewFilter from './ViewFilter'
 
-/** Timeline filter: the cost row (fiscal year / quarter / off), the energy
- *  chart and the package bars. For non-admins, whatever the project default
- *  turned off stays off (disabled, "Hidden by admin"). */
+/** Timeline filter: the cost row (fiscal year / quarter / off), the graphs
+ *  under the timeline (all of them, and each one -- migration 0032) and the
+ *  package bars. For non-admins, whatever the project default turned off
+ *  stays off (disabled, "Hidden by admin"). */
 type Props = {
   view: EffectiveViewSettings<'timeline'>
   align?: 'left' | 'right'
+  /** The project's graphs, in drawing order, for the per-graph switches. */
+  graphs?: ReadonlyArray<{ id: string; label: string; color: string }>
 }
 
 const COST_OPTIONS: { value: TimelineCostBreakdown; label: string }[] = [
@@ -18,11 +21,19 @@ const COST_OPTIONS: { value: TimelineCostBreakdown; label: string }[] = [
   { value: 'none', label: 'Off' },
 ]
 
-export default function TimelineFilter({ view, align }: Props) {
+export default function TimelineFilter({ view, align, graphs = [] }: Props) {
   const current = view.effective
   const base = view.projectDefault
   const costLocked = !view.isAdmin && base.costBreakdown === 'none'
-  const off = (current.costBreakdown === 'none' ? 1 : 0) + (current.showEnergy ? 0 : 1) + (current.showPackages ? 0 : 1)
+  // Graph ids hidden that still exist (a deleted graph's id can linger).
+  const hiddenGraphCount = current.showEnergy
+    ? graphs.filter((g) => current.hiddenGraphs.includes(g.id)).length
+    : 0
+  const off =
+    (current.costBreakdown === 'none' ? 1 : 0) +
+    (current.showEnergy ? 0 : 1) +
+    (current.showPackages ? 0 : 1) +
+    hiddenGraphCount
 
   return (
     <ViewFilter
@@ -61,12 +72,38 @@ export default function TimelineFilter({ view, align }: Props) {
             })}
           </div>
         </div>
+        {/* The graphs under the timeline (0032): one switch for all of
+            them (the old "Energy chart" setting), then one per graph. */}
         <Toggle
-          label="Energy chart"
+          label="Graphs"
           checked={current.showEnergy}
           lockedOff={!view.isAdmin && !base.showEnergy}
           onChange={(showEnergy) => view.setPersonal({ ...current, showEnergy })}
         />
+        {current.showEnergy && graphs.length > 0 ? (
+          <div className="-mt-1 space-y-0.5 border-l border-slate-200 pl-3" data-testid="timeline-filter-graphs">
+            {graphs.map((graph) => {
+              const hidden = current.hiddenGraphs.includes(graph.id)
+              return (
+                <Toggle
+                  key={graph.id}
+                  label={graph.label}
+                  swatch={graph.color}
+                  checked={!hidden}
+                  lockedOff={!view.isAdmin && base.hiddenGraphs.includes(graph.id)}
+                  onChange={(show) =>
+                    view.setPersonal({
+                      ...current,
+                      hiddenGraphs: show
+                        ? current.hiddenGraphs.filter((id) => id !== graph.id)
+                        : [...current.hiddenGraphs, graph.id],
+                    })
+                  }
+                />
+              )
+            })}
+          </div>
+        ) : null}
         <Toggle
           label="Packages"
           checked={current.showPackages}
@@ -83,11 +120,14 @@ function Toggle({
   checked,
   lockedOff,
   onChange,
+  swatch,
 }: {
   label: string
   checked: boolean
   lockedOff: boolean
   onChange: (v: boolean) => void
+  /** A graph's colour, shown as a dot before its name. */
+  swatch?: string
 }) {
   return (
     <label
@@ -95,7 +135,12 @@ function Toggle({
         lockedOff ? 'text-slate-400' : 'text-slate-700'
       }`}
     >
-      <span>{label}</span>
+      <span className="flex min-w-0 items-center gap-2">
+        {swatch ? (
+          <span aria-hidden className="inline-block h-2.5 w-2.5 shrink-0 rounded-full" style={{ backgroundColor: swatch }} />
+        ) : null}
+        <span className="truncate">{label}</span>
+      </span>
       <span className="flex items-center gap-2">
         {lockedOff ? <span className="text-[10px]">Hidden by admin</span> : null}
         <input
