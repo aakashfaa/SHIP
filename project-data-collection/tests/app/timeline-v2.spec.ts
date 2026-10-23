@@ -123,9 +123,10 @@ test('the cost model popup exposes the assumptions behind the numbers', async ({
   await expect(page.locator('[data-workspace-topbar] p').first()).toHaveText(/^Timeline · /)
 
   await page.getByRole('button', { name: 'Edit cost model', exact: true }).click()
-  const dialog = page.getByRole('dialog', { name: 'Cost model', exact: true })
+  // The title names the open version (0031): "Cost model — Version 1".
+  const dialog = page.getByRole('dialog', { name: /^Cost model — / })
   await expect(dialog).toBeVisible()
-  await expect(dialog.getByRole('heading', { name: 'Cost model', exact: true })).toBeVisible()
+  await expect(dialog.getByRole('heading', { name: /^Cost model — / })).toBeVisible()
   await expect(dialog.getByText('What $1,000,000 becomes')).toBeVisible()
   await settle(page)
 
