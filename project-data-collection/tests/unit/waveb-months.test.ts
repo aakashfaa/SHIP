@@ -421,6 +421,19 @@ function exportTables(zoomLevel: number) {
     },
     escalation_rate_overrides: [],
     project_energy_settings: { project_id: PROJECT_ID, unit_label: 'kBtu/yr', baseline_annual: null, interaction_factor: 1 },
+    project_graphs: [
+      {
+        id: 'g-energy',
+        project_id: PROJECT_ID,
+        label: 'Energy reduction',
+        source_key: 'annual_energy_savings',
+        unit_label: 'kBtu/yr',
+        baseline_annual: null,
+        interaction_factor: 1,
+        color: '#059669',
+        sort_order: 0,
+      },
+    ],
     project_timeline_settings: {
       project_id: PROJECT_ID,
       years: 10,
@@ -449,7 +462,7 @@ describe('Excel export (M-01, M-26, M-27)', () => {
       assert.deepEqual(data.packages, at[0].packages)
       assert.deepEqual(data.phases, at[0].phases)
       assert.deepEqual(data.annualCostSummary, at[0].annualCostSummary)
-      assert.deepEqual(data.energySummary, at[0].energySummary)
+      assert.deepEqual(data.graphSummaries, at[0].graphSummaries)
     }
   })
 

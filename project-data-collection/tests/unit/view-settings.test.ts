@@ -29,7 +29,7 @@ describe('normalizeViewSettings', () => {
     const value = {
       masterView: { hiddenColumns: ['cost', 'notes'] },
       chunking: { hiddenColumns: ['energy'] },
-      timeline: { costBreakdown: 'quarter' as const, showEnergy: false, showPackages: false },
+      timeline: { costBreakdown: 'quarter' as const, showEnergy: false, showPackages: false, hiddenGraphs: ['g1'] },
     }
     assert.deepEqual(normalizeViewSettings(value), value)
     assert.deepEqual(normalizeViewSettings(JSON.parse(JSON.stringify(value))), value)

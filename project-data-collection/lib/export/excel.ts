@@ -104,6 +104,22 @@ function addSheet<T>(
   }
 }
 
+/**
+ * A graph's sheet name: its label, made legal for Excel (no []:*?/\, at
+ * most 31 characters, unique case-insensitively within the workbook) --
+ * "Energy reduction", "Carbon reduction". Records the name in `used`.
+ */
+export function graphSheetName(label: string, used: Set<string>): string {
+  const base = label.replace(/[[\]:*?/\\]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 31) || 'Graph'
+  let name = base
+  for (let n = 2; used.has(name.toLowerCase()); n += 1) {
+    const suffix = ` (${n})`
+    name = `${base.slice(0, 31 - suffix.length)}${suffix}`
+  }
+  used.add(name.toLowerCase())
+  return name
+}
+
 export function buildExcelWorkbook(data: ProjectReportData): ExcelJS.Workbook {
   const workbook = new ExcelJS.Workbook()
   workbook.creator = 'SHIP'
@@ -196,28 +212,34 @@ export function buildExcelWorkbook(data: ProjectReportData): ExcelJS.Workbook {
     banner
   )
 
-  addSheet(
-    workbook,
-    'Energy Summary',
-    [
-      { header: 'Fiscal Year', width: 14, value: (r) => r.fiscalYear },
-      {
-        header: `Cumulative Savings (${data.energyUnitLabel})`,
-        width: 26,
-        value: (r) => r.cumulativeSavings,
-      },
-      {
-        header:
-          data.energyBaselineAnnual !== null
-            ? `Remaining Consumption (${data.energyUnitLabel})`
-            : 'Remaining Consumption (no baseline set)',
-        width: 30,
-        value: (r) => r.remainingConsumption ?? '',
-      },
-    ],
-    data.energySummary,
-    banner
-  )
+  // One fiscal-year sheet per Timeline graph (migration 0032), in the
+  // Timeline's order -- what the single "Energy Summary" sheet became.
+  const usedNames = new Set(workbook.worksheets.map((s) => s.name.toLowerCase()))
+  for (const graph of data.graphSummaries) {
+    const unit = graph.unitLabel.trim()
+    const withUnit = (heading: string) => (unit ? `${heading} (${unit})` : heading)
+    addSheet(
+      workbook,
+      graphSheetName(graph.label, usedNames),
+      [
+        { header: 'Fiscal Year', width: 14, value: (r) => r.fiscalYear },
+        {
+          header: withUnit(`Cumulative ${graph.label}`),
+          width: 30,
+          value: (r) => r.cumulativeSavings,
+        },
+        {
+          header: graph.hasBaseline
+            ? withUnit('Remaining from Baseline')
+            : 'Remaining from Baseline (no baseline set)',
+          width: 32,
+          value: (r) => r.remainingConsumption ?? '',
+        },
+      ],
+      graph.rows,
+      banner
+    )
+  }
 
   return workbook
 }

@@ -78,6 +78,8 @@ import {
   ScenarioPhase,
   TaxonomyKind,
 } from './types'
+import { projectGraphToRow, rowToProjectGraph, type ProjectGraphRow } from './mappers'
+import type { ProjectGraph } from './types'
 
 const PROJECT_SELECT = '*, project_consultants(*), project_members(*)'
 const CHUNK_SELECT = '*, chunk_project_items(*)'
@@ -1008,6 +1010,11 @@ export async function clearEscalationRateOverride(
 
 /* ---------------------------------------------------------- energy settings -- */
 
+// LEGACY since migration 0032: nothing in the app calls these any more --
+// energy is the first of the project's graphs (getProjectGraphs below), and
+// project_energy_settings is kept only as 0032's seed source. Left exported
+// so a branch still importing them compiles; do not add new callers.
+
 export async function getEnergySettingsForProject(
   projectId: string
 ): Promise<ProjectEnergySettings> {
@@ -1044,6 +1051,89 @@ export async function updateEnergySettingsForProject(
   }
 
   return getEnergySettingsForProject(projectId)
+}
+
+/* ----------------------------------------------------------------- graphs -- */
+
+/**
+ * The project's Timeline graphs (migration 0032), in drawing order. Since
+ * 0032 this, not getEnergySettingsForProject, is what the Timeline, the Cost
+ * model popup and the export read; energy is the first graph.
+ *
+ * Unlike the energy-settings writes above, graph writes do NOT swallow
+ * 42501: the setup UI is only offered to editors, so a refusal means the
+ * role changed under the user and they need to be told, not shown a
+ * graph that silently did not save.
+ */
+export async function getProjectGraphs(projectId: string): Promise<ProjectGraph[]> {
+  const supabase = getSupabaseBrowserClient()
+
+  const { data, error } = await supabase
+    .from('project_graphs')
+    .select('*')
+    .eq('project_id', projectId)
+    .order('sort_order', { ascending: true })
+    .order('created_at', { ascending: true })
+
+  if (error) fail(`Failed to load graphs for "${projectId}"`, error)
+
+  return ((data ?? []) as unknown as ProjectGraphRow[]).map(rowToProjectGraph)
+}
+
+export async function createProjectGraph(
+  projectId: string,
+  graph: Omit<ProjectGraph, 'id' | 'projectId'>
+): Promise<ProjectGraph> {
+  const supabase = getSupabaseBrowserClient()
+
+  const { data, error } = await supabase
+    .from('project_graphs')
+    .insert({ ...projectGraphToRow(graph), project_id: projectId })
+    .select('*')
+    .single()
+
+  if (error) fail(`Failed to add the graph "${graph.label}"`, error)
+
+  return rowToProjectGraph(data as unknown as ProjectGraphRow)
+}
+
+export async function updateProjectGraph(
+  graphId: string,
+  updates: Partial<Omit<ProjectGraph, 'id' | 'projectId'>>
+): Promise<ProjectGraph> {
+  const supabase = getSupabaseBrowserClient()
+
+  const { data, error } = await supabase
+    .from('project_graphs')
+    .update(projectGraphToRow(updates))
+    .eq('id', graphId)
+    .select('*')
+    .maybeSingle()
+
+  if (error) fail('Failed to save the graph', error)
+  // RLS filters an UPDATE it refuses down to zero rows rather than raising.
+  if (!data) fail('Failed to save the graph', { message: 'you no longer have permission to edit graphs on this project' })
+
+  return rowToProjectGraph(data as unknown as ProjectGraphRow)
+}
+
+export async function deleteProjectGraph(graphId: string): Promise<void> {
+  const supabase = getSupabaseBrowserClient()
+
+  const { error } = await supabase.from('project_graphs').delete().eq('id', graphId)
+
+  if (error) fail('Failed to delete the graph', error)
+}
+
+/** Persist a drawing order (index = new sort_order). A handful of rows, so
+ *  one update per row that actually moved. */
+export async function reorderProjectGraphs(
+  graphs: ReadonlyArray<Pick<ProjectGraph, 'id' | 'sortOrder'>>
+): Promise<void> {
+  const moved = graphs
+    .map((graph, index) => ({ graph, index }))
+    .filter(({ graph, index }) => graph.sortOrder !== index)
+  await Promise.all(moved.map(({ graph, index }) => updateProjectGraph(graph.id, { sortOrder: index })))
 }
 
 /* --------------------------------------------------------------- scenarios -- */

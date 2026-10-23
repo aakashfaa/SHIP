@@ -120,6 +120,10 @@ export type EnergySettings = {
   interactionFactor: number
 }
 
+/** One timeline graph's settings (migration 0032) -- the same three knobs
+ *  energy always had, now carried by every graph. */
+export type MetricSettings = EnergySettings
+
 /** One package's aggregate inputs, already summed from its line items.
  *  Quantity lives on the line-item↔package join, so the caller applies it. */
 export type PackageInput = {
@@ -727,7 +731,26 @@ export function computeFiscalYearTotals(
   return [...byYear.values()].sort((a, b) => a.fiscalYear - b.fiscalYear)
 }
 
-/* ---------------------------------------------------------------- energy -- */
+/* ---------------------------------------------------------------- graphs -- */
+
+/*
+ * The graphs under the Timeline (migration 0032).
+ *
+ * This used to be energy only: one chart, fed by each package's
+ * `energySavingsAnnual`. Megan then asked for carbon "on a separate graph
+ * right below energy", and the owner generalised it: "allow them to create
+ * graphs from any column they want". So the staircase below is computed for
+ * ANY per-package annual value -- the caller sums the chosen line-item
+ * column per package (lib/graphs.ts `packageGraphValues`, link quantity
+ * included, exactly as energy always was) and passes the totals in. Energy
+ * is now simply the first graph; `computeEnergySeries` and
+ * `computeEnergyByFiscalYear` stay as thin wrappers over the generic pair.
+ */
+
+/** Per package (by chunkProjectId): a graph's annual value once that
+ *  package is in service, summed from its line items, BEFORE the
+ *  interaction factor. A package missing from the map contributes nothing. */
+export type PackageMetricValues = ReadonlyMap<string, number>
 
 export type EnergyPoint = {
   slotIndex: number
@@ -747,34 +770,55 @@ export type EnergySeries = {
   finalSavings: number
 }
 
-function energyOnsets(summaries: readonly PackageSummary[], energy: EnergySettings) {
+/** The generic names for the same shapes: a graph's point and series. */
+export type MetricPoint = EnergyPoint
+export type MetricSeries = EnergySeries
+
+function metricOnsets(
+  summaries: readonly PackageSummary[],
+  values: PackageMetricValues,
+  settings: MetricSettings
+) {
   return summaries
-    .filter((s) => s.energyOnsetMonth !== null && s.input.energySavingsAnnual > 0)
-    .map((s) => ({
-      onsetMonth: s.energyOnsetMonth as number,
-      savings: s.input.energySavingsAnnual * energy.interactionFactor,
+    .map((s) => ({ summary: s, value: values.get(s.input.chunkProjectId) ?? 0 }))
+    // Positive only, as energy always was: a package whose column sums to
+    // zero (or less) has nothing to step in.
+    .filter(({ summary, value }) => summary.energyOnsetMonth !== null && value > 0)
+    .map(({ summary, value }) => ({
+      onsetMonth: summary.energyOnsetMonth as number,
+      savings: value * settings.interactionFactor,
     }))
 }
 
+/** Each package's `energySavingsAnnual` as a metric map -- what the energy
+ *  wrappers feed the generic functions. */
+export function energyValues(summaries: readonly PackageSummary[]): PackageMetricValues {
+  return new Map(summaries.map((s) => [s.input.chunkProjectId, s.input.energySavingsAnnual]))
+}
+
 /**
- * The stepped savings series drawn under the timeline, one point per column.
+ * One graph's stepped series, drawn under the timeline, one point per column.
  *
- * Savings come online when a package's LAST CONSTRUCTION phase finishes.
- * Design phases deliver nothing — you do not save energy by drawing a boiler —
- * which is why `kind` is a closed set rather than free text.
+ * A package's value comes online when its LAST CONSTRUCTION phase finishes
+ * (`PackageSummary.energyOnsetMonth` -- the name predates other graphs; it
+ * is "in service", whatever is being graphed). Design phases deliver
+ * nothing — you do not save energy, or carbon, by drawing a boiler — which
+ * is why `kind` is a closed set rather than free text.
  *
  * The result is a staircase: flat between completions, dropping at each one.
  * That is the shape Megan sketched, and it is also the conventional form for a
  * decarbonisation pathway chart.
  */
-export function computeEnergySeries(
+export function computeMetricSeries(
   summaries: readonly PackageSummary[],
-  energy: EnergySettings,
+  values: PackageMetricValues,
+  settings: MetricSettings,
   geometry: TimelineGeometry
-): EnergySeries {
+): MetricSeries {
+  const energy = settings
   const count = slotCount(geometry.years, geometry.interval)
   const per = monthsPerSlot(geometry.interval)
-  const onsets = energyOnsets(summaries, energy)
+  const onsets = metricOnsets(summaries, values, settings)
 
   const points: EnergyPoint[] = Array.from({ length: count }, (_, slotIndex) => {
     // A package finishing anywhere inside this column is delivering savings
@@ -804,6 +848,16 @@ export function computeEnergySeries(
   }
 }
 
+/** The energy graph's series: `computeMetricSeries` over each package's
+ *  `energySavingsAnnual`. */
+export function computeEnergySeries(
+  summaries: readonly PackageSummary[],
+  energy: EnergySettings,
+  geometry: TimelineGeometry
+): EnergySeries {
+  return computeMetricSeries(summaries, energyValues(summaries), energy, geometry)
+}
+
 export type FiscalYearEnergy = {
   fiscalYear: number
   /** Savings in service by the END of this fiscal year. */
@@ -811,19 +865,24 @@ export type FiscalYearEnergy = {
   remainingConsumption: number | null
 }
 
+export type FiscalYearMetric = FiscalYearEnergy
+
 /**
- * The same staircase, one row per fiscal year, for the export's Energy
- * Summary. Read at each fiscal year's end, from months -- so, like every other
- * exported figure, it no longer depends on the zoom the exporter happened to
- * have open (it used to be one row per column, labelled with that column's
- * starting FY, so a 5-year zoom produced two rows and a monthly one 180).
+ * The same staircase, one row per fiscal year, for the export's per-graph
+ * summary sheets. Read at each fiscal year's end, from months -- so, like
+ * every other exported figure, it does not depend on the zoom the exporter
+ * happened to have open (it used to be one row per column, labelled with
+ * that column's starting FY, so a 5-year zoom produced two rows and a
+ * monthly one 180).
  */
-export function computeEnergyByFiscalYear(
+export function computeMetricByFiscalYear(
   summaries: readonly PackageSummary[],
-  energy: EnergySettings,
+  values: PackageMetricValues,
+  settings: MetricSettings,
   geometry: TimelineGeometry
-): FiscalYearEnergy[] {
-  const onsets = energyOnsets(summaries, energy)
+): FiscalYearMetric[] {
+  const energy = settings
+  const onsets = metricOnsets(summaries, values, settings)
   const horizonMonths = Math.max(0, Math.round(geometry.years * 12))
 
   // The month offset just past the end of each fiscal year in the horizon.
@@ -847,6 +906,15 @@ export function computeEnergyByFiscalYear(
             : Math.max(0, energy.baselineAnnual - cumulativeSavings),
       }
     })
+}
+
+/** The energy graph's fiscal-year rows. */
+export function computeEnergyByFiscalYear(
+  summaries: readonly PackageSummary[],
+  energy: EnergySettings,
+  geometry: TimelineGeometry
+): FiscalYearEnergy[] {
+  return computeMetricByFiscalYear(summaries, energyValues(summaries), energy, geometry)
 }
 
 /* ------------------------------------------------------ dependency graph -- */

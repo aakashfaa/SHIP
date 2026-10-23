@@ -53,15 +53,20 @@ describe('column layers', () => {
 })
 
 describe('timeline layers', () => {
-  const base = { costBreakdown: 'fiscal-year' as const, showEnergy: true, showPackages: false }
+  const base = { costBreakdown: 'fiscal-year' as const, showEnergy: true, showPackages: false, hiddenGraphs: [] as string[] }
 
   test('non-admin: can turn off, cannot turn on what the admin turned off', () => {
-    const layer = timelineLayerFor(base, { costBreakdown: 'quarter', showEnergy: false, showPackages: true }, false)
+    const layer = timelineLayerFor(
+      base,
+      { costBreakdown: 'quarter', showEnergy: false, showPackages: true, hiddenGraphs: [] },
+      false
+    )
     assert.deepEqual(layer, { costBreakdown: 'quarter', showEnergy: false })
     assert.deepEqual(applyTimelineLayer(base, layer, false), {
       costBreakdown: 'quarter',
       showEnergy: false,
       showPackages: false,
+      hiddenGraphs: [],
     })
     assert.equal(applyTimelineLayer(base, { showPackages: true }, false).showPackages, false)
   })
@@ -73,15 +78,35 @@ describe('timeline layers', () => {
   })
 
   test('admin: any override applies', () => {
-    const layer = timelineLayerFor(base, { costBreakdown: 'none', showEnergy: true, showPackages: true }, true)
+    const layer = timelineLayerFor(
+      base,
+      { costBreakdown: 'none', showEnergy: true, showPackages: true, hiddenGraphs: [] },
+      true
+    )
     assert.deepEqual(applyTimelineLayer(base, layer, true), {
       costBreakdown: 'none',
       showEnergy: true,
       showPackages: true,
+      hiddenGraphs: [],
     })
   })
 
   test('parse keeps only valid keys', () => {
     assert.deepEqual(parseTimelineLayer({ costBreakdown: 'weekly', showEnergy: false, x: 1 }), { showEnergy: false })
+    assert.deepEqual(parseTimelineLayer({ hideGraphs: ['g1', 2], showGraphs: 'g2' }), { hideGraphs: ['g1'] })
+  })
+
+  test('graphs (0032): anyone can hide one; only an admin can show one the default hides', () => {
+    const withHidden = { ...base, hiddenGraphs: ['carbon'] }
+    // Non-admin hides energy on top of the admin's hidden carbon.
+    const layer = timelineLayerFor(withHidden, { ...withHidden, hiddenGraphs: ['energy'] }, false)
+    assert.deepEqual(layer, { hideGraphs: ['energy'] })
+    assert.deepEqual(applyTimelineLayer(withHidden, layer, false).hiddenGraphs.sort(), ['carbon', 'energy'])
+    // A forged showGraphs does nothing for a non-admin.
+    assert.deepEqual(applyTimelineLayer(withHidden, { showGraphs: ['carbon'] }, false).hiddenGraphs, ['carbon'])
+    // An admin can bring it back.
+    const adminLayer = timelineLayerFor(withHidden, { ...withHidden, hiddenGraphs: [] }, true)
+    assert.deepEqual(adminLayer, { showGraphs: ['carbon'] })
+    assert.deepEqual(applyTimelineLayer(withHidden, adminLayer, true).hiddenGraphs, [])
   })
 })

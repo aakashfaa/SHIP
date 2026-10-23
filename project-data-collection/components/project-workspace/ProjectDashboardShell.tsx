@@ -178,6 +178,9 @@ export default function ProjectDashboardShell({
             project={project}
             permissions={permissions}
             onOpenMasterView={() => setActiveTab('master-view')}
+            // Graph setup's "add a number question" link (0032). The form
+            // builder is in Settings, which only project admins have.
+            onOpenFormBuilder={isAdmin ? () => setActiveTab('settings') : undefined}
           />
         )
       default:

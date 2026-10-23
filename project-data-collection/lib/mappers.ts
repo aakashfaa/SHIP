@@ -54,6 +54,7 @@ import type {
   ProjectConsultant,
   ProjectCostSettings,
   ProjectEnergySettings,
+  ProjectGraph,
   ProjectTimelineSettings,
   Scenario,
   ScenarioDependency,
@@ -851,6 +852,55 @@ export function energySettingsToRow(settings: ProjectEnergySettings): ProjectEne
     baseline_annual: settings.baselineAnnual,
     interaction_factor: settings.interactionFactor,
   }
+}
+
+/* ------------------------------------------------------------- graphs -- */
+
+export type ProjectGraphRow = {
+  id: string
+  project_id: string
+  label: string
+  source_key: string
+  unit_label: string | null
+  baseline_annual: number | string | null
+  interaction_factor: number | string | null
+  color: string | null
+  sort_order: number | null
+}
+
+/** Same defensive reads as rowToEnergySettings: numeric columns arrive as
+ *  strings from PostgREST, and a bad value degrades to the default rather
+ *  than breaking the chart. */
+export function rowToProjectGraph(row: ProjectGraphRow): ProjectGraph {
+  const baselineValue = toNumber(row.baseline_annual)
+  const interactionValue = toNumber(row.interaction_factor)
+  const color = (row.color ?? '').toLowerCase()
+  return {
+    id: row.id,
+    projectId: row.project_id,
+    label: row.label,
+    sourceKey: row.source_key,
+    unitLabel: row.unit_label ?? '',
+    baselineAnnual: baselineValue !== null && baselineValue >= 0 ? baselineValue : null,
+    interactionFactor: interactionValue !== null && interactionValue > 0 ? interactionValue : 1.0,
+    color: /^#[0-9a-f]{6}$/.test(color) ? color : '#059669',
+    sortOrder: row.sort_order ?? 0,
+  }
+}
+
+/** Writable columns only; id/project_id are set on insert by the caller. */
+export function projectGraphToRow(
+  graph: Partial<Omit<ProjectGraph, 'id' | 'projectId'>>
+): Partial<ProjectGraphRow> {
+  const row: Partial<ProjectGraphRow> = {}
+  if (graph.label !== undefined) row.label = graph.label
+  if (graph.sourceKey !== undefined) row.source_key = graph.sourceKey
+  if (graph.unitLabel !== undefined) row.unit_label = graph.unitLabel
+  if (graph.baselineAnnual !== undefined) row.baseline_annual = graph.baselineAnnual
+  if (graph.interactionFactor !== undefined) row.interaction_factor = graph.interactionFactor
+  if (graph.color !== undefined) row.color = graph.color.toLowerCase()
+  if (graph.sortOrder !== undefined) row.sort_order = graph.sortOrder
+  return row
 }
 
 /* ------------------------------------------------------------- scenarios -- */
