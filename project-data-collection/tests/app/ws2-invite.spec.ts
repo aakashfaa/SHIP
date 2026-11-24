@@ -11,10 +11,11 @@ import path from 'node:path'
  * Mailpit's HTTP API, so these tests read the real email back from
  * http://127.0.0.1:55424 and click the real link:
  *
- *   1. Settings invites a brand-new address -> the email's link opens
- *      /auth/set-password -> choosing a password lands in the project.
- *      Opening the same link again shows the "expired or already used"
- *      banner on the sign-in page.
+ *   1. Settings invites a brand-new address -> the email's link opens a
+ *      "Choose a password" form on /auth/confirm (opening it uses nothing;
+ *      a typo doesn't use it either) -> saving lands in the project.
+ *      Opening the same link again and submitting shows "This link has
+ *      expired or was already used" with a way to get a new one.
  *   2. Inviting someone who already has an account returns no link to the
  *      admin, the email carries no token, and that person sees a
  *      "You've been added to <Project>" toast when they sign in.
@@ -243,12 +244,18 @@ test('a new invitee gets an email, sets a password and lands in the project; the
   const inviteeContext = await browser.newContext()
   const invitee = await freshPage(inviteeContext)
   await invitee.goto(link)
-  await invitee.waitForURL('**/auth/set-password**')
-  await expect(invitee.getByRole('heading', { name: /choose a password/i })).toBeVisible()
+  // Opening the link shows the password form straight away and uses
+  // nothing (mail scanners must not use it up).
+  await expect(invitee.getByRole('heading', { name: /finish setting up your account/i })).toBeVisible()
   await invitee.getByLabel('New password').fill('short')
   await invitee.getByLabel('Confirm password').fill('short')
   await invitee.getByRole('button', { name: /save password/i }).click()
   await expect(invitee.getByText(/at least 8 characters/)).toBeVisible()
+  // A mismatch is caught before the token is used, too.
+  await invitee.getByLabel('New password').fill(FIRST_PASSWORD)
+  await invitee.getByLabel('Confirm password').fill(`${FIRST_PASSWORD}x`)
+  await invitee.getByRole('button', { name: /save password/i }).click()
+  await expect(invitee.getByText(/don't match/)).toBeVisible()
 
   await invitee.getByLabel('New password').fill(FIRST_PASSWORD)
   await invitee.getByLabel('Confirm password').fill(FIRST_PASSWORD)
@@ -257,12 +264,16 @@ test('a new invitee gets an email, sets a password and lands in the project; the
   await expect(invitee.getByText(PROJECT_NAME).first()).toBeVisible({ timeout: 20_000 })
   await inviteeContext.close()
 
-  // The same link again: used -> banner on the sign-in page (M-03 / UX-5).
+  // The same link again: the form still opens, but submitting it reports
+  // the link as used and offers a new one (M-03 / UX-5).
   const againContext = await browser.newContext()
   const again = await freshPage(againContext)
   await again.goto(link)
-  await again.waitForURL((url) => url.pathname === '/')
-  await expect(again.getByTestId('auth-error-banner')).toContainText(/expired or has already been used/)
+  await again.getByLabel('New password').fill(SECOND_PASSWORD)
+  await again.getByLabel('Confirm password').fill(SECOND_PASSWORD)
+  await again.getByRole('button', { name: /save password/i }).click()
+  await expect(again.getByText('This link has expired or was already used.')).toBeVisible()
+  await expect(again.getByRole('button', { name: /email me a new link/i })).toBeVisible()
   await againContext.close()
 })
 
@@ -347,7 +358,7 @@ test('forgot password emails a reset link that sets a new password; unknown emai
   expect(new URL(link).searchParams.get('type')).toBe('recovery')
 
   await page.goto(link)
-  await page.waitForURL('**/auth/set-password**')
+  await expect(page.getByRole('heading', { name: /reset your password/i })).toBeVisible()
   await page.getByLabel('New password').fill(SECOND_PASSWORD)
   await page.getByLabel('Confirm password').fill(SECOND_PASSWORD)
   await page.getByRole('button', { name: /save password/i }).click()
@@ -366,12 +377,23 @@ test('forgot password emails a reset link that sets a new password; unknown emai
 })
 
 // ---------------------------------------------------------------------------
-// 4. A mangled link -> "didn't work" banner; ?next= is restricted.
+// 4. A mangled link -> an error and a way to get a new link (password
+//    links) or the sign-in banner (other links); ?next= is restricted.
 // ---------------------------------------------------------------------------
-test('a bad link shows the banner, and ?next= only accepts same-origin paths', async ({ browser }) => {
+test('a bad link shows an error, and ?next= only accepts same-origin paths', async ({ browser }) => {
   const context = await browser.newContext()
   const page = await freshPage(context)
   await page.goto('/auth/confirm?token_hash=nope&type=invite')
+  await page.getByLabel('New password').fill(SECOND_PASSWORD)
+  await page.getByLabel('Confirm password').fill(SECOND_PASSWORD)
+  await page.getByRole('button', { name: /save password/i }).click()
+  await expect(page.getByRole('button', { name: /email me a new link/i })).toBeVisible()
+  await page.goto('/auth/confirm?token_hash=nope&type=magiclink')
+  await page.getByRole('button', { name: /^continue$/i }).click()
+  await page.waitForURL((url) => url.pathname === '/')
+  await expect(page.getByTestId('auth-error-banner')).toBeVisible()
+  // A link with no token or an unknown type never gets a Continue button.
+  await page.goto('/auth/confirm?type=bogus')
   await page.waitForURL((url) => url.pathname === '/')
   await expect(page.getByTestId('auth-error-banner')).toBeVisible()
 

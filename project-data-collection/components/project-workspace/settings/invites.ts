@@ -4,7 +4,7 @@
 // (M-02 / D-7) -- so "Copy set-up link" only appears for those.
 export type InviteResult = {
   email: string
-  status?: 'invited' | 'added' | 'failed'
+  status?: 'invited' | 'setup' | 'added' | 'failed'
   invited: boolean
   alreadyExisted: boolean
   emailSent?: boolean
@@ -17,6 +17,9 @@ export function describeInvite(result: InviteResult): { text: string; tone: 'ok'
     return { text: result.error ?? 'Invite failed', tone: 'bad' }
   }
   if (result.error) return { text: result.error, tone: 'warn' }
+  if (result.status === 'setup') {
+    return { text: 'Has an account but never chose a password. We emailed them a link to choose one.', tone: 'ok' }
+  }
   return result.alreadyExisted
     ? { text: 'Already has an account. We emailed them a sign-in link.', tone: 'ok' }
     : { text: 'Invite emailed. They choose a password from the link.', tone: 'ok' }

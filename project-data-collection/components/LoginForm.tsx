@@ -33,8 +33,12 @@ const BANNERS: Record<AuthErrorCode, string> = {
   session_expired: 'You were signed out. Please sign in again.',
 }
 
+function isWrongPassword(error: { code?: string; message: string }): boolean {
+  return error.code === 'invalid_credentials' || /invalid login credentials/i.test(error.message)
+}
+
 function friendlySignInError(error: { code?: string; message: string }): string {
-  if (error.code === 'invalid_credentials' || /invalid login credentials/i.test(error.message)) {
+  if (isWrongPassword(error)) {
     return "That email and password don't match. Try again, or reset your password."
   }
   if (error.code === 'email_not_confirmed' || /email not confirmed/i.test(error.message)) {
@@ -50,6 +54,10 @@ export default function LoginForm() {
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [error, setError] = useState('')
+  // Wrong email/password: also offer a set-up link, for people whose
+  // account was made by an invite but who never chose a password. Worded
+  // so it says nothing about whether the account exists.
+  const [offerSetupLink, setOfferSetupLink] = useState(false)
   const [bannerDismissed, setBannerDismissed] = useState(false)
   const [loading, setLoading] = useState(false)
 
@@ -63,6 +71,7 @@ export default function LoginForm() {
     e.preventDefault()
     setLoading(true)
     setError('')
+    setOfferSetupLink(false)
     setBannerDismissed(true)
 
     const supabase = getSupabaseBrowserClient()
@@ -73,9 +82,21 @@ export default function LoginForm() {
 
     if (signInError) {
       setError(friendlySignInError(signInError))
+      setOfferSetupLink(isWrongPassword(signInError))
       setLoading(false)
       return
     }
+
+    // They used a password: record it (migration 0035), so no link ever
+    // treats them as "needs password". Fire and forget; never blocks
+    // sign-in. A first sign-in before the profile exists is covered by
+    // claim_invite, which stamps it from the password sign-in itself.
+    void Promise.resolve(supabase.rpc('mark_password_set')).then(
+      ({ error: markError }) => {
+        if (markError) console.error('mark_password_set failed', markError)
+      },
+      (err: unknown) => console.error('mark_password_set failed', err)
+    )
     // Success: stay in the "Signing in..." state; app/page.tsx redirects
     // once the profile has loaded.
   }
@@ -161,6 +182,14 @@ export default function LoginForm() {
             className="rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700"
           >
             {error}
+            {offerSetupLink ? (
+              <p className="mt-2" data-testid="setup-link-hint">
+                Never chose a password, or forgot it?{' '}
+                <Link href={forgotHref} className="font-medium text-teal-700 underline hover:text-teal-800">
+                  Email me a link to set one.
+                </Link>
+              </p>
+            ) : null}
           </div>
         ) : null}
 

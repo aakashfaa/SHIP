@@ -40,12 +40,16 @@ export function buildConfirmLink(
   base: string,
   tokenHash: string,
   type: EmailLinkType,
-  next?: string | null
+  next?: string | null,
+  options: { setup?: boolean } = {}
 ): string {
   const url = new URL('/auth/confirm', base)
   url.searchParams.set('token_hash', tokenHash)
   url.searchParams.set('type', type)
   if (next) url.searchParams.set('next', next)
+  // "Finish setting up your account" wording on the Continue and
+  // set-password pages (lib/supabase/email-confirm.ts isSetupFlag).
+  if (options.setup) url.searchParams.set('setup', '1')
   return url.toString()
 }
 

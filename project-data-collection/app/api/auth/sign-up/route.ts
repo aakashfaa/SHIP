@@ -2,22 +2,30 @@
 // made Supabase send its own confirmation email (D-6: every auth email is
 // ours, sent through Resend).
 //
+// SIGN-UP IS OPEN (owner decision 2026-11-24, migration 0035). Anyone may
+// create an account; claim_invite gives a confirmed, uninvited user a plain
+// consultant profile that sees no projects until an admin adds them to a
+// roster.
+//
 // What it does, in order:
 //   1. Validates the input and rate-limits per IP and per email address.
-//   2. Checks the address is on the SHIP allowlist (pending_invites, or an
-//      existing ship.profiles row). Not on it → nothing is sent.
-//   3. On it, and new → `generateLink({ type: 'signup', password })` creates
-//      an UNCONFIRMED account and we email a /auth/confirm link. Nobody gets a
-//      session until they click it, which is what stops the invite hijack in
-//      M-16: claim_invite (0013) only grants a profile to a confirmed email.
-//   4. On it, but the account already exists → we email a "you already have
-//      an account" message with a password-reset link instead.
+//   2. `generateLink({ type: 'signup', password })`:
+//      a. New address -> creates an UNCONFIRMED account and we email a
+//         /auth/confirm link. Nobody gets a session until they click it,
+//         which is what stops the invite hijack in M-16: claim_invite (0013,
+//         0035) only grants a profile to a confirmed email.
+//      b. The account already exists (`email_exists`) -> we email a "you
+//         already have an account" message with a password-reset link, but
+//         ONLY if the address is one SHIP knows (pending_invites or
+//         ship.profiles, see isKnownShipEmail). auth.users is shared with an
+//         unrelated production app; a stranger typing one of ITS users'
+//         addresses here must not make us mail that person a reset link.
 //
-// THE RESPONSE IS THE SAME IN EVERY CASE ("check your email"). auth.users is
-// shared with another production app; a sign-up form that answers "already
-// registered" is an oracle for that app's user list (SEC-8). The only
-// non-neutral answers are input errors (bad email format, short password) and
-// the rate limit, none of which depend on whether an account exists.
+// THE RESPONSE IS THE SAME IN EVERY CASE ("check your email"). A sign-up
+// form that answers "already registered" is an oracle for the other app's
+// user list (SEC-8). The only non-neutral answers are input errors (bad email
+// format, short or weak password) and the rate limit, none of which depend on
+// whether an account exists.
 
 import { NextRequest, NextResponse } from 'next/server'
 import { getSupabaseAdminClient } from '@/lib/supabase/admin'
@@ -38,7 +46,7 @@ import { renderConfirmSignupEmail, renderResetPasswordEmail } from '@/lib/email/
 export const runtime = 'nodejs'
 
 const NEUTRAL_MESSAGE =
-  "If this email is on the invite list, we've sent it a link to finish setting up. " +
+  "Check your email: we've sent a link to finish setting up your account. " +
   "It can take a minute or two to arrive; check your spam folder too."
 
 const WINDOW_MS = 15 * 60 * 1000
@@ -96,10 +104,6 @@ export async function POST(request: NextRequest) {
   const hours = linkExpiryHours()
 
   try {
-    if (!(await isKnownShipEmail(admin, email))) {
-      return NextResponse.json({ ok: true, message: NEUTRAL_MESSAGE })
-    }
-
     const { data, error } = await admin.auth.admin.generateLink({
       type: 'signup',
       email,
@@ -111,6 +115,10 @@ export async function POST(request: NextRequest) {
       const sent = await sendEmail(email, renderConfirmSignupEmail({ link, expiresInHours: hours }))
       if (!sent.ok) console.error('sign-up: confirmation email failed', sent.error)
     } else if (isEmailExistsError(error)) {
+      // Existing account. Only mail SHIP's own people (see the header).
+      if (!(await isKnownShipEmail(admin, email))) {
+        return NextResponse.json({ ok: true, message: NEUTRAL_MESSAGE })
+      }
       const recovery = await admin.auth.admin.generateLink({ type: 'recovery', email })
       if (!recovery.error && recovery.data.properties?.hashed_token) {
         const link = buildConfirmLink(base, recovery.data.properties.hashed_token, 'recovery', next)

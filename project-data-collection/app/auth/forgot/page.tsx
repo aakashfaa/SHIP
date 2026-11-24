@@ -54,7 +54,7 @@ export default function ForgotPasswordPage() {
         setError(payload.error ?? 'Something went wrong. Please try again.')
         return
       }
-      setSentMessage(payload.message ?? 'If that email has an account here, a reset link is on its way.')
+      setSentMessage(payload.message ?? 'If that email has an account here, a link to set your password is on its way.')
     } catch {
       setError("Couldn't reach the server. Check your connection and try again.")
     } finally {
@@ -71,8 +71,8 @@ export default function ForgotPasswordPage() {
             Reset your password
           </h1>
           <p className="mt-2 text-sm leading-6 text-slate-600">
-            Enter the email you sign in with and we&apos;ll send you a link to choose a new
-            password.
+            Enter the email you sign in with and we&apos;ll send you a link to choose a
+            password. It works whether you forgot yours or never chose one.
           </p>
         </div>
 

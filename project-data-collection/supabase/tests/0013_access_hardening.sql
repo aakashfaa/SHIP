@@ -44,14 +44,16 @@ select pg_temp.ok((ship.claim_invite()).role = 'consultant',
                   'M-16 after confirming, the same address claims as consultant');
 reset role;
 
--- An address that is not invited at all.
+-- An address that is not invited at all. 0013 refused it; 0035 (open
+-- sign-up, owner decision 2026-11-24) gives it a plain consultant profile
+-- with no project access. See supabase/tests/0035_join_links.sql.
 insert into auth.users (id, instance_id, aud, role, email, email_confirmed_at, created_at, updated_at)
 values ('00000000-0000-4000-8000-0000000013a2', '00000000-0000-0000-0000-000000000000',
         'authenticated', 'authenticated', 'stranger-0013@example.com', now(), now(), now());
 select pg_temp.login('stranger-0013@example.com');
 set local role authenticated;
-select pg_temp.throws('select ship.claim_invite()', '42501',
-                      'M-16 an uninvited (confirmed) user is still refused', 'not on the SHIP invite list');
+select pg_temp.ok((ship.claim_invite()).role = 'consultant',
+                  'M-16/0035 an uninvited (confirmed) user gets a consultant profile (open sign-up)');
 reset role;
 
 -- ---------------------------------------------------------------------

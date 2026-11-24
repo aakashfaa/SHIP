@@ -27,6 +27,7 @@ export default function SettingsTab({ project, onProjectUpdated }: Props) {
   const [inviteResults, setInviteResults] = useState<InviteResult[]>([])
   const [inviteError, setInviteError] = useState('')
   const [invitingEmails, setInvitingEmails] = useState<Set<string>>(new Set())
+  const [linkingEmails, setLinkingEmails] = useState<Set<string>>(new Set())
   const [copiedEmail, setCopiedEmail] = useState<string | null>(null)
   const [staleProject, setStaleProject] = useState(false)
 
@@ -86,13 +87,46 @@ export default function SettingsTab({ project, onProjectUpdated }: Props) {
     }
   }
 
-  async function copyLink(link: string, email: string) {
+  async function copyJoinLink(email: string) {
+    setLinkingEmails((prev) => new Set([...prev, email]))
     try {
-      await navigator.clipboard.writeText(link)
+      const res = await fetch('/api/admin/join-link', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ projectId: project.id, email }),
+      })
+      const payload = (await res.json().catch(() => ({}))) as {
+        url?: string
+        expiresAt?: string
+        error?: string
+      }
+      if (!res.ok || !payload.url) {
+        setError(payload.error ?? `Couldn't create a join link (${res.status}).`)
+        return
+      }
+      setError('')
+      try {
+        await navigator.clipboard.writeText(payload.url)
+      } catch {
+        window.prompt('Copy this join link:', payload.url)
+      }
       setCopiedEmail(email)
       window.setTimeout(() => setCopiedEmail((cur) => (cur === email ? null : cur)), 2000)
+      const expires = payload.expiresAt
+        ? new Date(payload.expiresAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
+        : 'in 14 days'
+      showMessage(
+        `Join link copied for ${email}. It works once and expires ${expires}. Copying a new one cancels this one.`,
+        5000
+      )
     } catch {
-      window.prompt('Copy this set-up link:', link)
+      setError("Couldn't create a join link: couldn't reach the server.")
+    } finally {
+      setLinkingEmails((prev) => {
+        const next = new Set(prev)
+        next.delete(email)
+        return next
+      })
     }
   }
 
@@ -238,6 +272,9 @@ export default function SettingsTab({ project, onProjectUpdated }: Props) {
           <ConsultantsCard
             consultants={project.consultants}
             invitingEmails={invitingEmails}
+            copiedEmail={copiedEmail}
+            linkingEmails={linkingEmails}
+            onCopyJoinLink={(email) => void copyJoinLink(email)}
             onAdd={() => setConsultantsModal({ editType: null })}
             onEditOrg={(editType) => setConsultantsModal({ editType })}
             onRemoveOrg={(type) => void removeOrg(type)}
@@ -252,7 +289,8 @@ export default function SettingsTab({ project, onProjectUpdated }: Props) {
               copiedEmail={copiedEmail}
               onClear={() => setInviteResults([])}
               onResend={(email) => void sendInvites([email])}
-              onCopyLink={(link, email) => void copyLink(link, email)}
+              linkingEmails={linkingEmails}
+              onCopyJoinLink={(email) => void copyJoinLink(email)}
             />
           ) : null}
         </div>

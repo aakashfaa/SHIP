@@ -14,8 +14,9 @@ import {
   SECONDARY_BUTTON,
 } from '../auth-shell'
 
-// "Set up your account" for someone their admin put on the invite list but
-// who didn't use (or lost) the invite email.
+// "Create your account". Sign-up is open (0035): anyone may make an account,
+// and sees projects once an admin adds their email to a project's team. It
+// is also the way in for someone who didn't get (or lost) their invite email.
 //
 // This used to call the browser's `supabase.auth.signUp`, which (a) made
 // Supabase send its own email (D-6 says all auth mail is ours) and (b) with
@@ -25,7 +26,7 @@ import {
 // until they click it.
 //
 // Whatever happens, the page says the same thing: "check your email". It
-// never says "you already have an account" or "you're not invited", because
+// never says "you already have an account", because
 // auth.users is shared with another app and either answer would tell a
 // stranger who has an account there (SEC-8). The email itself tells the real
 // owner which case they're in.
@@ -63,7 +64,7 @@ export default function SignUpPage() {
         setError(payload.error ?? 'Something went wrong. Please try again.')
         return false
       }
-      setSentMessage(payload.message ?? "If this email is on the invite list, we've sent it a link.")
+      setSentMessage(payload.message ?? "Check your email: we've sent you a link to finish setting up.")
       return true
     } catch {
       setError("Couldn't reach the server. Check your connection and try again.")
@@ -76,7 +77,7 @@ export default function SignUpPage() {
     setError('')
 
     if (!email.trim()) {
-      setError('Enter the email address your project admin invited.')
+      setError('Enter your email address.')
       return
     }
     if (password.length < MIN_PASSWORD) {
@@ -160,8 +161,8 @@ export default function SignUpPage() {
             Set up your account
           </h1>
           <p className="mt-2 text-sm leading-6 text-slate-600">
-            Use the email your project admin invited. If you got an invite email, its
-            button is the quickest way in.
+            Use your work email. You&apos;ll see a project once its admin adds that email to
+            the team. If you got an invite email, its button is the quickest way in.
           </p>
         </div>
 

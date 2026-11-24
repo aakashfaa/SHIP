@@ -8,7 +8,8 @@ type Props = {
   copiedEmail: string | null
   onClear: () => void
   onResend: (email: string) => void
-  onCopyLink: (link: string, email: string) => void
+  linkingEmails: Set<string>
+  onCopyJoinLink: (email: string) => void
 }
 
 export default function InviteResults({
@@ -17,7 +18,8 @@ export default function InviteResults({
   copiedEmail,
   onClear,
   onResend,
-  onCopyLink,
+  linkingEmails,
+  onCopyJoinLink,
 }: Props) {
   return (
     <div
@@ -43,13 +45,14 @@ export default function InviteResults({
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <span className="font-medium text-slate-900">{result.email}</span>
                 <div className="flex items-center gap-2">
-                  {result.actionLink ? (
+                  {result.status !== 'failed' ? (
                     <button
                       type="button"
-                      onClick={() => onCopyLink(result.actionLink as string, result.email)}
-                      className="rounded-xl bg-black px-3 py-1.5 text-xs font-medium text-white"
+                      disabled={linkingEmails.has(result.email)}
+                      onClick={() => onCopyJoinLink(result.email)}
+                      className="rounded-xl bg-black px-3 py-1.5 text-xs font-medium text-white disabled:opacity-50"
                     >
-                      {copiedEmail === result.email ? 'Copied' : 'Copy set-up link'}
+                      {copiedEmail === result.email ? 'Copied' : 'Copy join link'}
                     </button>
                   ) : null}
                   <button
@@ -77,9 +80,9 @@ export default function InviteResults({
           )
         })}
       </ul>
-      {results.some((r) => r.actionLink) ? (
+      {results.some((r) => r.status !== 'failed') ? (
         <p className="mt-2 text-xs text-slate-500">
-          A set-up link signs that person in once, so only send it to them directly.
+          A join link lets that person set a password and get in without email. Send it to them directly.
         </p>
       ) : null}
     </div>

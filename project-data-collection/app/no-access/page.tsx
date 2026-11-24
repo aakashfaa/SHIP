@@ -51,11 +51,11 @@ export default function NoAccessPage() {
     const { error } = await supabase.rpc('claim_invite')
 
     if (error) {
-      // 42501 means there's still no matching pending_invites row — the
-      // admin hasn't added this email yet. That's expected, not a bug.
+      // 42501 now (0035, open sign-up) only means the email isn't confirmed
+      // yet. That's expected, not a bug.
       if (error.code === '42501') {
         setCheckError(
-          "This email still isn't on the invite list. Ask your project admin to add it, then check again."
+          "Your email isn't confirmed yet. Use the link in your confirmation email, then check again."
         )
       } else {
         setCheckError('Something went wrong checking access. Please try again.')

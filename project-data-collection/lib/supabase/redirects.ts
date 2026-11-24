@@ -1,6 +1,6 @@
 /**
  * `?next=` handling, shared by the sign-in form, the email-link handler
- * (`app/auth/confirm/route.ts`), the set-password page and the project page's
+ * (`app/auth/confirm/page.tsx` + `verify/route.ts`), the set-password page and the project page's
  * signed-out redirect.
  *
  * WHY THIS IS STRICT. `next` arrives from a URL anyone can craft, and we

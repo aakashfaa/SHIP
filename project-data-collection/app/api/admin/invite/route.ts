@@ -15,7 +15,16 @@
 // - A NEW address → `generateLink({ type: 'invite' })` creates an
 //   unconfirmed account; we email a /auth/confirm?token_hash=… link that signs
 //   them in once and asks them to choose a password.
-// - An address that ALREADY HAS AN ACCOUNT (generateLink answers
+// - An address whose SHIP account never chose a password ("needs password":
+//   ship_invite-tagged, password_set_at null -- or unknown, on a database
+//   without 0035; platform admins included, since the link goes to their own
+//   inbox; see migration 0035) → a "Finish setting up your account" email
+//   with a recovery /auth/confirm link marked setup=1 that ends on the
+//   project. Typically a mail scanner burned their invite link. Never the
+//   tokenless "added" email, which is a dead end for them. actionLink stays
+//   null. If a recovery token was made for them under 2 minutes ago we send
+//   nothing new (a new token would kill the one already in their inbox).
+// - Any other address that ALREADY HAS AN ACCOUNT (generateLink answers
 //   `email_exists`) → no token at all. They get a "You've been added to
 //   <Project>" email linking to the normal sign-in page with
 //   ?next=/projects/<id>, and a row in ship.project_access_notices so the app
@@ -33,7 +42,6 @@
 // result. The route returns 200 with every result; Settings shows each one.
 
 import { NextRequest, NextResponse } from 'next/server'
-import type { User } from '@supabase/supabase-js'
 import { createSupabaseServerClient } from '@/lib/supabase/server'
 import { getSupabaseAdminClient } from '@/lib/supabase/admin'
 import type { ShipSupabaseClient } from '@/lib/supabase/client'
@@ -49,18 +57,25 @@ import {
 } from '@/lib/email/links'
 import { checkRateLimit } from '@/lib/email/rate-limit'
 import { sendEmail } from '@/lib/email/send'
-import { renderAddedToProjectEmail, renderInviteEmail } from '@/lib/email/templates'
+import { isUnactivatedShipInvite, recoveryRecentlySent } from '@/lib/join-links'
+import { lookupShipAccount } from '@/lib/supabase/needs-password'
+import {
+  renderAddedToProjectEmail,
+  renderFinishSetupEmail,
+  renderInviteEmail,
+} from '@/lib/email/templates'
 
 export const runtime = 'nodejs'
 
 const MAX_EMAILS_PER_REQUEST = 50
 
-type InviteStatus = 'invited' | 'added' | 'failed'
+type InviteStatus = 'invited' | 'setup' | 'added' | 'failed'
 
 type InviteResult = {
   email: string
-  /** invited = new account, set-password link sent; added = existing
-   *  account, plain sign-in email sent; failed = see `error`. */
+  /** invited = new account, set-password link sent; setup = account that
+   *  never chose a password, "finish setting up" link sent; added =
+   *  existing account, plain sign-in email sent; failed = see `error`. */
   status: InviteStatus
   /** Kept for app/projects/new/page.tsx: true unless status is 'failed'. */
   invited: boolean
@@ -82,24 +97,6 @@ function failed(email: string, error: string, alreadyExisted = false): InviteRes
     actionLink: null,
     error,
   }
-}
-
-/**
- * True when this auth user was created by a SHIP invite (we tag new invitees
- * with user_metadata.ship_invite at creation; GoTrue never rewrites metadata
- * on a re-invite — verified locally) and nobody has ever activated it: email
- * unconfirmed and never signed in. Such an account has no owner yet but the
- * mailbox holder, so handing the admin a link to it gives away nothing that
- * belongs to anyone. An unconfirmed account the OTHER app created is not
- * tagged, so it still gets the email but never a copyable link.
- */
-function isUnactivatedShipInvite(user: User | null | undefined): boolean {
-  if (!user) return false
-  return (
-    user.user_metadata?.ship_invite === true &&
-    !user.email_confirmed_at &&
-    !user.last_sign_in_at
-  )
 }
 
 /** Column-missing errors from PostgREST (0013 not applied yet). */
@@ -351,15 +348,59 @@ export async function POST(request: NextRequest) {
           invited: true,
           alreadyExisted: false,
           emailSent: sent.ok,
-          actionLink: isUnactivatedShipInvite(data.user) ? link : null,
+          // Platform admins only: a project admin could otherwise take the
+          // set-up link for an address a platform admin invited as 'admin'
+          // and become a platform admin. Project admins use join links.
+          actionLink: isPlatformAdmin && isUnactivatedShipInvite(data.user) ? link : null,
           error: sent.ok ? null : `Account created, but the email didn't send: ${sent.error}`,
         })
         continue
       }
 
       if (isEmailExistsError(error)) {
-        // Existing account: no token, ever (D-7).
         if (projectId) await recordAccessNotice(admin, email, projectId)
+
+        // Has an account but never chose a password: a sign-in email would
+        // be a dead end, so send them a link to choose one.
+        const account = await lookupShipAccount(admin, email, 'email')
+        if (account?.needsPassword && recoveryRecentlySent(account.recoverySentAt)) {
+          results.set(email, {
+            email,
+            status: 'setup',
+            invited: true,
+            alreadyExisted: true,
+            emailSent: false,
+            actionLink: null,
+            error: 'A set-up email was sent less than 2 minutes ago. Ask them to use that one.',
+          })
+          continue
+        }
+        if (account?.needsPassword) {
+          const recovery = await admin.auth.admin.generateLink({ type: 'recovery', email })
+          if (!recovery.error && recovery.data.properties?.hashed_token) {
+            const link = buildConfirmLink(base, recovery.data.properties.hashed_token, 'recovery', next, {
+              setup: true,
+            })
+            const sent = await sendEmail(
+              email,
+              renderFinishSetupEmail({ link, projectName, inviterName, expiresInHours: hours })
+            )
+            results.set(email, {
+              email,
+              status: 'setup',
+              invited: true,
+              alreadyExisted: true,
+              emailSent: sent.ok,
+              actionLink: null,
+              error: sent.ok ? null : `Access granted, but the email didn't send: ${sent.error}`,
+            })
+            continue
+          }
+          // Fall through to the plain "you've been added" email.
+          console.error('invite: generateLink(recovery) failed', email, recovery.error)
+        }
+
+        // Existing account with a password: no token, ever (D-7).
         const sent = await sendEmail(
           email,
           renderAddedToProjectEmail({

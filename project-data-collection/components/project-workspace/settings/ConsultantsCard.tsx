@@ -5,6 +5,9 @@ import { ProjectConsultant } from '@/lib/types'
 type Props = {
   consultants: ProjectConsultant[]
   invitingEmails: Set<string>
+  copiedEmail: string | null
+  linkingEmails: Set<string>
+  onCopyJoinLink: (email: string) => void
   onAdd: () => void
   onEditOrg: (type: ProjectConsultant['type']) => void
   onRemoveOrg: (type: ProjectConsultant['type']) => void
@@ -21,6 +24,9 @@ const ICON_BTN =
 export default function ConsultantsCard({
   consultants,
   invitingEmails,
+  copiedEmail,
+  linkingEmails,
+  onCopyJoinLink,
   onAdd,
   onEditOrg,
   onRemoveOrg,
@@ -90,6 +96,24 @@ export default function ConsultantsCard({
                   <li key={email} className="group flex items-center justify-between gap-2">
                     <p className="min-w-0 truncate text-[13px] leading-tight text-slate-700">{email}</p>
                     <div className={`flex flex-none items-center ${REVEAL}`}>
+                      <button
+                        type="button"
+                        disabled={linkingEmails.has(email)}
+                        onClick={() => onCopyJoinLink(email)}
+                        aria-label={`Copy join link for ${email}`}
+                        title="Copy join link"
+                        className={ICON_BTN}
+                      >
+                        {copiedEmail === email ? (
+                          <svg viewBox="0 0 20 20" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="2">
+                            <path d="M4 10.5l4 4 8-9" strokeLinecap="round" strokeLinejoin="round" />
+                          </svg>
+                        ) : (
+                          <svg viewBox="0 0 20 20" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="1.8">
+                            <path d="M8.5 11.5a3.5 3.5 0 005 0l3-3a3.5 3.5 0 00-5-5l-1 1M11.5 8.5a3.5 3.5 0 00-5 0l-3 3a3.5 3.5 0 005 5l1-1" strokeLinecap="round" strokeLinejoin="round" />
+                          </svg>
+                        )}
+                      </button>
                       <button
                         type="button"
                         disabled={invitingEmails.has(email)}

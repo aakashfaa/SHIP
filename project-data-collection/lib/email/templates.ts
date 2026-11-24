@@ -1,5 +1,5 @@
 /**
- * The four emails SHIP sends, as plain functions returning
+ * The emails SHIP sends, as plain functions returning
  * `{ subject, html, text }`.
  *
  * WHY WE WRITE OUR OWN. Since D-6 every auth email comes from our server via
@@ -148,7 +148,7 @@ export function renderInviteEmail(input: {
       'Open this link and choose a password:',
       input.link,
       '',
-      `This link works once and expires in ${hours} hours. If you weren't expecting this email, you can ignore it.`,
+      `This link works once and expires in ${hours} hours. If you asked more than once, use the newest email. If you weren't expecting this email, you can ignore it.`,
     ]),
   }
 }
@@ -206,10 +206,10 @@ export function renderConfirmSignupEmail(input: {
   return {
     subject: `Confirm your email for the ${PRODUCT}`,
     html: layout({
-      preheader: 'One click and your account is ready.',
+      preheader: 'Confirm your email and your account is ready.',
       heading: 'Confirm your email',
       paragraphs: [
-        `You've just set up an account on the ${escapeHtml(PRODUCT)}. Click the button below to confirm this is your email address, and you'll go straight in.`,
+        `You've just set up an account on the ${escapeHtml(PRODUCT)}. Click the button below, then press Continue, to confirm this is your email address.`,
       ],
       buttonLabel: 'Confirm my email',
       buttonUrl: input.link,
@@ -253,7 +253,7 @@ export function renderResetPasswordEmail(input: {
       paragraphs: [escapeHtml(intro)],
       buttonLabel: 'Choose a new password',
       buttonUrl: input.link,
-      footnote: `This link works once and expires in ${hours} hours. If you didn't ask for this, you can ignore this email; your password won't change.`,
+      footnote: `This link works once and expires in ${hours} hours. If you asked more than once, use the newest email. If you didn't ask for this, you can ignore this email; your password won't change.`,
     }),
     text: textBody([
       input.existingAccountOnSignUp ? 'You already have an account' : 'Reset your password',
@@ -262,7 +262,68 @@ export function renderResetPasswordEmail(input: {
       '',
       input.link,
       '',
-      `This link works once and expires in ${hours} hours. If you didn't ask for this, ignore this email; your password won't change.`,
+      `This link works once and expires in ${hours} hours. If you asked more than once, use the newest email. If you didn't ask for this, ignore this email; your password won't change.`,
+    ]),
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 5. Finish setting up — the person HAS an account (SHIP created it) but has
+//    never chosen a password, usually because a mail scanner opened their
+//    invite link first ("needs password", migration 0035). Sent by Settings >
+//    Resend and by Forgot password instead of "sign in" / "reset". The link
+//    is a recovery link marked setup=1, so the pages on the way say "Finish
+//    setting up your account" too.
+// ---------------------------------------------------------------------------
+export function renderFinishSetupEmail(input: {
+  link: string
+  projectName?: string | null
+  inviterName?: string | null
+  /** True when they asked for it themselves (Forgot password). */
+  requested?: boolean
+  expiresInHours?: number
+}): RenderedEmail {
+  const project = projectPhrase(input.projectName)
+  const inviter = inviterPhrase(input.inviterName)
+  const hours = input.expiresInHours ?? 24
+  const subject = input.projectName?.trim()
+    ? `Finish setting up your account for ${oneLine(input.projectName)}`
+    : `Finish setting up your ${PRODUCT} account`
+  const intro = input.requested
+    ? {
+        html: `You asked for a link to sign in to the ${escapeHtml(PRODUCT)}. Your account is ready; it just needs a password.`,
+        text: `You asked for a link to sign in to the ${PRODUCT}. Your account is ready; it just needs a password.`,
+      }
+    : {
+        html: `${inviter.html} has invited you to ${project.html}. Your account is ready; it just needs a password.`,
+        text: `${inviter.text} has invited you to ${project.text}. Your account is ready; it just needs a password.`,
+      }
+  const askAgain = input.requested
+    ? 'request a new one from the sign-in page'
+    : `ask ${inviter.html === 'Your project admin' ? 'your project admin' : inviter.html} to send a new one`
+
+  return {
+    subject,
+    html: layout({
+      preheader: 'Choose a password to finish setting up your account.',
+      heading: 'Finish setting up your account',
+      paragraphs: [
+        intro.html,
+        `Click the button below and choose a password. ${input.projectName?.trim() ? "You'll go straight to the project." : "You'll be signed in straight away."}`,
+      ],
+      buttonLabel: 'Choose a password',
+      buttonUrl: input.link,
+      footnote: `This link works once and expires in ${hours} hours. If you asked more than once, use the newest email. If it has expired, ${askAgain}. If you weren't expecting this email, you can ignore it.`,
+    }),
+    text: textBody([
+      'Finish setting up your account',
+      '',
+      intro.text,
+      '',
+      'Open this link and choose a password:',
+      input.link,
+      '',
+      `This link works once and expires in ${hours} hours. If you asked more than once, use the newest email. If you weren't expecting this email, you can ignore it.`,
     ]),
   }
 }

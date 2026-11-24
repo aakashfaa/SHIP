@@ -5,6 +5,7 @@ import Link from 'next/link'
 import { getSupabaseBrowserClient } from '@/lib/supabase/client'
 import { safeNextPath } from '@/lib/supabase/redirects'
 import { useQueryParam } from '@/lib/supabase/use-location'
+import { isSetupFlag } from '@/lib/supabase/email-confirm'
 import {
   CARD,
   ErrorNote,
@@ -14,11 +15,14 @@ import {
   PRIMARY_BUTTON,
 } from '../auth-shell'
 
-// "Choose a password". Reached only from /auth/confirm after an invite link
-// (a brand-new account that has no password yet) or a reset link (M-03,
-// M-17). By the time this renders, /auth/confirm has already verified the
-// link and set the session cookies, so all this page does is
-// `updateUser({ password })` and send them on to `next` or /projects.
+// "Choose a password" for someone who is ALREADY SIGNED IN. Email links no
+// longer come through here: invite and reset links set the password on
+// /auth/confirm itself (see app/auth/confirm/verify/route.ts). The one email
+// path that still lands here is the rare case where that route used the link
+// but GoTrue rejected the password (?error=weak_password|save_failed): the
+// person is signed in, so they just pick another one. All this page does is
+// `updateUser({ password })`, stamp password_set_at (0035) and send them on
+// to `next` or /projects.
 //
 // If there's no session (someone bookmarked this page, or the cookies didn't
 // stick), we say so and point at "Forgot password?" rather than showing a
@@ -45,10 +49,20 @@ export default function SetPasswordPage() {
   const [phase, setPhase] = useState<Phase>('checking')
   const [email, setEmail] = useState('')
   const welcome = useQueryParam('welcome') === '1'
+  // setup=1: an account that never chose a password (migration 0035).
+  const setup = isSetupFlag(useQueryParam('setup'))
+  const arrivedWith = useQueryParam('error')
   const next = safeNextPath(useQueryParam('next'))
   const [password, setPassword] = useState('')
   const [confirmPassword, setConfirmPassword] = useState('')
-  const [error, setError] = useState('')
+  const [typedError, setError] = useState<string | null>(null)
+  const error =
+    typedError ??
+    (arrivedWith === 'weak_password'
+      ? 'That password was rejected as too weak. Choose a longer or less common one.'
+      : arrivedWith === 'save_failed'
+        ? 'Could not save your password. Please try again.'
+        : '')
   const [saving, setSaving] = useState(false)
 
   useEffect(() => {
@@ -84,6 +98,15 @@ export default function SetPasswordPage() {
       setError(friendlyUpdateError(updateError))
       setSaving(false)
       return
+    }
+
+    // Record that they now have a password they chose (0035), so no link
+    // treats them as "needs password" again. Never blocks them.
+    try {
+      const { error: markError } = await supabase.rpc('mark_password_set')
+      if (markError) console.error('mark_password_set failed', markError)
+    } catch (err) {
+      console.error('mark_password_set failed', err)
     }
 
     // A full navigation (not router.replace) so the auth context reloads the
@@ -135,9 +158,10 @@ export default function SetPasswordPage() {
         <div className="mb-8">
           <Eyebrow />
           <h1 className="text-4xl font-semibold tracking-tight text-slate-950">
-            {welcome ? 'Welcome! Choose a password' : 'Choose a new password'}
+            {setup ? 'Finish setting up your account' : welcome ? 'Welcome! Choose a password' : 'Choose a new password'}
           </h1>
           <p className="mt-2 text-sm leading-6 text-slate-600">
+            {setup ? 'Choose a password. ' : null}
             {email ? (
               <>
                 For <span className="font-medium text-slate-800">{email}</span>. You&apos;ll

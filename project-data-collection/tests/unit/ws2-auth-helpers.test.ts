@@ -27,6 +27,7 @@ import { checkRateLimit, clientIpFromHeaders, resetRateLimits } from '../../lib/
 import {
   escapeHtml,
   renderAddedToProjectEmail,
+  renderFinishSetupEmail,
   renderInviteEmail,
   renderResetPasswordEmail,
 } from '../../lib/email/templates.ts'
@@ -193,5 +194,48 @@ describe('email templates', () => {
 
   test('escapeHtml covers the five specials', () => {
     assert.equal(escapeHtml(`<>&"'`), '&lt;&gt;&amp;&quot;&#39;')
+  })
+})
+
+describe('set-up links and email (needs password, migration 0035)', () => {
+  test('buildConfirmLink marks a set-up link with setup=1', () => {
+    const link = new URL(
+      buildConfirmLink('https://ship.example.com', 'abc', 'recovery', '/projects/p1', { setup: true })
+    )
+    assert.equal(link.searchParams.get('type'), 'recovery')
+    assert.equal(link.searchParams.get('setup'), '1')
+    assert.equal(link.searchParams.get('next'), '/projects/p1')
+    const plain = new URL(buildConfirmLink('https://ship.example.com', 'abc', 'recovery'))
+    assert.equal(plain.searchParams.has('setup'), false)
+  })
+
+  test('the Resend version says finish setting up, names the project, never "reset"', () => {
+    const email = renderFinishSetupEmail({
+      link: 'https://ship.example.com/auth/confirm?token_hash=x&type=recovery&setup=1',
+      projectName: 'State <House>',
+      inviterName: 'Pat',
+    })
+    assert.match(email.subject, /Finish setting up your account for State <House>/)
+    assert.match(email.html, /Finish setting up your account/)
+    assert.match(email.html, /State &lt;House&gt;/)
+    assert.match(email.html, /Pat has invited you/)
+    assert.match(email.html, /straight to the project/)
+    assert.doesNotMatch(email.html + email.text, /reset/i)
+    assert.match(email.text, /token_hash=x/)
+    assert.match(email.html, /use the newest email/)
+    assert.match(email.text, /use the newest email/)
+  })
+
+  test('the reset email also says to use the newest one', () => {
+    const email = renderResetPasswordEmail({ link: 'https://x.example/l' })
+    assert.match(email.html, /use the newest email/)
+    assert.match(email.text, /use the newest email/)
+  })
+
+  test('the Forgot-password version does not claim an inviter', () => {
+    const email = renderFinishSetupEmail({ link: 'https://x.example/l', requested: true })
+    assert.match(email.html, /You asked for a link/)
+    assert.doesNotMatch(email.html, /has invited you/)
+    assert.doesNotMatch(email.html + email.text, /reset/i)
   })
 })
